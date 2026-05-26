@@ -672,6 +672,39 @@ def _detect_marker_leaks(
     return findings
 
 
+@dataclass(slots=True, frozen=True)
+class _TerminatorBreadcrumb:
+    """#2349 — pending ``audit.stuck_draft_terminated`` row.
+
+    Produced by the (pure) ``_detect_stuck_drafts`` detector when a
+    subject first crosses ``STUCK_DRAFT_TERMINATOR_THRESHOLD``. The
+    cadence handler (``scan_project``) drains the breadcrumb list and
+    emits the rows via :func:`_emit_stuck_draft_terminator`. Keeping the
+    breadcrumb a plain value type — not a side effect — means
+    ``scan_events`` / ``_detect_stuck_drafts`` can stay pure and tests
+    that monkeypatch ``pollypm.audit.log.emit`` and call ``scan_events``
+    directly see ZERO writes.
+    """
+
+    project: str
+    subject: str
+    prior_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class _StuckDraftScanResult:
+    """#2349 — result of the (pure) stuck_draft detector pass.
+
+    ``findings`` are the rows the cadence handler will route normally;
+    ``terminator_breadcrumbs`` are subjects that crossed the cascade
+    threshold for the first time in this scan and need a one-shot
+    ``audit.stuck_draft_terminated`` row emitted by the route layer.
+    """
+
+    findings: list[Finding]
+    terminator_breadcrumbs: list[_TerminatorBreadcrumb]
+
+
 def _emit_stuck_draft_terminator(
     *,
     project: str,
@@ -688,12 +721,18 @@ def _emit_stuck_draft_terminator(
     breadcrumb is far better than crashing the cadence handler.
 
     ``project_path`` MUST be threaded through from the cadence handler
-    (via ``scan_project`` → ``scan_events`` → ``_detect_stuck_drafts``)
-    so the breadcrumb lands in the per-project audit log alongside the
-    ``audit.finding`` rows it terminates. Without this, the per-project
-    log is the read source on the next scan but the breadcrumb only
-    lives on the central tail — the read/write split makes the
-    terminator re-emit forever (the #2349 Codex blocker).
+    (via ``scan_project``) so the breadcrumb lands in the per-project
+    audit log alongside the ``audit.finding`` rows it terminates.
+    Without this, the per-project log is the read source on the next
+    scan but the breadcrumb only lives on the central tail — the
+    read/write split makes the terminator re-emit forever (the #2349
+    Codex blocker).
+
+    #2349 (round 3) — this helper is invoked exclusively from the
+    cadence path (:func:`scan_project`) after the pure detectors have
+    finished. The detectors return :class:`_TerminatorBreadcrumb`
+    values; ``scan_project`` materialises them via this helper. Pure
+    ``scan_events`` callers never reach this code path.
     """
     try:
         from pollypm.audit.log import emit as _audit_emit
@@ -728,8 +767,7 @@ def _detect_stuck_drafts(
     now: datetime,
     config: WatchdogConfig,
     open_tasks: Sequence[Any] | None = None,
-    project_path: Path | str | None = None,
-) -> list[Finding]:
+) -> _StuckDraftScanResult:
     """Rule 3 (state-based, #1433): tasks currently at ``status=draft``
     older than ``stuck_draft_seconds``.
 
@@ -742,8 +780,18 @@ def _detect_stuck_drafts(
     Findings produced by the state path take precedence — we dedupe
     on ``(project, subject)`` so a task that is both visible in
     ``open_tasks`` AND has a matching audit event only fires once.
+
+    #2349 (round 3) — this detector is PURE: no I/O. When a subject
+    crosses ``STUCK_DRAFT_TERMINATOR_THRESHOLD`` for the first time, a
+    :class:`_TerminatorBreadcrumb` is collected onto the returned
+    :class:`_StuckDraftScanResult`; the cadence handler
+    (:func:`scan_project`) is responsible for actually emitting the
+    ``audit.stuck_draft_terminated`` row. Direct ``scan_events``
+    callers that bypass the cadence handler get suppression of repeat
+    stuck_draft findings without any durable writes.
     """
     findings: list[Finding] = []
+    terminator_breadcrumbs: list[_TerminatorBreadcrumb] = []
     seen_subjects: set[str] = set()
     cutoff = now - timedelta(seconds=config.stuck_draft_seconds)
 
@@ -780,8 +828,15 @@ def _detect_stuck_drafts(
 
         Idempotent across scans: a subject with a prior
         ``audit.stuck_draft_terminated`` row is still skipped, but the
-        breadcrumb is NOT re-emitted. Only the *first* scan that crosses
-        the threshold writes the terminator event.
+        breadcrumb is NOT re-collected. Only the *first* scan that
+        crosses the threshold appends a :class:`_TerminatorBreadcrumb`
+        for the cadence handler to emit.
+
+        #2349 (round 3) — pure: this helper appends to the local
+        ``terminator_breadcrumbs`` list rather than calling
+        :func:`_emit_stuck_draft_terminator` directly. The route layer
+        (:func:`scan_project`) consumes the breadcrumb list and emits
+        the durable row.
         """
         if prior_finding_counts.get(subject, 0) < (
             STUCK_DRAFT_TERMINATOR_THRESHOLD
@@ -792,12 +847,11 @@ def _detect_stuck_drafts(
             return True
         if subject not in terminated_subjects:
             terminated_subjects.add(subject)
-            _emit_stuck_draft_terminator(
+            terminator_breadcrumbs.append(_TerminatorBreadcrumb(
                 project=project,
                 subject=subject,
                 prior_count=prior_finding_counts[subject],
-                project_path=project_path,
-            )
+            ))
         return True
 
     # State-based path (#1433): walks current ``work_tasks`` rows.
@@ -934,7 +988,10 @@ def _detect_stuck_drafts(
                 "detected_via": "event",
             },
         ))
-    return findings
+    return _StuckDraftScanResult(
+        findings=findings,
+        terminator_breadcrumbs=terminator_breadcrumbs,
+    )
 
 
 def _detect_cancellation_no_promotion(
@@ -2802,12 +2859,24 @@ def scan_events(
     state_db_probes: Sequence[Any] | None = None,
     run_safety_net_probes: bool = True,
     worker_cap_back_pressure: Mapping[str, bool] | None = None,
+    stuck_draft_terminator_breadcrumbs: list[_TerminatorBreadcrumb] | None = None,
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
 
     Pure function — no I/O. Tests pass a synthetic event list directly.
     The events are iterated multiple times so an iterable is materialised
     into a list up front.
+
+    #2349 (round 3) — ``scan_events`` is PURE. When the cadence handler
+    (:func:`scan_project`) needs to emit ``audit.stuck_draft_terminated``
+    breadcrumbs it passes an empty list via
+    ``stuck_draft_terminator_breadcrumbs``; ``scan_events`` populates it
+    with one :class:`_TerminatorBreadcrumb` per subject that first
+    crossed the cascade threshold this scan, and the cadence handler
+    emits them after the scan returns. Direct ``scan_events`` callers
+    omit the kwarg and never trigger any I/O — only finding-suppression.
+    ``project_path`` is accepted for back-compat (older internal callers
+    threaded it through) but no longer used inside the detector.
 
     Args:
         events: audit events to scan. Order need not be sorted —
@@ -2854,13 +2923,22 @@ def scan_events(
     findings.extend(_detect_marker_leaks(
         materialised, now=now, config=config,
     ))
-    findings.extend(_detect_stuck_drafts(
+    stuck_draft_result = _detect_stuck_drafts(
         materialised,
         now=now,
         config=config,
         open_tasks=open_tasks,
-        project_path=project_path,
-    ))
+    )
+    findings.extend(stuck_draft_result.findings)
+    # #2349 (round 3) — surface terminator breadcrumbs to the cadence
+    # handler via the optional side-channel. Pure callers (synthetic
+    # event tests) leave the kwarg as None and get no breadcrumbs +
+    # zero writes; the detector still suppresses the repeating finding
+    # via the in-memory ``terminated_subjects`` guard.
+    if stuck_draft_terminator_breadcrumbs is not None:
+        stuck_draft_terminator_breadcrumbs.extend(
+            stuck_draft_result.terminator_breadcrumbs,
+        )
     findings.extend(_detect_cancellation_no_promotion(
         materialised, now=now, config=config,
     ))
@@ -2985,6 +3063,13 @@ def scan_project(
     pass-through for the plan_missing_alert_churn rule (#1524). When
     omitted those rules become no-ops, which is the right default for
     callers that only have audit events on hand.
+
+    #2349 (round 3) — ``scan_project`` IS the audit-write boundary for
+    ``audit.stuck_draft_terminated`` breadcrumbs. The pure
+    ``scan_events`` detector collects breadcrumbs into a local list;
+    after the scan returns, we drain that list and call
+    :func:`_emit_stuck_draft_terminator` with the cadence-owned
+    ``project_path`` so each row lands in the per-project audit log.
     """
     from pollypm.audit.log import read_events
 
@@ -3003,7 +3088,13 @@ def scan_project(
         since=since,
         project_path=project_path,
     )
-    return scan_events(
+    # #2349 (round 3) — owned by the cadence handler. The pure
+    # detector appends one :class:`_TerminatorBreadcrumb` per subject
+    # that first crossed the terminator threshold this scan; we emit
+    # the durable rows after ``scan_events`` returns so the I/O lives
+    # at the route layer, not inside the detector.
+    pending_terminators: list[_TerminatorBreadcrumb] = []
+    findings = scan_events(
         events,
         now=resolved_now,
         config=config,
@@ -3019,7 +3110,16 @@ def scan_project(
         state_db_probes=state_db_probes,
         run_safety_net_probes=run_safety_net_probes,
         worker_cap_back_pressure=worker_cap_back_pressure,
+        stuck_draft_terminator_breadcrumbs=pending_terminators,
     )
+    for breadcrumb in pending_terminators:
+        _emit_stuck_draft_terminator(
+            project=breadcrumb.project,
+            subject=breadcrumb.subject,
+            prior_count=breadcrumb.prior_count,
+            project_path=project_path,
+        )
+    return findings
 
 
 # ---------------------------------------------------------------------------

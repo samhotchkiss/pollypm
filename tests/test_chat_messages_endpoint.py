@@ -52,6 +52,7 @@ from pollypm.web_api.chat.registry import (
     SurfaceType,
     TmuxWindowState,
 )
+from pollypm.web_api.chat import registry as chat_registry
 from pollypm.web_api.routes import chat_messages as chat_messages_routes
 from pollypm.web_api import service as web_api_service
 
@@ -259,7 +260,10 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
     against the same surface list.
     """
     def install(surfaces: list[ChatSurface]) -> None:
-        def fake(config, work_service=None, tmux_client=None):
+        def fake(
+            config, work_service=None, tmux_client=None,
+            include_transcripts=True,
+        ):
             return list(surfaces)
         def fake_find(config, session_name, work_service=None, tmux_client=None):
             for surface in surfaces:
@@ -408,7 +412,10 @@ def test_sessions_endpoint_coalesces_concurrent_discovery(
         lambda _config: None,
     )
 
-    def fake_enumerate(_config, *, work_service=None, tmux_client=None):
+    def fake_enumerate(
+        _config, *, work_service=None, tmux_client=None,
+        include_transcripts=True,
+    ):
         calls["n"] += 1
         time.sleep(0.05)
         return [surface]
@@ -433,6 +440,144 @@ def test_sessions_endpoint_coalesces_concurrent_discovery(
 
     assert results == [["operator"]] * 8
     assert calls == {"n": 1}
+
+
+def test_sessions_endpoint_cache_key_tracks_config_session_count(
+    config, monkeypatch,
+) -> None:
+    chat_messages_routes._CHAT_SESSIONS_CACHE.clear()
+    calls = {"n": 0}
+    surface = _surface("operator", SurfaceType.OPERATOR, persona="Polly")
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_tmux_client",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_work_service_stub",
+        lambda _config: None,
+    )
+
+    def fake_enumerate(
+        _config, *, work_service=None, tmux_client=None,
+        include_transcripts=True,
+    ):
+        calls["n"] += 1
+        return [surface] if _config.sessions else []
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "enumerate_chat_surfaces",
+        fake_enumerate,
+    )
+
+    first = chat_messages_routes.list_chat_sessions_endpoint(config)
+    assert first.sessions == []
+
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=config.project.root_dir,
+        project="myproj",
+        window_name="pm-operator",
+    )
+
+    second = chat_messages_routes.list_chat_sessions_endpoint(config)
+    assert [row.session_name for row in second.sessions] == ["operator"]
+    assert calls == {"n": 2}
+
+
+def test_sessions_endpoint_lightweight_mode_skips_transcript_indexes(
+    client, auth_headers, config, workspace, monkeypatch,
+) -> None:
+    chat_messages_routes._CHAT_SESSIONS_CACHE.clear()
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=workspace,
+        project="myproj",
+        window_name="pm-operator",
+    )
+
+    monkeypatch.setattr(chat_messages_routes, "_build_tmux_client", lambda: None)
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_work_service_stub",
+        lambda _config, **_kw: None,
+    )
+    monkeypatch.setattr(
+        chat_registry,
+        "_build_session_index",
+        lambda *_args, **_kwargs: pytest.fail(
+            "include_transcripts=false should skip transcript index scans"
+        ),
+    )
+
+    response = client.get(
+        "/api/v1/chat/sessions?include_transcripts=false",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [row["session_name"] for row in body["sessions"]] == ["operator"]
+    assert body["sessions"][0]["transcript"] == {"source": None, "path": None}
+
+
+def test_sessions_endpoint_cache_key_separates_lightweight_mode(
+    config, monkeypatch,
+) -> None:
+    chat_messages_routes._CHAT_SESSIONS_CACHE.clear()
+    calls: list[bool] = []
+    surface = _surface("operator", SurfaceType.OPERATOR, persona="Polly")
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_tmux_client",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_work_service_stub",
+        lambda _config: None,
+    )
+
+    def fake_enumerate(
+        _config, *, work_service=None, tmux_client=None,
+        include_transcripts=True,
+    ):
+        calls.append(include_transcripts)
+        return [surface]
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "enumerate_chat_surfaces",
+        fake_enumerate,
+    )
+
+    full = chat_messages_routes.list_chat_sessions_endpoint(
+        config,
+        include_transcripts=True,
+    )
+    light = chat_messages_routes.list_chat_sessions_endpoint(
+        config,
+        include_transcripts=False,
+    )
+    cached_light = chat_messages_routes.list_chat_sessions_endpoint(
+        config,
+        include_transcripts=False,
+    )
+
+    assert [row.session_name for row in full.sessions] == ["operator"]
+    assert [row.session_name for row in light.sessions] == ["operator"]
+    assert [row.session_name for row in cached_light.sessions] == ["operator"]
+    assert calls == [True, False]
 
 
 def test_sessions_endpoint_cookie_auth_uses_bounded_tmux_probe(

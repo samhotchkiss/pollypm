@@ -25,6 +25,8 @@ The helpers exposed here:
 * :func:`parse_event_ts` — best-effort ``ts`` → ``datetime`` parser.
 * :func:`iter_matching_events` — apply filters cheap→expensive and
   stream matching dict records.
+* :func:`aggregate_recent_stats` — stats-specific recent-window
+  aggregation optimized for the Web UI Activity rollup.
 
 Nothing here writes to disk; nothing imports from Typer or FastAPI.
 """
@@ -39,6 +41,7 @@ import multiprocessing.connection
 import re
 import time
 import zlib
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, MutableMapping
@@ -308,6 +311,21 @@ _SHORTCUT_UNITS = {
     "d": "days",
     "w": "weeks",
 }
+_TAIL_READ_CHUNK_BYTES = 128 * 1024
+_ARCHIVE_TS_RE = re.compile(r"\.(\d+)(?:\.\d+)?\.gz$")
+
+
+@dataclass(slots=True)
+class AuditStatsAggregate:
+    """Aggregated audit counts plus the route diagnostic counters."""
+
+    total: int = 0
+    by_event: dict[str, int] = field(default_factory=dict)
+    by_severity: dict[str, int] = field(default_factory=dict)
+    truncated_by_deadline: bool = False
+    lines_scanned: int = 0
+    corrupt_archives_skipped: int = 0
+    malformed_rows_skipped: int = 0
 
 
 def parse_since(value: str) -> datetime:
@@ -458,6 +476,152 @@ def open_log_lines(
             fh.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _iter_live_log_lines_reverse(path: Path) -> Iterator[str]:
+    """Yield non-empty live JSONL lines newest-first without full-file reads."""
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        logger.warning("audit.query: stat failed for %s: %s", path, exc)
+        return
+    if file_size <= 0:
+        return
+
+    carry = b""
+    offset = file_size
+    try:
+        with path.open("rb") as handle:
+            while offset > 0:
+                read_size = min(_TAIL_READ_CHUNK_BYTES, offset)
+                offset -= read_size
+                handle.seek(offset)
+                data = handle.read(read_size) + carry
+                lines = data.splitlines()
+                if offset > 0:
+                    if lines:
+                        carry = lines[0]
+                        lines = lines[1:]
+                    else:
+                        carry = data
+                        continue
+                else:
+                    carry = b""
+                for raw in reversed(lines):
+                    stripped = raw.decode("utf-8", errors="replace").strip()
+                    if stripped:
+                        yield stripped
+    except OSError as exc:
+        logger.warning("audit.query: tail read failed for %s: %s", path, exc)
+
+
+def _archive_predates_since(path: Path, since: datetime) -> bool:
+    """Return true when archive metadata proves all rows are older."""
+    if path.suffix != ".gz":
+        return False
+    since_ts = since.timestamp()
+    match = _ARCHIVE_TS_RE.search(path.name)
+    if match is not None:
+        try:
+            return int(match.group(1)) < since_ts
+        except ValueError:
+            pass
+    try:
+        return path.stat().st_mtime < since_ts
+    except OSError:
+        return False
+
+
+def _iter_log_lines_newest_first(
+    path: Path,
+    *,
+    stats: MutableMapping[str, int],
+) -> Iterator[str]:
+    """Yield raw lines newest-first for live files and best-effort archives."""
+    if path.suffix != ".gz":
+        yield from _iter_live_log_lines_reverse(path)
+        return
+    rows = [
+        line.strip()
+        for line in open_log_lines(path, stats=stats)
+        if line.strip()
+    ]
+    yield from reversed(rows)
+
+
+def _stats_deadline_expired(deadline_at: float | None) -> bool:
+    return deadline_at is not None and time.monotonic() >= deadline_at
+
+
+def _apply_stats_record(
+    record: dict,
+    aggregate: AuditStatsAggregate,
+) -> None:
+    aggregate.total += 1
+    event_name = str(record.get("event") or "")
+    severity = str(record.get("status") or "ok")
+    aggregate.by_event[event_name] = aggregate.by_event.get(event_name, 0) + 1
+    aggregate.by_severity[severity] = (
+        aggregate.by_severity.get(severity, 0) + 1
+    )
+
+
+def aggregate_recent_stats(
+    *,
+    targets: Iterable[Path],
+    since: datetime,
+    deadline_s: float | None = None,
+) -> AuditStatsAggregate:
+    """Aggregate recent audit stats without scanning known-old history.
+
+    This is intentionally stats-specific. Grep keeps the complete
+    forward walker because it supports arbitrary pattern semantics,
+    while the Activity rollup only needs counts inside a mandatory
+    ``since`` window. Audit writers append chronologically, so reading
+    live logs newest-first lets this helper stop a target's rotation
+    chain once it sees the first valid row older than ``since``.
+    """
+    stats: dict[str, int] = {}
+    aggregate = AuditStatsAggregate()
+    deadline_at = (
+        time.monotonic() + deadline_s
+        if deadline_s is not None and deadline_s > 0
+        else None
+    )
+
+    for live_path in targets:
+        stop_chain = False
+        for chain_path in walk_log_chain(live_path):
+            if _archive_predates_since(chain_path, since):
+                continue
+            for stripped in _iter_log_lines_newest_first(chain_path, stats=stats):
+                if _stats_deadline_expired(deadline_at):
+                    aggregate.truncated_by_deadline = True
+                    stop_chain = True
+                    break
+                aggregate.lines_scanned += 1
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                ts_raw = record.get("ts")
+                parsed_ts = (
+                    parse_event_ts(ts_raw) if isinstance(ts_raw, str) else None
+                )
+                if parsed_ts is None:
+                    aggregate.malformed_rows_skipped += 1
+                    continue
+                if parsed_ts < since:
+                    stop_chain = True
+                    break
+                _apply_stats_record(record, aggregate)
+            if stop_chain:
+                break
+
+    aggregate.corrupt_archives_skipped = stats.get("corrupt_archives_skipped", 0)
+    return aggregate
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +894,8 @@ def iter_matching_events(
 
 
 __all__ = [
+    "AuditStatsAggregate",
+    "aggregate_recent_stats",
     "iter_matching_events",
     "open_log_lines",
     "parse_event_ts",

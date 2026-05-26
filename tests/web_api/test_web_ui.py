@@ -273,10 +273,32 @@ def test_ui_index_contains_required_anchors(client: TestClient) -> None:
     assert "/ui/styles.css" in html
 
 
+def test_ui_index_versions_static_asset_urls(client: TestClient) -> None:
+    html = client.get("/ui/").text
+    assert "/ui/app.js?v=" in html
+    assert "/ui/styles.css?v=" in html
+
+
+def test_ui_index_sets_etag_and_revalidates(client: TestClient) -> None:
+    response = client.get("/ui/")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
+    etag = response.headers["etag"]
+    assert etag.startswith('"ui-index-')
+
+    cached = client.get("/ui/", headers={"If-None-Match": etag})
+    assert cached.status_code == 304
+    assert cached.headers["etag"] == etag
+    assert cached.headers["cache-control"] == "no-cache"
+
+
 def test_ui_static_js_served(client: TestClient) -> None:
     """``GET /ui/app.js`` returns the vanilla JS app."""
     response = client.get("/ui/app.js")
     assert response.status_code == 200
+    assert response.headers["cache-control"] == (
+        "public, max-age=31536000, immutable"
+    )
     body = response.text
     assert "credentials" in body, "app.js must use credentials:'include'"
     assert "loadSurfaces" in body
@@ -309,6 +331,9 @@ def test_ui_static_css_served(client: TestClient) -> None:
     """``GET /ui/styles.css`` returns the dark-theme stylesheet."""
     response = client.get("/ui/styles.css")
     assert response.status_code == 200
+    assert response.headers["cache-control"] == (
+        "public, max-age=31536000, immutable"
+    )
     body = response.text
     # Sanity-check that the palette wired through (not an empty file).
     assert "--info" in body or "#5b8aff" in body
@@ -1105,6 +1130,28 @@ def test_ui_app_js_has_surface_audit_panel_hooks(client: TestClient) -> None:
         "loadAuditForSurface",
         "auditPatternForSurface",
         "audit-toggle",
+    ):
+        assert expected in body
+
+
+def test_ui_app_js_uses_lightweight_chat_sessions_for_rail(
+    client: TestClient,
+) -> None:
+    body = client.get("/ui/app.js").text
+    assert '/chat/sessions?include_transcripts=false' in body
+    assert "new AbortController()" in body
+    assert "timedOut && isAbortError(err)" in body
+
+
+def test_ui_app_js_activity_stats_has_timeout_and_retry(client: TestClient) -> None:
+    body = client.get("/ui/app.js").text
+    for expected in (
+        "ACTIVITY_REQUEST_TIMEOUT_MS = 3000",
+        "ACTIVITY_STATS_DEADLINE_SECONDS = 2.5",
+        "apiJsonOptionalWithTimeout",
+        "_truncated_by_deadline",
+        "activity unavailable:",
+        "Retry loading activity",
     ):
         assert expected in body
 

@@ -22,6 +22,7 @@
   const PUSH_REFRESH_DEBOUNCE_MS = 150;
   const FETCH_RETRY_MS = 3000;
   const MAX_MESSAGES = 50;
+  const HISTORY_RENDER_LIMIT = MAX_MESSAGES;
   const SESSION_ISSUED_COOKIE = "pollypm-session-issued-at";
   const SESSION_EXPIRY_WARNING_MS = 6 * 24 * 60 * 60 * 1000;
   const TASK_RAIL_LIMIT = 200;
@@ -70,6 +71,7 @@
     dashboardRefreshQueued: false,
     historyInFlight: {},
     historyRefreshQueued: {},
+    historyRenderSignatures: {},
     fetchStates: {},
     sseFailures: 0,
     sseRetryTimer: null,
@@ -129,6 +131,11 @@
       }
     }
     return node;
+  }
+
+  function clearMessageList(list) {
+    list.innerHTML = "";
+    delete list.dataset.historySession;
   }
 
   function setStatus(level, label) {
@@ -1022,7 +1029,7 @@
     $("send-input").disabled = true;
     $("send-button").disabled = true;
     const list = $("message-list");
-    list.innerHTML = "";
+    clearMessageList(list);
     list.appendChild(el("div", {
       class: "message-empty",
       text: "No surface selected.",
@@ -1093,7 +1100,7 @@
       pollDashboard();
     });
     const list = $("message-list");
-    list.innerHTML = "";
+    clearMessageList(list);
     list.appendChild(el("div", { class: "empty-state" }, [
       el("div", { class: "empty-title", text: "No surface selected" }),
       el("div", {
@@ -1147,7 +1154,7 @@
   function renderTaskSummary(task, detail) {
     const data = detail || task;
     const list = $("message-list");
-    list.innerHTML = "";
+    clearMessageList(list);
     const status = data.work_status;
     const isTerminal = TERMINAL_TASK_STATES.has(status);
     // §1.4.5 (#2336): dwell row when non-terminal — surfaces "stuck
@@ -1600,6 +1607,53 @@
     renderLocalEchoes(name);
   }
 
+  function historyMessageSignature(message, index) {
+    const m = message || {};
+    return JSON.stringify([
+      m.id == null ? "index:" + index : "id:" + String(m.id),
+      String(m.ts || ""),
+      String(m.role || ""),
+      String(m.actor || ""),
+      String(m.type || ""),
+      String(m.text || ""),
+    ]);
+  }
+
+  function historyRenderSignature(data, messages) {
+    return JSON.stringify([
+      String(data.session_name || ""),
+      String(data.surface_type || ""),
+      String(data.transcript_source || ""),
+      String(messages.length),
+      messages.map(historyMessageSignature),
+    ]);
+  }
+
+  function shouldSkipHistoryRender(list, sessionName, signature) {
+    return (
+      list.dataset.historySession === sessionName
+      && state.historyRenderSignatures[sessionName] === signature
+    );
+  }
+
+  function markHistoryRendered(list, sessionName, signature) {
+    state.historyRenderSignatures[sessionName] = signature;
+    list.dataset.historySession = sessionName;
+  }
+
+  function historyMessageNode(message) {
+    const m = message || {};
+    const roleClass = "message message-role-" + (m.role || "system");
+    return el("div", { class: roleClass }, [
+      el("div", { class: "message-head" }, [
+        el("span", { class: "message-actor", text: m.actor || m.role || "?" }),
+        el("span", { class: "message-ts", text: m.ts || "" }),
+        el("span", { class: "message-type", text: m.type || "" }),
+      ]),
+      el("div", { class: "message-text", text: m.text || "" }),
+    ]);
+  }
+
   async function loadHistory(name, opts) {
     if (!name) return;
     const force = opts && opts.force;
@@ -1652,7 +1706,7 @@
 
   function renderHistoryLoading(fetchName) {
     const list = $("message-list");
-    list.innerHTML = "";
+    clearMessageList(list);
     list.appendChild(
       fetchAffordance(fetchName, "div", "message-empty", "loading history..."),
     );
@@ -1661,17 +1715,24 @@
 
   function renderHistory(data) {
     const list = $("message-list");
-    list.innerHTML = "";
     const meta = [];
     if (data.surface_type) meta.push(data.surface_type);
     if (data.transcript_source) meta.push("src=" + data.transcript_source);
     $("pane-meta").textContent = meta.join(" · ");
-    const msgs = Array.isArray(data.messages) ? data.messages.slice() : [];
+    const rawMessages = Array.isArray(data.messages) ? data.messages : [];
+    const msgs = rawMessages.slice(0, HISTORY_RENDER_LIMIT);
     const pending = reconcilePendingMessages(data.session_name, msgs);
     state.surfaceMidStream[data.session_name] = (
       msgs.length > 0 && messageLooksMidStream(msgs[0])
     );
     updateStopAgentButton();
+    const signature = historyRenderSignature(data, msgs);
+    if (shouldSkipHistoryRender(list, data.session_name, signature)) {
+      renderLocalEchoes(data.session_name);
+      return;
+    }
+    clearMessageList(list);
+    markHistoryRendered(list, data.session_name, signature);
     if (msgs.length === 0 && pending.length === 0) {
       list.appendChild(
         el("div", { class: "message-empty", text: "no messages yet" }),
@@ -1681,20 +1742,11 @@
     }
     // API returned newest-first; render oldest-first so the latest is
     // at the bottom (chat convention).
-    msgs.reverse();
-    for (const m of msgs) {
-      const roleClass = "message message-role-" + (m.role || "system");
-      list.appendChild(
-        el("div", { class: roleClass }, [
-          el("div", { class: "message-head" }, [
-            el("span", { class: "message-actor", text: m.actor || m.role || "?" }),
-            el("span", { class: "message-ts", text: m.ts || "" }),
-            el("span", { class: "message-type", text: m.type || "" }),
-          ]),
-          el("div", { class: "message-text", text: m.text || "" }),
-        ]),
-      );
+    const fragment = document.createDocumentFragment();
+    for (let i = msgs.length - 1; i >= 0; i -= 1) {
+      fragment.appendChild(historyMessageNode(msgs[i]));
     }
+    list.appendChild(fragment);
     renderLocalEchoes(data.session_name);
     list.scrollTop = list.scrollHeight;
     renderAuditPanel(data.session_name);
@@ -1702,7 +1754,7 @@
 
   function renderHistoryError(err) {
     const list = $("message-list");
-    list.innerHTML = "";
+    clearMessageList(list);
     list.appendChild(
       el("div", { class: "error-banner", text: "history error: " + err.message }),
     );
@@ -2126,7 +2178,7 @@
       + (state.inbox.nextCursor ? " · more available" : "")
     );
     const list = $("message-list");
-    list.innerHTML = "";
+    clearMessageList(list);
     list.appendChild(el("div", { class: "inbox-view" }, [
       renderInboxFilters(),
       el("div", { class: "inbox-content" }, [
@@ -2308,7 +2360,7 @@
     $("send-button").disabled = true;
     updateStopAgentButton();
     const list = $("message-list");
-    list.innerHTML = "";
+    clearMessageList(list);
     const rows = [
       ["Metric", card.label],
       ["Value", card.value],

@@ -255,6 +255,14 @@ EVENT_COCKPIT_SESSION_PARKED = "cockpit.session_parked"
 EVENT_COCKPIT_SESSION_RESPAWNED = "cockpit.session_respawned"
 EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED = "cockpit.duplicate_window_killed"
 EVENT_COCKPIT_PARK_SKIPPED_EXISTING = "cockpit.park_skipped_existing"
+# #2372 — operator pause/resume route audit events. The daemon-loop
+# ``session.pause.skip`` event is throttled in ``pollypm.session_paused``
+# because sweep ticks can fire repeatedly. These operator-request events
+# are not throttled: every successful API action, including idempotent
+# pause/resume requests, is a distinct audit breadcrumb.
+EVENT_SESSION_PAUSE_PAUSED = "session.paused"
+EVENT_SESSION_PAUSE_RESUMED = "session.resumed"
+EVENT_SESSION_PAUSE_REFUSED = "session.pause.refused"
 # #1570 — emitted once per row that ``pm inbox backfill-kinds --commit``
 # reclassifies from ``kind='legacy'`` to a real
 # :class:`pollypm.inbox.kind.InboxItemKind`. Carries ``msg_id``,

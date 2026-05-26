@@ -1246,8 +1246,9 @@ def list_project_tasks(
             next_cursor: str | None = None
             if len(tasks) > limit and page:
                 next_cursor = str(getattr(page[-1], "task_number", 0))
+            project_paused = not getattr(project, "tracked", True)
             return [
-                _task_to_summary(t) for t in page
+                _task_to_summary(t, project_paused=project_paused) for t in page
             ], next_cursor, total
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
@@ -1349,7 +1350,14 @@ def list_all_tasks(
                 since=since,
             ):
                 continue
-            summaries.append(_task_to_summary(task))
+            summaries.append(
+                _task_to_summary(
+                    task,
+                    project_paused=_project_paused_for_key(
+                        config, str(getattr(task, "project", ""))
+                    ),
+                )
+            )
         return _page_task_summaries(
             summaries, limit=limit, cursor=cursor, warnings=warnings
         )
@@ -1391,7 +1399,7 @@ def list_all_tasks(
                 since=since,
             ):
                 continue
-            summaries.append(_task_to_summary(task))
+            summaries.append(_task_to_summary(task, project_paused=False))
 
     try:
         dropped_count = _count_untracked_matches(
@@ -1501,7 +1509,15 @@ def _list_all_tasks_summary_page(
                         }
                     )
             return (
-                [_task_summary_projection_to_api(row) for row in rows],
+                [
+                    _task_summary_projection_to_api(
+                        row,
+                        project_paused=_project_paused_for_key(
+                            config, row.project
+                        ),
+                    )
+                    for row in rows
+                ],
                 next_cursor,
                 warnings,
                 total,
@@ -1526,6 +1542,13 @@ def _workspace_root_path(config: PollyPMConfig) -> Path:
         or getattr(config.project, "root_dir", None)
         or Path.cwd()
     )
+
+
+def _project_paused_for_key(config: PollyPMConfig, project_key: str) -> bool:
+    project = config.projects.get(project_key)
+    if project is None:
+        return True
+    return not getattr(project, "tracked", True)
 
 
 def _task_for_summary(svc, task):
@@ -3688,7 +3711,11 @@ def _task_to_summary(task, *, project_paused: bool | None = None) -> APITaskSumm
     )
 
 
-def _task_summary_projection_to_api(row: TaskSummaryProjection) -> APITaskSummary:
+def _task_summary_projection_to_api(
+    row: TaskSummaryProjection,
+    *,
+    project_paused: bool | None = None,
+) -> APITaskSummary:
     created_at = _as_aware_datetime(row.created_at)
     state_entered_at = _as_aware_datetime(row.state_entered_at) or created_at
     now = datetime.now(timezone.utc)
@@ -3709,6 +3736,7 @@ def _task_summary_projection_to_api(row: TaskSummaryProjection) -> APITaskSummar
         dwell_seconds=_dwell_seconds(row.work_status, state_entered_at, now),
         age_seconds=_elapsed_seconds(created_at, now),
         updated_at=_as_aware_datetime(row.updated_at),
+        project_paused=project_paused,
     )
 
 

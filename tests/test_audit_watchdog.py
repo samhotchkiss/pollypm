@@ -26,11 +26,13 @@ from pollypm.audit.log import (
 from pollypm.audit.watchdog import (
     EVENT_AUDIT_FINDING,
     EVENT_HEARTBEAT_TICK,
+    EVENT_STUCK_DRAFT_TERMINATED,
     RULE_CANCEL_NO_PROMOTION,
     RULE_MARKER_LEAKED,
     RULE_ORPHAN_MARKER,
     RULE_STUCK_DRAFT,
     RULE_TASK_PROGRESS_STALE,
+    STUCK_DRAFT_TERMINATOR_THRESHOLD,
     TIER_2,
     Finding,
     WatchdogConfig,
@@ -289,6 +291,305 @@ def test_stuck_draft_silenced_by_cancellation(now: datetime) -> None:
     ]
     findings = [f for f in scan_events(events, now=now) if f.rule == RULE_STUCK_DRAFT]
     assert findings == []
+
+
+def test_stuck_draft_terminator_breadcrumbs_collected_after_threshold_and_idempotent(
+    now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2333 / #2349 (round 3): after STUCK_DRAFT_TERMINATOR_THRESHOLD
+    prior findings for a subject, ``scan_events`` stops surfacing new
+    stuck_draft findings AND surfaces a single
+    :class:`_TerminatorBreadcrumb` for that subject through the optional
+    side-channel. A subsequent scan that also sees the terminator
+    breadcrumb in the events sequence must NOT re-collect it —
+    otherwise the breadcrumb itself cascades.
+
+    #2349 (round 3) hardening: ``scan_events`` is PURE — collecting the
+    breadcrumb is via an explicit list passed by the caller, never via
+    a direct ``pollypm.audit.log.emit`` call. The spy proves that even
+    when the side-channel is engaged, ``scan_events`` itself performs
+    zero durable writes.
+    """
+    from pollypm.audit.watchdog import _TerminatorBreadcrumb
+
+    emitted: list[tuple[str, str | None]] = []
+
+    def _record(*, event: str, subject: str | None = None, **_: object) -> None:
+        emitted.append((event, subject))
+
+    monkeypatch.setattr("pollypm.audit.log.emit", _record)
+
+    # Scan 1: 3 prior stuck_draft findings → terminator engages.
+    create_ts = now - timedelta(minutes=15)
+    prior_findings = [
+        _make_event(
+            event=EVENT_AUDIT_FINDING,
+            subject="demo/2",
+            metadata={"rule": RULE_STUCK_DRAFT},
+            ts=now - timedelta(minutes=30 + 5 * i),
+        )
+        for i in range(STUCK_DRAFT_TERMINATOR_THRESHOLD)
+    ]
+    create_event = _make_event(
+        event=EVENT_TASK_CREATED, subject="demo/2", ts=create_ts,
+    )
+    breadcrumbs_scan1: list[_TerminatorBreadcrumb] = []
+    findings = [
+        f for f in scan_events(
+            [create_event, *prior_findings],
+            now=now,
+            stuck_draft_terminator_breadcrumbs=breadcrumbs_scan1,
+        )
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings == [], "terminator should suppress the new finding"
+    assert len(breadcrumbs_scan1) == 1
+    assert breadcrumbs_scan1[0].subject == "demo/2"
+    assert breadcrumbs_scan1[0].project == "demo"
+    assert [
+        ev for ev in emitted if ev[0] == EVENT_STUCK_DRAFT_TERMINATED
+    ] == [], (
+        "scan_events must be pure — no direct audit.log.emit call even "
+        "when collecting terminator breadcrumbs"
+    )
+
+    # Scan 2: same prior findings + the terminator breadcrumb from
+    # scan 1 in the events sequence. The terminator MUST NOT re-collect.
+    emitted.clear()
+    breadcrumb_event = _make_event(
+        event=EVENT_STUCK_DRAFT_TERMINATED,
+        subject="demo/2",
+        metadata={"rule": RULE_STUCK_DRAFT},
+        ts=now - timedelta(minutes=1),
+    )
+    breadcrumbs_scan2: list[_TerminatorBreadcrumb] = []
+    findings_scan2 = [
+        f for f in scan_events(
+            [create_event, *prior_findings, breadcrumb_event],
+            now=now,
+            stuck_draft_terminator_breadcrumbs=breadcrumbs_scan2,
+        )
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings_scan2 == [], "still suppressed across scans"
+    assert breadcrumbs_scan2 == [], (
+        "terminator must NOT cascade — already_terminated_subjects guard"
+    )
+    assert [
+        ev for ev in emitted if ev[0] == EVENT_STUCK_DRAFT_TERMINATED
+    ] == [], "scan_events remains pure across scans"
+
+
+def test_scan_events_remains_pure_when_terminator_threshold_hit(
+    now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2349 (round 3) regression: ``scan_events`` MUST NOT call
+    ``pollypm.audit.log.emit`` even when the cascade-terminator
+    threshold is crossed.
+
+    Direct/synthetic ``scan_events`` callers (unit tests, ad-hoc
+    detector probes) feed event sequences in repeatedly; if the
+    detector emitted ``audit.stuck_draft_terminated`` rows during the
+    scan, the same input scanned twice would emit twice (or, worse,
+    feed back into the next read window and re-cascade). The cadence
+    path (:func:`scan_project`) is the sole authorised emitter.
+
+    Contract under test (the round-3 split):
+      * The repeat stuck_draft finding for the subject IS suppressed
+        (terminator dedup still works in-process).
+      * ``pollypm.audit.log.emit`` is called ZERO times by
+        ``scan_events`` itself.
+    """
+    spy_calls: list[dict[str, object]] = []
+
+    def _spy(**kwargs: object) -> None:
+        spy_calls.append(kwargs)
+
+    monkeypatch.setattr("pollypm.audit.log.emit", _spy)
+
+    create_ts = now - timedelta(minutes=15)
+    subject = "demo/4"
+    prior_findings = [
+        _make_event(
+            event=EVENT_AUDIT_FINDING,
+            subject=subject,
+            metadata={"rule": RULE_STUCK_DRAFT},
+            ts=now - timedelta(minutes=40 + 5 * i),
+        )
+        for i in range(STUCK_DRAFT_TERMINATOR_THRESHOLD)
+    ]
+    create_event = _make_event(
+        event=EVENT_TASK_CREATED, subject=subject, ts=create_ts,
+    )
+
+    findings = [
+        f for f in scan_events([create_event, *prior_findings], now=now)
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    # The repeating stuck_draft is still suppressed by the in-process
+    # terminator dedup — the detector remains correct, just pure.
+    assert findings == [], (
+        "scan_events must still suppress the repeating stuck_draft "
+        "finding once the terminator threshold is hit"
+    )
+    # ZERO writes — this is the round-3 hardening contract.
+    assert spy_calls == [], (
+        "scan_events performed audit.log.emit calls — detector must be "
+        "pure (no I/O). Cadence path (scan_project) is the only "
+        "authorised emitter for stuck_draft_terminated breadcrumbs. "
+        f"Observed: {spy_calls!r}"
+    )
+
+
+def test_stuck_draft_terminator_durable_across_scan_project_calls(
+    now: datetime,
+    tmp_path: Path,
+) -> None:
+    """#2349 regression: the terminator must NOT cascade when the
+    cadence handler reads from a per-project audit log.
+
+    Repro: production ``scan_project`` calls ``read_events`` which
+    prefers the per-project log when one exists. If prior
+    ``audit.finding`` rows are written without ``project_path`` they
+    only land on the central tail and ``scan_project`` does not see
+    them — so the threshold never counts the prior findings, OR the
+    threshold counts only synthetic rows and the terminator
+    breadcrumb itself lives only on the central tail (so the next
+    scan re-emits it forever).
+
+    Fix: ``emit_finding`` and ``_emit_stuck_draft_terminator`` now
+    accept ``project_path`` and both rows land in the per-project log
+    alongside the events that drive dedupe.
+
+    This test exercises the cadence-adjacent path: pre-seed the
+    per-project log with prior findings via the real
+    ``emit_finding`` writer (with ``project_path``), then call
+    ``scan_project`` twice with the same ``project_path``. The first
+    scan should emit exactly one terminator breadcrumb (also into the
+    per-project log). The second scan must see that breadcrumb and
+    NOT re-emit.
+    """
+    from pollypm.audit.log import emit as audit_emit, project_log_path
+    from pollypm.audit.watchdog import (
+        STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        emit_finding,
+        Finding,
+    )
+
+    project = "savethenovel"
+    project_path = tmp_path / project
+    (project_path / ".pollypm").mkdir(parents=True)
+    per_project = project_log_path(project_path)
+    assert per_project is not None
+
+    subject = f"{project}/7"
+
+    # Seed prior findings via the production ``emit_finding`` writer with
+    # ``project_path`` so they land in the per-project log — the source
+    # ``scan_project`` will read on the next tick.
+    for i in range(STUCK_DRAFT_TERMINATOR_THRESHOLD):
+        finding = Finding(
+            rule=RULE_STUCK_DRAFT,
+            project=project,
+            subject=subject,
+            message=f"prior stuck_draft finding #{i}",
+            recommendation="rec",
+        )
+        emit_finding(finding, project_path=project_path)
+
+    # Also write an old ``task.created`` row so the synthetic-event
+    # path inside ``_detect_stuck_drafts`` has a candidate to flag —
+    # this is the row that the terminator would suppress on the next
+    # scan. Use ``audit_emit`` with ``project_path`` so it lands in
+    # the per-project log too (mirroring what work-service does).
+    audit_emit(
+        event=EVENT_TASK_CREATED,
+        project=project,
+        subject=subject,
+        actor="polly",
+        project_path=project_path,
+    )
+
+    # Fix up the ``task.created`` ts so it's older than the
+    # stuck_draft threshold (the writer stamps "now"). Rewrite the
+    # file with the doctored ts. Per-project log content:
+    # finding rows + task.created.
+    lines = per_project.read_text(encoding="utf-8").splitlines()
+    rewritten: list[str] = []
+    create_ts = (now - timedelta(minutes=15)).isoformat()
+    finding_ts_base = now - timedelta(minutes=45)
+    finding_idx = 0
+    for raw in lines:
+        if not raw.strip():
+            continue
+        obj = json.loads(raw)
+        if obj.get("event") == EVENT_TASK_CREATED:
+            obj["ts"] = create_ts
+        elif obj.get("event") == "audit.finding":
+            # Space the prior findings out in the past so they all
+            # fall inside the scan_project lookback window.
+            obj["ts"] = (
+                finding_ts_base + timedelta(minutes=finding_idx)
+            ).isoformat()
+            finding_idx += 1
+        rewritten.append(json.dumps(obj))
+    per_project.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+    # First scan: terminator should engage. The cadence handler
+    # passes ``project_path`` so ``scan_project`` reads from the
+    # per-project log AND ``_emit_stuck_draft_terminator`` lands the
+    # breadcrumb in that same log.
+    findings_scan1 = [
+        f
+        for f in scan_project(project, project_path=project_path, now=now)
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings_scan1 == [], (
+        "terminator should suppress finding once threshold met"
+    )
+
+    # Verify the breadcrumb landed in the per-project log (not just
+    # the central tail).
+    rows_after_1 = [
+        json.loads(line)
+        for line in per_project.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    terminator_rows_1 = [
+        r for r in rows_after_1
+        if r["event"] == EVENT_STUCK_DRAFT_TERMINATED
+        and r.get("subject") == subject
+    ]
+    assert len(terminator_rows_1) == 1, (
+        "first scan must write exactly one terminator breadcrumb to "
+        "the per-project log"
+    )
+
+    # Second scan: the per-project log now contains the breadcrumb
+    # from scan 1. ``scan_project`` will read it and the terminator
+    # must NOT re-emit — otherwise the breadcrumb itself cascades.
+    findings_scan2 = [
+        f
+        for f in scan_project(project, project_path=project_path, now=now)
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings_scan2 == [], "still suppressed across scans"
+    rows_after_2 = [
+        json.loads(line)
+        for line in per_project.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    terminator_rows_2 = [
+        r for r in rows_after_2
+        if r["event"] == EVENT_STUCK_DRAFT_TERMINATED
+        and r.get("subject") == subject
+    ]
+    assert len(terminator_rows_2) == 1, (
+        "second scan must NOT re-emit the terminator — read/write "
+        "sources must agree (per-project log)"
+    )
 
 
 def test_stuck_draft_event_path_cross_checks_open_tasks_status(now: datetime) -> None:

@@ -117,6 +117,9 @@ The current event families are:
 | `worker.session_reaped` | worker marker reaper | `window_name`, `marker_path`, `reason` |
 | `watchdog.escalation_dispatched` | auto-unstick dispatch path | `finding_type`, `subject`, `brief` |
 | `session.provisioned` | reviewer/role recovery provisioning | `role`, `project`, `reason` |
+| `session.paused` | sessions-admin pause route | `session_name`, `actor`, `reason`, `paused_count_after` |
+| `session.resumed` | sessions-admin resume route | `session_name`, `actor`, `reason`, `paused_count_after` |
+| `session.pause.refused` | sessions-admin pause/resume unreadable-marker 503 path | `session_name`, `actor`, `reason`, `paused_count_after`, `refused_reason` |
 | `session.pause.marker_unreadable` | pause-marker reader | `path`, `reason`, `last_readable_paused_names` |
 | `session.pause.marker_restored` | pause-marker reader | `path`, `restored_size_bytes`, `restored_mtime`, `paused_state_diff` |
 | `worker.thread_leaked` | job worker shutdown leak detector | worker/thread diagnostic metadata |

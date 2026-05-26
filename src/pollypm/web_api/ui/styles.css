@@ -146,6 +146,9 @@ aside#dashboard-rail {
 }
 
 .surface-filter-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   padding: 0 12px 8px;
 }
 .rail-input,
@@ -169,6 +172,9 @@ aside#dashboard-rail {
 }
 .rail-select {
   flex: 0 0 86px;
+}
+.task-status-filter {
+  flex: 0 0 auto;
 }
 
 .project-list {
@@ -409,6 +415,32 @@ section#message-pane {
   font-size: 12.5px;
   margin: 8px 0;
   white-space: pre-wrap;
+}
+.task-detail-section {
+  margin: 10px 0;
+}
+.task-detail-heading {
+  color: var(--text-label);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin: 0 0 4px;
+  text-transform: uppercase;
+}
+.task-detail-section-body {
+  color: var(--text-body);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.task-detail-list {
+  margin: 0;
+  padding-left: 18px;
+}
+.task-detail-list li {
+  color: var(--text-body);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
 }
 .task-detail-row {
   display: grid;

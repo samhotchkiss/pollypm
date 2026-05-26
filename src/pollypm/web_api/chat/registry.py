@@ -317,6 +317,7 @@ def find_chat_surface(
     *,
     work_service: Any | None = None,
     tmux_client: Any | None = None,
+    include_transcripts: bool = True,
 ) -> ChatSurface | None:
     """Resolve one chat surface without enumerating the whole workspace.
 
@@ -339,7 +340,7 @@ def find_chat_surface(
             tmux_session=storage_session_name(config.project.tmux_session),
             tmux_state_cache=tmux_state_cache,
             session_index_cache=session_index_cache,
-            include_transcripts=True,
+            include_transcripts=include_transcripts,
         )
 
     parsed = parse_task_window_name(session_name)
@@ -368,7 +369,7 @@ def find_chat_surface(
                 tmux_session=storage_session_name(config.project.tmux_session),
                 tmux_state_cache=tmux_state_cache,
                 session_index_cache=session_index_cache,
-                include_transcripts=True,
+                include_transcripts=include_transcripts,
             )
     return None
 

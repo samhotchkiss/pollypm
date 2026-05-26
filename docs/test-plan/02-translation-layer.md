@@ -265,6 +265,16 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application
 
 **Expected:** 200, message lands even mid-stream. Confirms force bypass works.
 
+Then verify the audit trail:
+```bash
+tail -20 ~/.pollypm/audit/pollypm.jsonl | \
+  jq 'select(.event == "chat.send.force_bypass") | {event, status, subject, metadata}'
+```
+
+**Pass:** a `chat.send.force_bypass` event exists with `status: "warn"`,
+the target session in `subject`, a `metadata.bypassed_gates` array naming the
+skipped safety gates, and no injected message text in metadata.
+
 ### 2.4.4 Dead session
 
 ```bash

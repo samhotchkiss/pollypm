@@ -89,6 +89,74 @@ def _extract_text(value: Any) -> str:
     return ""
 
 
+def _json_object_from_string(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {"value": value}
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _codex_reasoning_text(payload: dict[str, Any]) -> str:
+    summary = payload.get("summary")
+    if not isinstance(summary, list):
+        return ""
+    parts: list[str] = []
+    for item in summary:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _codex_tool_call_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    payload_type = str(payload.get("type") or "tool_call")
+    call_id = str(payload.get("call_id") or payload.get("id") or "")
+    tool_name = str(
+        payload.get("name")
+        or payload.get("tool_name")
+        or payload.get("tool")
+        or payload_type
+    )
+    raw_input = (
+        payload.get("arguments")
+        if "arguments" in payload
+        else payload.get("input")
+    )
+    tool_input = raw_input if isinstance(raw_input, dict) else _json_object_from_string(raw_input)
+    out = dict(payload)
+    if call_id:
+        out["id"] = call_id
+    out["name"] = tool_name
+    out["input"] = tool_input
+    return out
+
+
+def _codex_tool_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    call_id = str(
+        payload.get("call_id")
+        or payload.get("id")
+        or payload.get("tool_use_id")
+        or ""
+    )
+    content = (
+        payload.get("output")
+        if "output" in payload
+        else payload.get("content", payload.get("text"))
+    )
+    out = dict(payload)
+    if call_id:
+        out["tool_use_id"] = call_id
+    if content is not None:
+        out["content"] = content
+        out["output"] = content
+    return out
+
+
 def _project_key_for_cwd(config, cwd: str | None) -> str:
     if not cwd:
         return config.project.name
@@ -483,7 +551,7 @@ def _normalize_codex_line(
             cursor.model_name = model_name
         return events
 
-    if entry_type != "event_msg":
+    if entry_type not in {"event_msg", "response_item"}:
         return events
 
     session_id = cursor.session_id or source_path.stem
@@ -491,6 +559,70 @@ def _normalize_codex_line(
     project_key = _project_key_for_cwd(config, cwd)
     model_name = cursor.model_name
     payload_type = payload.get("type")
+
+    if entry_type == "response_item":
+        common = {
+            "session_id": session_id,
+            "account_name": account_name,
+            "provider": account.provider.value,
+            "project_key": project_key,
+            "timestamp": timestamp,
+            "source_path": source_path,
+            "source_offset": source_offset,
+            "cwd": cwd,
+            "model_name": model_name,
+        }
+        if payload_type == "message":
+            text = _extract_text(
+                payload.get("content")
+                or payload.get("text")
+                or payload.get("message")
+                or payload
+            )
+            if text:
+                role = str(payload.get("role") or "assistant")
+                event_type = "user_turn" if role == "user" else "assistant_turn"
+                events.append(_event_base(
+                    event_type=event_type,
+                    payload={"text": text},
+                    **common,
+                ))
+        elif payload_type in {
+            "function_call",
+            "custom_tool_call",
+            "tool_search_call",
+        }:
+            events.append(_event_base(
+                event_type="tool_call",
+                payload=_codex_tool_call_payload(payload),
+                **common,
+            ))
+        elif payload_type in {
+            "function_call_output",
+            "custom_tool_call_output",
+            "tool_search_output",
+        }:
+            events.append(_event_base(
+                event_type="tool_result",
+                payload=_codex_tool_result_payload(payload),
+                **common,
+            ))
+        elif payload_type == "reasoning":
+            text = _codex_reasoning_text(payload)
+            if text:
+                events.append(_event_base(
+                    event_type="thinking",
+                    payload={
+                        "text": text,
+                        "signature": "",
+                        "raw": {
+                            "type": "reasoning",
+                            "summary": payload.get("summary"),
+                        },
+                    },
+                    **common,
+                ))
+        return events
 
     if payload_type == "token_count":
         info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
@@ -536,7 +668,7 @@ def _normalize_codex_line(
                     payload={"text": text},
                 )
             )
-    elif payload_type == "assistant_message":
+    elif payload_type in {"assistant_message", "agent_message"}:
         text = _extract_text(payload.get("text") or payload.get("message") or payload)
         if text:
             events.append(
@@ -567,7 +699,7 @@ def _normalize_codex_line(
                 source_offset=source_offset,
                 cwd=cwd,
                 model_name=model_name,
-                payload=payload,
+                payload=_codex_tool_call_payload(payload),
             )
         )
     elif payload_type == "tool_result":
@@ -583,7 +715,7 @@ def _normalize_codex_line(
                 source_offset=source_offset,
                 cwd=cwd,
                 model_name=model_name,
-                payload=payload,
+                payload=_codex_tool_result_payload(payload),
             )
         )
     elif payload_type == "turn_end":
@@ -602,12 +734,31 @@ def _normalize_codex_line(
                 payload=payload,
             )
         )
-    # TODO(#2048): Codex rollouts do not currently surface a ``reasoning``
-    # ``event_msg`` payload type — only ``reasoning_output_tokens`` is
-    # exposed via the ``token_count`` info blob (see line ~413). Wire a
-    # ``thinking`` branch here if/when Codex starts emitting reasoning
-    # content blocks; until then leaving this absent so the parser
-    # contract stays Claude-only for the THINKING envelope.
+    elif payload_type == "reasoning":
+        text = _codex_reasoning_text(payload)
+        if text:
+            events.append(
+                _event_base(
+                    event_type="thinking",
+                    session_id=session_id,
+                    account_name=account_name,
+                    provider=account.provider.value,
+                    project_key=project_key,
+                    timestamp=timestamp,
+                    source_path=source_path,
+                    source_offset=source_offset,
+                    cwd=cwd,
+                    model_name=model_name,
+                    payload={
+                        "text": text,
+                        "signature": "",
+                        "raw": {
+                            "type": "reasoning",
+                            "summary": payload.get("summary"),
+                        },
+                    },
+                )
+            )
     elif payload_type == "error":
         events.append(
             _event_base(

@@ -108,6 +108,7 @@ The current event families are:
 | `work_db.opened` | `PgWorkService.__init__` | `had_messages_table_pre_open`, `tables_created`, `project_path` |
 | `work_table.cleared` | Reserved for future wholesale work-table reset paths | reset reason and affected scope |
 | `heartbeat.tick` | audit watchdog cadence | cadence metadata |
+| `worker.heartbeat` | heartbeat supervisor when a worker has fresh transcript output | `task_id`, `session_name`, `window_name`, `snapshot_hash`, `log_bytes`, `delta_bytes` |
 | `heartbeat.missing` | supervisor recovery detection | `session`, `window_name`, `tmux_session`, `failure_type`, `failure_message` |
 | `session.spawn` | supervisor recovery relaunch | `session`, `window_name`, `tmux_session`, `failure_type`, `account`, `provider` |
 | `audit.finding` | audit watchdog findings | `rule`, `message`, `recommendation`, plus rule-specific data |
@@ -142,7 +143,7 @@ an alert keyed by `(rule, project, subject)`.
 | `orphan_marker` | `marker.created` without matching `marker.released` and without a terminal task transition. | `window_seconds=1800` | Inspect the worker pane; resume it or transition/cancel the task so cleanup can release the marker. |
 | `marker_leaked` | Any `marker.leaked` event in the window. | `window_seconds=1800` | Investigate identity/persona guard failures and session-name collisions. |
 | `stuck_draft` | A draft task that has not moved to queued, in progress, review, blocked, rework, or a terminal state. | `stuck_draft_seconds=300` | Queue the task with `pm task queue <project/N>` or cancel it if it is stale. |
-| `cancellation_no_promotion` | A task was cancelled and no later `task.created` event appeared for the same project within the grace window. | `cancel_grace_seconds=300` | Nudge or restart planning so a replacement task is created, or confirm cancellation was intentional. |
+| `cancellation_no_promotion` | A task was cancelled and no later `task.created` event appeared for the same project within the grace window. | `cancel_grace_seconds=300` | Routed to the architect self-heal tier to queue replacement work or make the parked state intentional. |
 | `task_review_stale` | A task has stayed at `status=review` too long. | `review_stale_seconds=1800` | Spawn a reviewer or complete/reject the task manually. |
 | `task_on_hold_stale` | A task has stayed at `status=on_hold` too long. | `on_hold_stale_seconds=900` | Let the architect reassess. Use an on-hold reason starting with `human-needed` only when a real human decision is required. |
 | `role_session_missing` | A queued, in-progress, or review task needs a role window that is absent from the storage closet. | No time threshold; depends on live task state and tmux windows. | Spawn the expected role session or reassign the task. |

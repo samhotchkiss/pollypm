@@ -114,6 +114,7 @@ class FakeHeartbeatAPI:
         self.events: list[tuple[str, str, str]] = []
         self.observations: list[str] = []
         self.checkpoints: list[tuple[str, list[str]]] = []
+        self.worker_heartbeats: list[tuple[str, str | None]] = []
         self.recoveries: list[tuple[str, str, str]] = []
         self.account_marks: list[tuple[str, str, str]] = []
         self.messages: list[tuple[str, str, str]] = []
@@ -147,6 +148,14 @@ class FakeHeartbeatAPI:
 
     def record_checkpoint(self, context: HeartbeatSessionContext, *, alerts: list[str]) -> None:
         self.checkpoints.append((context.session_name, alerts))
+
+    def record_worker_heartbeat(
+        self,
+        context: HeartbeatSessionContext,
+        *,
+        task_id: str | None = None,
+    ) -> None:
+        self.worker_heartbeats.append((context.session_name, task_id))
 
     def record_event(self, session_name: str, event_type: str, message: str) -> None:
         self.events.append((session_name, event_type, message))
@@ -663,6 +672,40 @@ def test_supervisor_heartbeat_api_records_observation_via_supervisor_facade() ->
     assert calls[0]["snapshot_hash"] == "hash-1"
 
 
+def test_supervisor_heartbeat_api_emits_worker_heartbeat_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.audit.log import EVENT_WORKER_HEARTBEAT, read_events
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    supervisor = SimpleNamespace(config=_config(tmp_path))
+    api = SupervisorHeartbeatAPI.__new__(SupervisorHeartbeatAPI)
+    api.supervisor = supervisor
+
+    api.record_worker_heartbeat(
+        _context(
+            session_name="worker_pollypm",
+            role="worker",
+            project_key="pollypm",
+            transcript_delta="Implemented the parser.\n",
+            source_bytes=128,
+        ),
+        task_id="pollypm/9",
+    )
+
+    rows = read_events(
+        "pollypm",
+        event=EVENT_WORKER_HEARTBEAT,
+        project_path=tmp_path,
+    )
+    assert len(rows) == 1
+    assert rows[0].subject == "pollypm/9"
+    assert rows[0].actor == "worker_pollypm"
+    assert rows[0].metadata["task_id"] == "pollypm/9"
+    assert rows[0].metadata["delta_bytes"] == len("Implemented the parser.\n")
+
+
 def test_supervisor_heartbeat_api_deduplicates_snapshot_learnings(tmp_path: Path, monkeypatch) -> None:
     supervisor = Supervisor(_config(tmp_path))
     supervisor.ensure_layout()
@@ -1147,6 +1190,38 @@ def test_local_heartbeat_backend_uses_mechanical_checks_only_for_heartbeat_super
     assert ("heartbeat", "needs_followup") not in api.alerts
     assert ("heartbeat", "idle_output") not in api.alerts
     assert ("heartbeat", "suspected_loop") not in api.alerts
+
+
+def test_local_heartbeat_backend_records_worker_heartbeat_for_fresh_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "pollypm.heartbeats.local._collect_work_service_signals",
+        lambda _api, _context: {"active_claim_task_id": "pollypm/42"},
+    )
+    api = FakeHeartbeatAPI([
+        _context(transcript_delta="Implemented the change.\n"),
+    ])
+
+    LocalHeartbeatBackend().run(api)
+
+    assert api.worker_heartbeats == [("worker_pollypm", "pollypm/42")]
+
+
+def test_local_heartbeat_backend_skips_worker_heartbeat_without_fresh_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "pollypm.heartbeats.local._collect_work_service_signals",
+        lambda _api, _context: {"active_claim_task_id": "pollypm/42"},
+    )
+    api = FakeHeartbeatAPI([
+        _context(transcript_delta=""),
+    ])
+
+    LocalHeartbeatBackend().run(api)
+
+    assert api.worker_heartbeats == []
 
 
 def test_local_heartbeat_backend_alerts_on_unmanaged_window_once() -> None:

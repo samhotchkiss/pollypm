@@ -39,6 +39,7 @@ from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     OPERATOR_DISPATCH_THROTTLE_SECONDS,
     Finding,
+    RULE_CANCEL_NO_PROMOTION,
     RULE_DUPLICATE_ADVISOR_TASKS,
     RULE_LEGACY_DB_SHADOW,
     RULE_PLAN_MISSING_ALERT_CHURN,
@@ -145,6 +146,7 @@ _DISPATCHABLE_RULES: frozenset[str] = frozenset({
     # alone leaves them parked forever; dispatch the architect to queue,
     # cancel, or rewrite them.
     RULE_STUCK_DRAFT,
+    RULE_CANCEL_NO_PROMOTION,
     RULE_TASK_REVIEW_STALE,
     RULE_TASK_PROGRESS_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,

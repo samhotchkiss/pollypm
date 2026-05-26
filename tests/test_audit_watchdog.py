@@ -31,6 +31,7 @@ from pollypm.audit.watchdog import (
     RULE_ORPHAN_MARKER,
     RULE_STUCK_DRAFT,
     RULE_TASK_PROGRESS_STALE,
+    TIER_2,
     Finding,
     WatchdogConfig,
     emit_finding,
@@ -395,6 +396,12 @@ def test_cancel_without_replacement_fires(now: datetime) -> None:
     ]
     assert len(findings) == 1
     assert findings[0].subject == "demo/1"
+    assert findings[0].tier == TIER_2
+    assert findings[0].evidence["cancelled_task_id"] == "demo/1"
+    assert (
+        findings[0].evidence["required_decision"]
+        == "queue_replacement_or_mark_project_intentionally_parked"
+    )
 
 
 def test_cancel_with_followup_create_silenced(now: datetime) -> None:
@@ -415,6 +422,32 @@ def test_cancel_with_followup_create_silenced(now: datetime) -> None:
         if f.rule == RULE_CANCEL_NO_PROMOTION
     ]
     assert findings == []
+
+
+def test_format_unstick_brief_cancellation_no_promotion_is_decisive() -> None:
+    from pollypm.audit.watchdog import format_unstick_brief
+
+    finding = Finding(
+        rule=RULE_CANCEL_NO_PROMOTION,
+        project="demo",
+        subject="demo/1",
+        message="Task demo/1 was cancelled but no replacement was queued.",
+        metadata={
+            "cancelled_at": "2026-05-06T16:45:00+00:00",
+            "from": "in_progress",
+            "actor": "worker",
+        },
+        tier=TIER_2,
+    )
+
+    brief = format_unstick_brief(finding)
+
+    assert "Finding: cancellation_no_promotion" in brief
+    assert "in_progress -> cancelled" in brief
+    assert "No later task.created" in brief
+    assert "queue replacement work" in brief
+    assert "intentionally park" in brief
+    assert "Do not reply with analysis alone" in brief
 
 
 def test_cancel_within_grace_window_silenced(now: datetime) -> None:
@@ -1213,6 +1246,75 @@ def test_cadence_handler_dispatches_stuck_draft(
     ]
     assert len(dispatch_rows) == 1
     assert dispatch_rows[0]["metadata"]["finding_type"] == RULE_STUCK_DRAFT
+
+
+def test_cadence_handler_dispatches_cancellation_no_promotion(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel-without-replacement is tier-2 self-heal via architect dispatch."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+
+    central = central_log_path("savethenovel")
+    central.parent.mkdir(parents=True, exist_ok=True)
+    central.write_text(
+        json.dumps({
+            "schema": 1,
+            "ts": (now - timedelta(minutes=15)).isoformat(),
+            "project": "savethenovel",
+            "event": EVENT_TASK_STATUS_CHANGED,
+            "subject": "savethenovel/1",
+            "actor": "worker",
+            "status": "ok",
+            "metadata": {"from": "in_progress", "to": "cancelled"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: [],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_open_tasks",
+        lambda key, path: [],
+    )
+
+    store = _RecordingStore()
+    counters = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert counters["findings"] == 1
+    assert counters["dispatches_sent"] == 1
+    assert len(sent) == 1
+    target, brief = sent[0]
+    assert target == "pollypm-storage-closet:architect-savethenovel"
+    assert RULE_CANCEL_NO_PROMOTION in brief
+    assert "queue replacement work" in brief
+    assert "intentionally park" in brief
+
+    rows = [
+        json.loads(line)
+        for line in central.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    dispatch_rows = [
+        r for r in rows if r["event"] == "watchdog.escalation_dispatched"
+    ]
+    assert len(dispatch_rows) == 1
+    assert dispatch_rows[0]["metadata"]["finding_type"] == RULE_CANCEL_NO_PROMOTION
 
 
 def test_cadence_handler_throttles_repeat_dispatch(

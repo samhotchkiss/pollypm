@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +11,9 @@ from pollypm.atomic_io import atomic_write_json
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
 from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
 from pollypm.heartbeats.types import Alert
+
+
+logger = logging.getLogger(__name__)
 
 
 class _SupervisorHost(Protocol):
@@ -168,6 +172,61 @@ class SupervisorHeartbeatAPI:
             snapshot_path=context.snapshot_path,
             snapshot_hash=context.snapshot_hash,
         )
+
+    def record_worker_heartbeat(
+        self,
+        context: HeartbeatSessionContext,
+        *,
+        task_id: str | None = None,
+    ) -> None:
+        """Emit the audit progress signal for fresh worker transcript output.
+
+        The local heartbeat backend decides whether a session produced
+        fresh transcript output this tick; this facade owns the audit
+        write so the event uses the configured project/audit path and
+        stays best-effort like the rest of the heartbeat observation
+        path.
+        """
+        if context.role != "worker":
+            return
+        if not (context.transcript_delta or "").strip():
+            return
+        project = context.project_key or ""
+        if not project:
+            return
+        subject = task_id or context.session_name
+        project_path: Path | None = None
+        try:
+            project_cfg = self.supervisor.config.projects.get(project)
+            if project_cfg is not None:
+                project_path = Path(project_cfg.path)
+        except Exception:  # noqa: BLE001
+            project_path = None
+
+        try:
+            from pollypm.audit.log import (
+                EVENT_WORKER_HEARTBEAT,
+                emit as audit_emit,
+            )
+
+            delta = context.transcript_delta or ""
+            audit_emit(
+                event=EVENT_WORKER_HEARTBEAT,
+                project=project,
+                subject=subject,
+                actor=context.session_name,
+                metadata={
+                    "task_id": task_id or "",
+                    "session_name": context.session_name,
+                    "window_name": context.window_name,
+                    "snapshot_hash": context.snapshot_hash,
+                    "log_bytes": context.source_bytes,
+                    "delta_bytes": len(delta.encode("utf-8")),
+                },
+                project_path=project_path,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("record_worker_heartbeat failed", exc_info=True)
 
     def record_checkpoint(self, context: HeartbeatSessionContext, *, alerts: list[str]) -> None:
         if not context.window_present or context.snapshot_path is None:

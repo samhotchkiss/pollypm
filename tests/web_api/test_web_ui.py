@@ -1366,14 +1366,15 @@ const path = process.argv[1];
 const payload = JSON.parse(process.argv[2]);
 
 function makeNode(tag) {
-  const node = {
-    tagName: (tag || "div").toUpperCase(),
-    children: [],
-    attrs: {},
-    className: "",
-    textContent: "",
-    disabled: false,
-  };
+    const node = {
+      tagName: (tag || "div").toUpperCase(),
+      children: [],
+      attrs: {},
+      className: "",
+      textContent: "",
+      dataset: {},
+      disabled: false,
+    };
   Object.defineProperty(node, "innerHTML", {
     get() {
       function render(n) {
@@ -1531,6 +1532,45 @@ def test_selecting_task_surface_disables_chat_send() -> None:
     assert "Historical fix" in rendered["messages"]
     assert rendered["sendInputDisabled"] is True
     assert rendered["sendButtonDisabled"] is True
+
+
+def test_task_detail_renders_labeled_api_fields() -> None:
+    rendered = _node_render_surface_rail({
+        "tasks": [
+            {
+                "key": "myproj/11",
+                "task_id": "myproj/11",
+                "project": "myproj",
+                "task_number": "11",
+                "title": "Spike contract",
+                "work_status": "queued",
+                "type": "spike",
+                "priority": "high",
+                "assignee": "",
+                "updated_at": "2026-05-23T00:00:00Z",
+                "description": "Investigate the API shape.",
+                "acceptance_criteria": "Acceptance stays visible.",
+                "constraints": "Do not bypass service facades.",
+                "labels": ["api", "web"],
+                "relevant_files": ["src/pollypm/web_api/service.py"],
+                "requires_human_review": True,
+            },
+        ],
+        "selectTask": "myproj/11",
+    })
+    messages = rendered["messages"]
+    assert "Type" in messages
+    assert "spike" in messages
+    assert "Labels" in messages
+    assert "api, web" in messages
+    assert "Human review" in messages
+    assert "required" in messages
+    assert "Acceptance criteria" in messages
+    assert "Acceptance stays visible." in messages
+    assert "Constraints" in messages
+    assert "Do not bypass service facades." in messages
+    assert "Relevant files" in messages
+    assert "src/pollypm/web_api/service.py" in messages
 
 
 def test_task_detail_surfaces_cancel_and_reopen_actions() -> None:

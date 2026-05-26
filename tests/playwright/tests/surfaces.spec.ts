@@ -167,7 +167,7 @@ test.describe("surfaces", () => {
   }
 
   async function stubEmptyTasks(page: import("@playwright/test").Page) {
-    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+    await page.route(/\/api\/v1\/tasks\?.*limit=200/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -885,6 +885,91 @@ test.describe("surfaces", () => {
     await expect(page.locator("#message-list")).toContainText(
       "Visible task detail",
     );
+  });
+
+  test("task status selector reloads rail with status query params", async ({ page }) => {
+    const requestedStatuses: string[][] = [];
+    await stubEmptyProjects(page);
+    await stubEmptyActivity(page);
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?.*limit=200/, (route) => {
+      const url = new URL(route.request().url());
+      requestedStatuses.push(url.searchParams.getAll("status"));
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.locator("#task-status-filter").selectOption("blocked");
+    await expect.poll(() => requestedStatuses.some((statuses) =>
+      statuses.includes("blocked") && statuses.includes("on_hold"),
+    )).toBe(true);
+  });
+
+  test("task search can open project slash number outside the loaded rail", async ({ page }) => {
+    await stubEmptyProjects(page);
+    await stubEmptyActivity(page);
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      }),
+    );
+    await page.route("**/api/v1/tasks/demo/404", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          task_id: "demo/404",
+          project: "demo",
+          task_number: 404,
+          title: "Historical blocked task",
+          work_status: "blocked",
+          type: "bug",
+          priority: "high",
+          assignee: "",
+          updated_at: "2026-05-23T00:00:00Z",
+          description: "Loaded by direct detail lookup",
+          acceptance_criteria: "Direct lookup has labeled criteria.",
+          constraints: "Use REST detail only.",
+          labels: ["historical"],
+          relevant_files: ["src/pollypm/web_api/ui/app.js"],
+          requires_human_review: true,
+          relationships: {},
+          transitions: [],
+          executions: [],
+        }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    await page.locator("#surface-filter").fill("demo/404");
+    await page.locator("li[data-task='demo/404']").click();
+    await expect(page.locator("#pane-title")).toHaveText("demo/404");
+    await expect(page.locator("#message-list")).toContainText(
+      "Loaded by direct detail lookup",
+    );
+    await expect(page.locator("#message-list")).toContainText(
+      "Acceptance criteria",
+    );
+    await expect(page.locator("#message-list")).toContainText("Relevant files");
   });
 
   test("queued task detail Start posts to claim endpoint as worker", async ({ page }) => {

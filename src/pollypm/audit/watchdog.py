@@ -677,6 +677,7 @@ def _emit_stuck_draft_terminator(
     project: str,
     subject: str,
     prior_count: int,
+    project_path: Path | str | None = None,
 ) -> None:
     """#2333 — record that we stopped re-flagging ``subject`` as stuck_draft.
 
@@ -685,6 +686,14 @@ def _emit_stuck_draft_terminator(
     pollypm/191?" without us having to dig through the detector.
     Best-effort — must never raise; the loss of a single forensic
     breadcrumb is far better than crashing the cadence handler.
+
+    ``project_path`` MUST be threaded through from the cadence handler
+    (via ``scan_project`` → ``scan_events`` → ``_detect_stuck_drafts``)
+    so the breadcrumb lands in the per-project audit log alongside the
+    ``audit.finding`` rows it terminates. Without this, the per-project
+    log is the read source on the next scan but the breadcrumb only
+    lives on the central tail — the read/write split makes the
+    terminator re-emit forever (the #2349 Codex blocker).
     """
     try:
         from pollypm.audit.log import emit as _audit_emit
@@ -704,6 +713,7 @@ def _emit_stuck_draft_terminator(
                     "watchdog flagging."
                 ),
             },
+            project_path=project_path,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -718,6 +728,7 @@ def _detect_stuck_drafts(
     now: datetime,
     config: WatchdogConfig,
     open_tasks: Sequence[Any] | None = None,
+    project_path: Path | str | None = None,
 ) -> list[Finding]:
     """Rule 3 (state-based, #1433): tasks currently at ``status=draft``
     older than ``stuck_draft_seconds``.
@@ -785,6 +796,7 @@ def _detect_stuck_drafts(
                 project=project,
                 subject=subject,
                 prior_count=prior_finding_counts[subject],
+                project_path=project_path,
             )
         return True
 
@@ -2781,6 +2793,7 @@ def scan_events(
     open_tasks: Sequence[Any] | None = None,
     storage_window_names: Sequence[str] | None = None,
     project: str = "",
+    project_path: Path | str | None = None,
     done_plan_tasks: Sequence[Any] | None = None,
     plan_review_present: Any = None,
     bypassed_plan_tasks: Sequence[Any] | None = None,
@@ -2842,7 +2855,11 @@ def scan_events(
         materialised, now=now, config=config,
     ))
     findings.extend(_detect_stuck_drafts(
-        materialised, now=now, config=config, open_tasks=open_tasks,
+        materialised,
+        now=now,
+        config=config,
+        open_tasks=open_tasks,
+        project_path=project_path,
     ))
     findings.extend(_detect_cancellation_no_promotion(
         materialised, now=now, config=config,
@@ -2993,6 +3010,7 @@ def scan_project(
         open_tasks=open_tasks,
         storage_window_names=storage_window_names,
         project=project,
+        project_path=project_path,
         done_plan_tasks=done_plan_tasks,
         plan_review_present=plan_review_present,
         bypassed_plan_tasks=bypassed_plan_tasks,
@@ -3135,12 +3153,24 @@ def emit_heartbeat_tick(
         )
 
 
-def emit_finding(finding: Finding) -> None:
+def emit_finding(
+    finding: Finding,
+    *,
+    project_path: Path | str | None = None,
+) -> None:
     """Emit an ``audit.finding`` event for posterity.
 
     The cadence handler also routes findings to ``upsert_alert`` for
     user-visible surfacing; this audit emit is the durable forensic
     trail. Best-effort — never raises.
+
+    ``project_path``: when supplied, the finding row is also written to
+    the per-project audit log (``<project>/.pollypm/audit.jsonl``). The
+    cadence handler MUST pass this so :func:`scan_project` — which
+    prefers the per-project log when present — sees the prior findings
+    that drive dedupe windows and cascade terminators (#2333/#2349).
+    Without it, prior findings live only on the central tail and the
+    next scan misses them.
     """
     from pollypm.audit.log import emit as _audit_emit
     try:
@@ -3156,6 +3186,7 @@ def emit_finding(finding: Finding) -> None:
                 "recommendation": finding.recommendation,
                 **dict(finding.metadata or {}),
             },
+            project_path=project_path,
         )
     except Exception:  # noqa: BLE001
         logger.debug("emit_finding failed", exc_info=True)

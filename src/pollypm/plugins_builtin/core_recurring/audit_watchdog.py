@@ -3344,7 +3344,13 @@ def _route_one_finding(
 ) -> None:
     """Apply alert routing + tier-1/3/4 dispatch for a single finding."""
     counters["findings"] += 1
-    emit_finding(finding)
+    # #2349 — thread ``project_path`` so the ``audit.finding`` row lands
+    # in the per-project audit log alongside the per-project events
+    # that scan_project will read on the next tick. Without this, prior
+    # findings live only on the central tail and the cascade-terminator
+    # (#2333) can't dedupe across scans for projects with a per-project
+    # log.
+    emit_finding(finding, project_path=project_path)
     if _route_to_alert_sink(
         finding, msg_store=msg_store, state_store=state_store,
     ):

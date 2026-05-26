@@ -111,6 +111,78 @@ def test_run_smoke_exits_nonzero_when_slow_rest_check_fails(monkeypatch, capsys)
     assert "Failed checks: dashboard" in output
 
 
+def test_run_rest_check_discards_cold_first_hit_for_dashboard(monkeypatch) -> None:
+    """Dashboard/sessions get a discarded warmup hit; measurement reflects the
+    second (warm) request. A cold-hit-then-warm pattern must pass even though
+    the cold hit alone would have exceeded the 1s smoke threshold."""
+    calls: list[str] = []
+
+    def fake_get_json(url: str, *, token: str | None, timeout_seconds: float = 5.0):
+        calls.append(url)
+        return 200, {"daemon_status": "ok"}
+
+    # run_rest_check calls time.monotonic() exactly twice on the measured
+    # request (start + end). The warmup hit doesn't time itself.
+    timings = iter([0.000, 0.050])
+    monkeypatch.setattr(smoke, "get_json", fake_get_json)
+    monkeypatch.setattr(smoke.time, "monotonic", lambda: next(timings))
+
+    result = smoke.run_rest_check(
+        "dashboard",
+        "http://127.0.0.1:8765/api/v1/dashboard",
+        token="t",
+        required_key="daemon_status",
+    )
+
+    # Two HTTP hits: one warmup, one measured.
+    assert len(calls) == 2
+    assert result.ok
+    assert result.elapsed_seconds == 0.050
+    assert "HTTP 200 in 0.050s" == result.detail
+
+
+def test_run_rest_check_health_does_not_warmup(monkeypatch) -> None:
+    """Endpoints outside WARMUP_REST_CHECKS get a single request only."""
+    calls: list[str] = []
+
+    def fake_get_json(url: str, *, token: str | None, timeout_seconds: float = 5.0):
+        calls.append(url)
+        return 200, {"status": "ok"}
+
+    monkeypatch.setattr(smoke, "get_json", fake_get_json)
+
+    result = smoke.run_rest_check(
+        "health",
+        "http://127.0.0.1:8765/api/v1/health",
+        token=None,
+        expected_value=("status", "ok"),
+    )
+
+    assert len(calls) == 1
+    assert result.ok
+
+
+def test_run_rest_check_fails_when_warm_response_exceeds_budget(monkeypatch) -> None:
+    """After warmup, a still-slow measured response (>1s) must still fail."""
+
+    def fake_get_json(url: str, *, token: str | None, timeout_seconds: float = 5.0):
+        return 200, {"daemon_status": "ok"}
+
+    monkeypatch.setattr(smoke, "get_json", fake_get_json)
+    timings = iter([0.000, 1.500])
+    monkeypatch.setattr(smoke.time, "monotonic", lambda: next(timings))
+
+    result = smoke.run_rest_check(
+        "dashboard",
+        "http://127.0.0.1:8765/api/v1/dashboard",
+        token="t",
+        required_key="daemon_status",
+    )
+
+    assert not result.ok
+    assert "slow response 1.500s" == result.detail
+
+
 def test_dry_run_avoids_command_execution() -> None:
     result, stdout = smoke.run_command(
         smoke.CommandSpec("doctor", ("pm", "doctor")),

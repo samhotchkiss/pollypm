@@ -25,6 +25,7 @@ Also covers:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -1074,6 +1075,81 @@ def test_parse_cache_skips_strict_mode(
     parse_events_jsonl(events_path, strict=True)
     # One event * 3 strict calls = 3 conversions (no caching).
     assert parse_calls["count"] == 3
+
+
+def test_parse_cache_miss_shares_concurrent_strict_parse(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Concurrent source=jsonl-style readers wait on one active parse."""
+    _parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [_claude_event("user_turn", text="shared")])
+
+    parse_calls = {"count": 0}
+    parse_calls_lock = threading.Lock()
+    parse_started = threading.Event()
+    release_parse = threading.Event()
+    real_event_to_envelopes = transcripts_module._event_to_envelopes
+
+    def counting(*args, **kwargs):  # type: ignore[no-untyped-def]
+        with parse_calls_lock:
+            parse_calls["count"] += 1
+        parse_started.set()
+        assert release_parse.wait(timeout=2.0)
+        return real_event_to_envelopes(*args, **kwargs)
+
+    monkeypatch.setattr(transcripts_module, "_event_to_envelopes", counting)
+
+    results: list[list[str]] = []
+    errors: list[BaseException] = []
+    results_lock = threading.Lock()
+    waiter_count = {"count": 0}
+    waiters_ready = threading.Event()
+    waiter_target = 7
+
+    def worker(*, is_waiter: bool = False) -> None:
+        if is_waiter:
+            with results_lock:
+                waiter_count["count"] += 1
+                if waiter_count["count"] == waiter_target:
+                    waiters_ready.set()
+        try:
+            envelopes = parse_events_jsonl(events_path, strict=True)
+        except BaseException as exc:  # pragma: no cover - assertion reports errors
+            with results_lock:
+                errors.append(exc)
+            return
+        with results_lock:
+            results.append([env.text for env in envelopes])
+
+    owner = threading.Thread(target=worker)
+    owner.start()
+    assert parse_started.wait(timeout=2.0)
+
+    waiters = [
+        threading.Thread(target=worker, kwargs={"is_waiter": True})
+        for _ in range(waiter_target)
+    ]
+    for thread in waiters:
+        thread.start()
+
+    assert waiters_ready.wait(timeout=2.0)
+    # Give the waiter wave a chance to hit the in-flight entry while the
+    # owner is still blocked inside the parse body. Without sharing,
+    # they would increment parse_calls here and block on release_parse too.
+    time.sleep(0.1)
+    assert parse_calls["count"] == 1
+    release_parse.set()
+    for thread in [owner, *waiters]:
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert results == [["shared"]] * 8
+    assert parse_calls["count"] == 1
+    assert (events_path, False) not in transcripts_module._PARSE_CACHE
+    assert transcripts_module._PARSE_INFLIGHT == {}
 
 
 def test_parse_cache_distinguishes_actor_fallback(

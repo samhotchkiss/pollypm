@@ -52,6 +52,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -358,6 +359,22 @@ _PARSE_CACHE: dict[
 _PARSE_CACHE_MAX = 100
 
 
+@dataclass(slots=True)
+class _ParseInflight:
+    event: threading.Event
+    result: list[MessageEnvelope] | None = None
+    exception: BaseException | None = None
+
+
+# Protects the persistent parse cache and the short-lived in-flight
+# registry. The heavyweight JSONL read/parse happens outside this lock;
+# it only serializes dictionary bookkeeping for one cache-fill decision.
+_PARSE_CACHE_LOCK = threading.Lock()
+_PARSE_INFLIGHT: dict[
+    tuple[Path, bool, float, str, bool], _ParseInflight,
+] = {}
+
+
 _SESSION_INDEX_CACHE: dict[
     Path, tuple[tuple[tuple[str, float, int], ...], list[_SessionIndexEntry]]
 ] = {}
@@ -366,8 +383,102 @@ _SESSION_INDEX_CACHE_MAX = 100
 
 def _parse_cache_clear() -> None:
     """Drop every cached parse result. Test-only helper."""
-    _PARSE_CACHE.clear()
+    with _PARSE_CACHE_LOCK:
+        _PARSE_CACHE.clear()
     _SESSION_INDEX_CACHE.clear()
+
+
+def _parse_cache_hit(
+    cache_key: tuple[Path, bool],
+    *,
+    mtime: float,
+    actor_fallback: str,
+) -> list[MessageEnvelope] | None:
+    with _PARSE_CACHE_LOCK:
+        cached = _PARSE_CACHE.get(cache_key)
+        if (
+            cached is not None
+            and cached[0] == mtime
+            and cached[2] == actor_fallback
+        ):
+            # Defensive copy: callers downstream sort/filter the
+            # list in-place (see _apply_filters_and_paginate's
+            # ``indexed.sort``), so handing them the cached list
+            # directly would corrupt the cache on the next hit.
+            return list(cached[1])
+    return None
+
+
+def _store_parse_cache(
+    cache_key: tuple[Path, bool],
+    *,
+    mtime: float,
+    envelopes: list[MessageEnvelope],
+    actor_fallback: str,
+) -> None:
+    with _PARSE_CACHE_LOCK:
+        # Evict oldest insertion before storing the new entry. Python
+        # dicts preserve insertion order so ``next(iter(...))`` gives
+        # us the oldest key without an auxiliary structure. Pop the
+        # current key first (if present) so re-stores refresh ordering.
+        _PARSE_CACHE.pop(cache_key, None)
+        if len(_PARSE_CACHE) >= _PARSE_CACHE_MAX:
+            _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
+        # Store a fresh list so test/in-place mutations on the
+        # returned copy don't bleed back into the cache.
+        _PARSE_CACHE[cache_key] = (mtime, list(envelopes), actor_fallback)
+
+
+def _begin_parse_fill(
+    fill_key: tuple[Path, bool, float, str, bool],
+    *,
+    cache_key: tuple[Path, bool],
+    mtime: float,
+    actor_fallback: str,
+    cache_eligible: bool,
+) -> tuple[_ParseInflight, bool, list[MessageEnvelope] | None]:
+    """Join or create the in-flight parse for a specific cache fill.
+
+    The fill key includes mtime, actor fallback, strictness, and
+    ``include_thinking`` so unshareable variants never reuse each
+    other's parse result. Waiters receive the owner's result directly;
+    sequential strict callers still bypass the persistent cache.
+    """
+    while True:
+        with _PARSE_CACHE_LOCK:
+            if cache_eligible:
+                cached = _PARSE_CACHE.get(cache_key)
+                if (
+                    cached is not None
+                    and cached[0] == mtime
+                    and cached[2] == actor_fallback
+                ):
+                    return _ParseInflight(threading.Event()), False, list(cached[1])
+            inflight = _PARSE_INFLIGHT.get(fill_key)
+            if inflight is None:
+                inflight = _ParseInflight(threading.Event())
+                _PARSE_INFLIGHT[fill_key] = inflight
+                return inflight, True, None
+        inflight.event.wait()
+        if inflight.exception is not None:
+            raise inflight.exception
+        if inflight.result is not None:
+            return inflight, False, list(inflight.result)
+
+
+def _finish_parse_fill(
+    fill_key: tuple[Path, bool, float, str, bool],
+    inflight: _ParseInflight,
+    *,
+    result: list[MessageEnvelope] | None = None,
+    exception: BaseException | None = None,
+) -> None:
+    with _PARSE_CACHE_LOCK:
+        if _PARSE_INFLIGHT.get(fill_key) is inflight:
+            _PARSE_INFLIGHT.pop(fill_key, None)
+        inflight.result = list(result) if result is not None else None
+        inflight.exception = exception
+        inflight.event.set()
 
 
 def parse_events_jsonl(
@@ -399,8 +510,9 @@ def parse_events_jsonl(
     ``archive_unreadable`` instead of silently returning ``200`` with
     an empty list (round-5 blocker 2). The chat-messages route catches
     the propagated ``OSError`` and translates it. ``strict=True``
-    callers also skip the mtime cache so validation paths always see a
-    fresh parse.
+    callers also skip the persistent mtime cache so validation paths
+    always see a fresh parse outside of same-mtime concurrent readers
+    already waiting on one in-flight parse.
 
     ``include_thinking`` (default ``False``; see GitHub #2048 / #2082)
     — when ``True``, Anthropic extended-thinking content blocks
@@ -416,17 +528,23 @@ def parse_events_jsonl(
     forward-readlines the full archive each call; with operator
     transcripts running into the thousands of lines this dominates
     poll latency. When the file mtime is unchanged the cached envelopes
-    are returned directly.
+    are returned directly. Concurrent misses for the same path, mtime,
+    actor fallback, strictness, and ``include_thinking`` flag share one
+    in-flight parse and reuse its result; different mtimes or option
+    variants parse independently.
     """
     envelopes: list[MessageEnvelope] = []
     if not events_path.exists():
         return envelopes
     # Cache lookup happens BEFORE the heavy parse. We stat once up
-    # front; ``strict=True`` callers skip the cache so validation paths
-    # always see a fresh parse + propagated OSError.
+    # front; ``strict=True`` callers skip the persistent cache so
+    # validation paths always see a fresh parse + propagated OSError
+    # unless they are part of the same in-flight same-mtime read.
     cache_eligible = not strict
     cache_key = (events_path, include_thinking)
     cached_mtime: float | None = None
+    fill_key: tuple[Path, bool, float, str, bool] | None = None
+    inflight: _ParseInflight | None = None
     if cache_eligible:
         try:
             cached_mtime = events_path.stat().st_mtime
@@ -436,71 +554,97 @@ def parse_events_jsonl(
             # logged with the same context as before.
             cached_mtime = None
         if cached_mtime is not None:
-            cached = _PARSE_CACHE.get(cache_key)
-            if (
-                cached is not None
-                and cached[0] == cached_mtime
-                and cached[2] == actor_fallback
-            ):
-                # Defensive copy: callers downstream sort/filter the
-                # list in-place (see _apply_filters_and_paginate's
-                # ``indexed.sort``), so handing them the cached list
-                # directly would corrupt the cache on the next hit.
-                return list(cached[1])
-    source_key = hashlib.blake2b(
-        str(events_path).encode("utf-8"), digest_size=4,
-    ).hexdigest()
-    try:
-        with events_path.open("r", encoding="utf-8", errors="ignore") as handle:
-            while True:
-                start_offset = handle.tell()
-                line = handle.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.debug(
-                        "chat.transcripts: skipping malformed line in %s @ %d",
-                        events_path, start_offset,
-                    )
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                converted = _event_to_envelopes(
-                    event,
-                    offset=start_offset,
-                    source_key=source_key,
-                    actor_fallback=actor_fallback,
-                    include_thinking=include_thinking,
-                )
-                envelopes.extend(converted)
-    except OSError as exc:
-        if strict:
-            # Let the route translate this into a typed 503
-            # ``archive_unreadable`` (round-5 blocker 2).
-            raise
-        logger.warning(
-            "chat.transcripts: read failed for %s: %s",
-            events_path, exc,
+            cached = _parse_cache_hit(
+                cache_key,
+                mtime=cached_mtime,
+                actor_fallback=actor_fallback,
+            )
+            if cached is not None:
+                return cached
+    else:
+        try:
+            cached_mtime = events_path.stat().st_mtime
+        except OSError:
+            cached_mtime = None
+
+    if cached_mtime is not None:
+        fill_key = (
+            events_path,
+            include_thinking,
+            cached_mtime,
+            actor_fallback,
+            strict,
         )
-        return _dedupe_envelopes_by_id(envelopes)
-    envelopes = _dedupe_envelopes_by_id(envelopes)
-    if cache_eligible and cached_mtime is not None:
-        # Evict oldest insertion before storing the new entry. Python
-        # dicts preserve insertion order so ``next(iter(...))`` gives
-        # us the oldest key without an auxiliary structure. Pop the
-        # current key first (if present) so re-stores refresh ordering.
-        _PARSE_CACHE.pop(cache_key, None)
-        if len(_PARSE_CACHE) >= _PARSE_CACHE_MAX:
-            _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
-        # Store a fresh list so test/in-place mutations on the
-        # returned copy don't bleed back into the cache.
-        _PARSE_CACHE[cache_key] = (cached_mtime, list(envelopes), actor_fallback)
-    return envelopes
+        inflight, is_owner, shared_result = _begin_parse_fill(
+            fill_key,
+            cache_key=cache_key,
+            mtime=cached_mtime,
+            actor_fallback=actor_fallback,
+            cache_eligible=cache_eligible,
+        )
+        if not is_owner:
+            return shared_result or []
+
+    try:
+        source_key = hashlib.blake2b(
+            str(events_path).encode("utf-8"), digest_size=4,
+        ).hexdigest()
+        try:
+            with events_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                while True:
+                    start_offset = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.debug(
+                            "chat.transcripts: skipping malformed line in %s @ %d",
+                            events_path, start_offset,
+                        )
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    converted = _event_to_envelopes(
+                        event,
+                        offset=start_offset,
+                        source_key=source_key,
+                        actor_fallback=actor_fallback,
+                        include_thinking=include_thinking,
+                    )
+                    envelopes.extend(converted)
+        except OSError as exc:
+            if strict:
+                # Let the route translate this into a typed 503
+                # ``archive_unreadable`` (round-5 blocker 2).
+                raise
+            logger.warning(
+                "chat.transcripts: read failed for %s: %s",
+                events_path, exc,
+            )
+            envelopes = _dedupe_envelopes_by_id(envelopes)
+            if fill_key is not None and inflight is not None:
+                _finish_parse_fill(fill_key, inflight, result=envelopes)
+            return envelopes
+        envelopes = _dedupe_envelopes_by_id(envelopes)
+        if cache_eligible and cached_mtime is not None:
+            _store_parse_cache(
+                cache_key,
+                mtime=cached_mtime,
+                envelopes=envelopes,
+                actor_fallback=actor_fallback,
+            )
+        if fill_key is not None and inflight is not None:
+            _finish_parse_fill(fill_key, inflight, result=envelopes)
+        return envelopes
+    except BaseException as exc:
+        if fill_key is not None and inflight is not None:
+            _finish_parse_fill(fill_key, inflight, exception=exc)
+        raise
 
 
 # Tail-read chunk progression for ``parse_events_jsonl_tail`` (issue
@@ -570,15 +714,13 @@ def parse_events_jsonl_tail(
     except OSError:
         cached_mtime = None
     if cached_mtime is not None:
-        cached = _PARSE_CACHE.get((events_path, include_thinking))
-        if (
-            cached is not None
-            and cached[0] == cached_mtime
-            and cached[2] == actor_fallback
-        ):
-            # Tail of the cached list. Defensive copy: downstream
-            # callers sort/filter in place.
-            return list(cached[1][-limit:])
+        cached = _parse_cache_hit(
+            (events_path, include_thinking),
+            mtime=cached_mtime,
+            actor_fallback=actor_fallback,
+        )
+        if cached is not None:
+            return cached[-limit:]
 
     source_key = hashlib.blake2b(
         str(events_path).encode("utf-8"), digest_size=4,

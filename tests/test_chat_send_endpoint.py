@@ -76,6 +76,7 @@ class FakeTmuxClient:
     panes_by_target: dict[str, list[FakePane]] = {}
     send_side_effect: Exception | None = None
     send_calls: list[tuple[str, str, bool]] = []
+    send_enter_delays: list[float] = []
     list_panes_side_effect: Exception | None = None
     list_windows_side_effect: Exception | None = None
 
@@ -91,10 +92,18 @@ class FakeTmuxClient:
         # or session, depending on the call shape; check both.
         return list(self.panes_by_target.get(target, []))
 
-    def send_keys(self, target: str, text: str, press_enter: bool = True) -> None:
+    def send_keys(
+        self,
+        target: str,
+        text: str,
+        press_enter: bool = True,
+        *,
+        enter_delay_seconds: float = 0.5,
+    ) -> None:
         if self.send_side_effect is not None:
             raise self.send_side_effect
         self.send_calls.append((target, text, press_enter))
+        self.send_enter_delays.append(enter_delay_seconds)
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +112,7 @@ def _reset_fake_tmux():
     FakeTmuxClient.panes_by_target = {}
     FakeTmuxClient.send_side_effect = None
     FakeTmuxClient.send_calls = []
+    FakeTmuxClient.send_enter_delays = []
     FakeTmuxClient.list_panes_side_effect = None
     FakeTmuxClient.list_windows_side_effect = None
     yield
@@ -396,6 +406,7 @@ def test_happy_path_text_send(
     assert patched_tmux.send_calls == [
         ("pollypm-test-storage-closet:pm-operator", "hello operator", True),
     ]
+    assert patched_tmux.send_enter_delays == [0.0]
 
 
 def test_happy_path_long_text_uses_paste_buffer(
@@ -416,6 +427,34 @@ def test_happy_path_long_text_uses_paste_buffer(
     body = response.json()
     assert body["method"] == "paste_buffer"
     assert body["characters_sent"] == 250
+    assert patched_tmux.send_enter_delays == [0.5]
+
+
+def test_force_text_send_skips_transcript_resolution(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    monkeypatch.setattr(chat_send_routes, "audit_emit", lambda **kwargs: None)
+
+    def _should_not_resolve(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        raise AssertionError("force text send should not resolve transcripts")
+
+    monkeypatch.setattr(
+        chat_send_routes, "_resolve_session_events", _should_not_resolve,
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send?safety=force",
+        json={"text": "fast force"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert patched_tmux.send_calls == [
+        ("pollypm-test-storage-closet:pm-operator", "fast force", True),
+    ]
 
 
 def test_happy_path_architect_session(
@@ -812,7 +851,64 @@ def test_closed_tool_allows_send(
     assert response.status_code == 200
 
 
-def test_safety_force_bypasses_mid_tool(
+def test_safety_force_audit_does_not_log_message_text(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_audit: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        chat_send_routes,
+        "audit_emit",
+        lambda **kwargs: captured_audit.append(kwargs),
+    )
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, 0.5)  # also fresh heartbeat
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello", "safety": "force"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(captured_audit) == 1
+    event = captured_audit[0]
+    assert event["event"] == "chat.send.force_bypass"
+    assert event["subject"] == "operator"
+    assert event["actor"] == "rest_client"
+    assert event["status"] == "warn"
+    assert event["metadata"]["message_id"] == body["message_id"]
+    assert event["metadata"]["window_target"] == "pollypm-test-storage-closet:pm-operator"
+    assert event["metadata"]["characters_sent"] == len("hello")
+    assert event["metadata"]["press_enter"] is True
+    assert set(event["metadata"]["bypassed_gates"]) == {
+        "unsafe_mid_stream",
+    }
+    assert "hello" not in json.dumps(event["metadata"])
+
+
+def test_force_bypass_gate_helper_detects_mid_tool(
+    api_config: PollyPMConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    _patch_heartbeat_age(monkeypatch, None)
+    events_path = _write_events_jsonl(
+        project_root, "session-open", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
+    assert chat_send_routes._force_bypass_gates(
+        events_path=events_path,
+        resolution="exact",
+        config=api_config,
+        session_name="operator",
+        exempt_tool_ids=set(),
+    ) == ["unsafe_mid_tool"]
+
+
+def test_strict_mid_tool_does_not_emit_force_audit(
     client: TestClient,
     auth_headers: dict[str, str],
     patched_tmux: type[FakeTmuxClient],
@@ -820,18 +916,26 @@ def test_safety_force_bypasses_mid_tool(
     project_root: Path,
     workspace_root: Path,
 ) -> None:
+    captured_audit: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        chat_send_routes,
+        "audit_emit",
+        lambda **kwargs: captured_audit.append(kwargs),
+    )
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
-    _patch_heartbeat_age(monkeypatch, 0.5)  # also fresh heartbeat
+    _patch_heartbeat_age(monkeypatch, None)
     _write_events_jsonl(
         project_root, "session-open", _assistant_with_open_tool(),
         cwd=workspace_root,
     )
     response = client.post(
         "/api/v1/chat/operator/send",
-        json={"text": "hello", "safety": "force"},
+        json={"text": "hello"},
         headers=auth_headers,
     )
-    assert response.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "unsafe_mid_tool"
+    assert captured_audit == []
 
 
 def test_safety_force_query_param_bypasses_mid_tool(
@@ -1778,6 +1882,22 @@ def test_open_tool_ids_helper_resets_per_assistant_turn() -> None:
         {"event_type": "assistant_turn", "payload": {"text": "first"}},
         {"event_type": "tool_call", "payload": {"id": "stale_open"}},
         {"event_type": "assistant_turn", "payload": {"text": "second"}},
+    ]
+    assert chat_send_routes._last_assistant_open_tool_ids(events) == set()
+
+
+def test_open_tool_ids_helper_turn_end_closes_orphaned_tool() -> None:
+    events = [
+        {"event_type": "tool_call", "payload": {"id": "stale_open"}},
+        {"event_type": "turn_end", "payload": {"reason": "done"}},
+    ]
+    assert chat_send_routes._last_assistant_open_tool_ids(events) == set()
+
+
+def test_open_tool_ids_helper_session_state_closes_previous_run() -> None:
+    events = [
+        {"event_type": "tool_call", "payload": {"id": "stale_open"}},
+        {"event_type": "session_state", "payload": {"state": "started"}},
     ]
     assert chat_send_routes._last_assistant_open_tool_ids(events) == set()
 

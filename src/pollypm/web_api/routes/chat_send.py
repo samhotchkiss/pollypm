@@ -6,7 +6,7 @@ into the running CLI agent backing ``session_name`` via tmux.
 The router is a thin adapter over the P1 shared facade in
 :mod:`pollypm.web_api.chat`:
 
-- :func:`pollypm.web_api.chat.enumerate_chat_surfaces` resolves
+- :func:`pollypm.web_api.chat.find_chat_surface` resolves
   ``session_name`` → :class:`ChatSurface` (window, transcript, cwd).
   Workers are validated against the work-service's active
   :class:`WorkerSessionRecord` rows via the public service facade
@@ -81,10 +81,11 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel, Field
 
+from pollypm.audit.log import EVENT_CHAT_SEND_FORCE_BYPASS, emit as audit_emit
 from pollypm.tmux.client import DeadPaneError, TmuxClient
 from pollypm.web_api.chat import (
     ChatSurface,
-    enumerate_chat_surfaces,
+    find_chat_surface,
 )
 from pollypm.web_api.errors import APIError
 from pollypm.web_api.routes._deps import ConfigDep
@@ -497,7 +498,9 @@ def _list_worker_sessions(config: Any) -> list[Any]:
     return list(list_active_worker_sessions(config)) or []
 
 
-def _list_worker_sessions_strict(config: Any) -> list[Any]:
+def _list_worker_sessions_strict(
+    config: Any, *, project: str | None = None,
+) -> list[Any]:
     """Strict worker-lookup via the public service facade.
 
     Codex #2043 review v6 blocker 1 / v7 blocker 2: the *non-strict*
@@ -526,7 +529,7 @@ def _list_worker_sessions_strict(config: Any) -> list[Any]:
     raise, exercising the real public-facade-bypass path end-to-end.
     """
     try:
-        return list(list_active_worker_sessions_strict(config))
+        return list(list_active_worker_sessions_strict(config, project=project))
     except _WorkerFacadeUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -538,8 +541,13 @@ def _list_worker_sessions_strict(config: Any) -> list[Any]:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_surface(config: Any, session_name: str) -> ChatSurface:
-    """Resolve ``session_name`` → :class:`ChatSurface` via the P1 facade.
+def _resolve_surface(
+    config: Any,
+    session_name: str,
+    *,
+    include_transcripts: bool = True,
+) -> ChatSurface:
+    """Resolve ``session_name`` → one :class:`ChatSurface`.
 
     Configured operator/architect/advisor sessions come from
     ``config.sessions``. Per-task workers are looked up in the
@@ -563,13 +571,15 @@ def _resolve_surface(config: Any, session_name: str) -> ChatSurface:
     is_worker_pattern = _looks_like_worker_session(session_name)
     worker_records: list[Any]
     if is_worker_pattern:
-        # Strict path: bypass the public facade so open/list outages
-        # propagate as :class:`_WorkerFacadeUnavailable` and map to a
-        # typed 503 (Codex #2043 review v6 blocker 1). The public
-        # facade swallows those failures into ``[]``, which would
-        # collapse into ``404 session_unknown`` here.
+        parsed_worker = parse_task_window_name(session_name)
+        project_filter = parsed_worker[0] if parsed_worker else None
         try:
-            worker_records = _list_worker_sessions_strict(config)
+            try:
+                worker_records = _list_worker_sessions_strict(
+                    config, project=project_filter,
+                )
+            except TypeError:
+                worker_records = _list_worker_sessions_strict(config)
         except _WorkerFacadeUnavailable as exc:
             logger.debug(
                 "chat_send: worker session lookup failed for %r",
@@ -598,21 +608,30 @@ def _resolve_surface(config: Any, session_name: str) -> ChatSurface:
 
     class _Adapter:
         @staticmethod
-        def list_worker_sessions(*, active_only: bool = True) -> list[Any]:
+        def list_worker_sessions(
+            *, project: str | None = None, active_only: bool = True,
+        ) -> list[Any]:
+            records = worker_records
+            if project is not None:
+                records = [
+                    r for r in records
+                    if getattr(r, "task_project", "") == project
+                ]
             if not active_only:
-                return worker_records
+                return records
             return [
-                r for r in worker_records if getattr(r, "ended_at", None) is None
+                r for r in records if getattr(r, "ended_at", None) is None
             ]
 
-    surfaces = enumerate_chat_surfaces(
+    surface = find_chat_surface(
         config,
-        work_service=_Adapter,
+        session_name,
+        work_service=_Adapter if is_worker_pattern else None,
         tmux_client=None,
+        include_transcripts=include_transcripts,
     )
-    for surface in surfaces:
-        if surface.session_name == session_name:
-            return surface
+    if surface is not None:
+        return surface
     raise _session_unknown(session_name)
 
 
@@ -761,10 +780,10 @@ def _resolve_session_events(
     """Locate the exact events.jsonl for ``surface``.
 
     Trusts :attr:`ChatSurface.transcript_path` populated by P1's
-    :func:`enumerate_chat_surfaces` — that's the same fingerprint
-    mapping the read endpoints (P2) use, so the send path can never
-    disagree with the GET path on "which transcript is this
-    session's". P1's resolver returns ``None`` when no archive
+    single-surface resolver — that's the same fingerprint mapping the
+    read endpoints (P2) use, so the send path can never disagree with
+    the GET path on "which transcript is this session's". P1's
+    resolver returns ``None`` when no archive
     matches the surface's ``(cwd, account, provider)`` fingerprint;
     it never opportunistically picks the freshest.
 
@@ -810,12 +829,18 @@ def _last_assistant_open_tool_ids(
     any *other* open tool still blocks the send (Codex #2043 review
     v4 block 1).
     """
-    # Find the most-recent boundary (user_turn or assistant_turn).
+    # Find the most-recent boundary. ``turn_end`` / ``session_state``
+    # close stale orphaned tool calls left by a prior crashed turn.
     # Everything after that belongs to the current in-flight response.
     boundary = -1
     for idx in range(len(events) - 1, -1, -1):
         event_type = events[idx].get("event_type")
-        if event_type in ("user_turn", "assistant_turn"):
+        if event_type in (
+            "user_turn",
+            "assistant_turn",
+            "turn_end",
+            "session_state",
+        ):
             boundary = idx
             break
     # When no boundary exists in the tail we still scan: that's the
@@ -866,6 +891,75 @@ def _is_mid_tool(
     return bool(
         _last_assistant_open_tool_ids(events, exempt_tool_ids=exempt_tool_ids),
     )
+
+
+def _force_bypass_gates(
+    *,
+    events_path: Path | None,
+    resolution: _ResolutionQuality,
+    config: Any,
+    session_name: str,
+    exempt_tool_ids: set[str] | None,
+) -> list[str]:
+    """Best-effort list of gates ``safety=force`` bypassed.
+
+    This never blocks the send path. It only evaluates the same safety
+    signals for audit metadata so a later forensic read can distinguish
+    a routine force send from a force send during active streaming.
+    """
+    bypassed: list[str] = []
+    if resolution == "absent_but_others_exist":
+        bypassed.append("unsafe_mid_tool")
+    try:
+        if _is_mid_tool(events_path, exempt_tool_ids=exempt_tool_ids):
+            bypassed.append("unsafe_mid_tool")
+    except TranscriptUnavailable:
+        bypassed.append("unsafe_unavailable_transcript")
+    try:
+        age = _heartbeat_age_seconds(config, session_name)
+    except HeartbeatUnavailable:
+        bypassed.append("unsafe_unavailable_heartbeat")
+    else:
+        if age is not None and age < _MID_STREAM_WINDOW_SECONDS:
+            bypassed.append("unsafe_mid_stream")
+    return sorted(set(bypassed))
+
+
+def _emit_force_bypass_audit(
+    *,
+    config: Any,
+    project_key: str | None,
+    project_root: Path,
+    session_name: str,
+    target: str,
+    message_id: str,
+    text_to_send: str,
+    method: str,
+    press_enter: bool,
+    press_enter_at: str | None,
+    bypassed_gates: list[str],
+) -> None:
+    project = project_key or getattr(getattr(config, "project", None), "name", "")
+    try:
+        audit_emit(
+            event=EVENT_CHAT_SEND_FORCE_BYPASS,
+            project=str(project or ""),
+            subject=session_name,
+            actor="rest_client",
+            status="warn",
+            project_path=project_root,
+            metadata={
+                "message_id": message_id,
+                "window_target": target,
+                "characters_sent": len(text_to_send),
+                "method": method,
+                "press_enter": press_enter,
+                "press_enter_at": press_enter_at,
+                "bypassed_gates": list(bypassed_gates),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("chat_send: force-bypass audit emit failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1161,6 +1255,38 @@ def _resolve_pane_target(
     ``409 pane_invalid``) so the operator gets actionable typed
     errors instead of generic 500s (Codex #2043 review v4 block 3).
     """
+    window_target = f"{storage_session}:{window_name}"
+    if pane_index is None:
+        get_window = getattr(tmux, "get_window", None)
+        if callable(get_window):
+            try:
+                try:
+                    window = get_window(window_target, timeout=1)
+                except TypeError:
+                    window = get_window(window_target)
+            except FileNotFoundError as exc:
+                raise _tmux_unavailable(
+                    f"tmux binary not found: {exc}",
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise _tmux_unavailable(
+                    f"tmux command timed out after {exc.timeout}s",
+                ) from exc
+            except subprocess.CalledProcessError:
+                logger.debug(
+                    "chat_send: get_window(%r) CalledProcessError",
+                    window_target,
+                    exc_info=True,
+                )
+                return window_target, False
+            except OSError as exc:
+                raise _tmux_unavailable(str(exc)) from exc
+            if window is None:
+                return window_target, False
+            if getattr(window, "pane_dead", False):
+                raise _pane_dead(window_target)
+            return window_target, True
+
     try:
         windows = tmux.list_windows(storage_session)
     except FileNotFoundError as exc:
@@ -1183,7 +1309,7 @@ def _resolve_pane_target(
             storage_session,
             exc_info=True,
         )
-        return f"{storage_session}:{window_name}", False
+        return window_target, False
     except OSError as exc:
         # Other subprocess plumbing errors (permission denied on
         # ``tmux`` binary, etc.) — treat as tmux_unavailable so the
@@ -1200,15 +1326,14 @@ def _resolve_pane_target(
     # signal here.
     if pane_index is None:
         if window.pane_dead:
-            raise _pane_dead(f"{storage_session}:{window_name}")
-        return f"{storage_session}:{window_name}", True
+            raise _pane_dead(window_target)
+        return window_target, True
     # Specific pane requested (including 0). Pane indexes must be
     # >= 0 and the pane has to exist on the window AND be alive.
     # Without this gate a negative or out-of-range index slips
     # through to ``send_keys`` and surfaces as a 500 — and explicit
     # ``pane=0`` would silently go to tmux's active pane, which is
     # not guaranteed to be pane 0.
-    window_target = f"{storage_session}:{window_name}"
     if pane_index < 0:
         raise _pane_invalid(pane_index, window_target)
     try:
@@ -1276,10 +1401,16 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
 ) -> ChatSendResponse:
     """POST /api/v1/chat/{session_name}/send — push text into a tmux pane."""
     safety_mode = safety or body.safety
+    needs_transcript = safety_mode != "force" or body.answer_to is not None
 
-    # 1. Resolve session via the P1 facade (validates workers against
-    # the work-service — see Codex review block 2).
-    surface = _resolve_surface(config, session_name)
+    # 1. Resolve the one target surface. Plain force sends do not need
+    # a transcript before touching tmux, so keep the latency-critical
+    # path out of the session-index filesystem walk.
+    surface = _resolve_surface(
+        config,
+        session_name,
+        include_transcripts=needs_transcript,
+    )
     # ``surface.project`` is intentionally ``None`` for operators in P1
     # (the operator is workspace-wide). The send path still needs a
     # concrete project_key for storage-closet naming and transcripts
@@ -1319,7 +1450,10 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
     # the failure entirely. We track the helper's outcome rather than
     # short-circuiting on the first call so the warning header lands
     # even when the answer_to lookup is what raised.
-    events_path, resolution = _resolve_session_events(surface, project_root)
+    events_path: Path | None = None
+    resolution: _ResolutionQuality = "absent_clean"
+    if needs_transcript:
+        events_path, resolution = _resolve_session_events(surface, project_root)
     ask_envelope: dict[str, Any] | None = None
     ask_exempt_ids: set[str] = set()
     transcript_unavailable_detail: str | None = None
@@ -1349,7 +1483,18 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
 
     # 3. Safety gates (§4.1, §4.3) — use the exact session transcript
     # (Codex review block 3).
-    if safety_mode != "force":
+    force_bypassed_gates: list[str] = []
+    force_gate_audit_deferred = safety_mode == "force" and not needs_transcript
+    if safety_mode == "force":
+        if not force_gate_audit_deferred:
+            force_bypassed_gates = _force_bypass_gates(
+                events_path=events_path,
+                resolution=resolution,
+                config=config,
+                session_name=session_name,
+                exempt_tool_ids=ask_exempt_ids,
+            )
+    else:
         if resolution == "absent_but_others_exist":
             # Strict and loose both require an exact transcript
             # mapping. Other transcripts exist for the project but
@@ -1430,9 +1575,16 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
     method: Literal["send_keys", "paste_buffer"] = (
         "paste_buffer" if len(text_to_send) > 100 else "send_keys"
     )
+    message_id = f"msg_{uuid.uuid4().hex}"
     press_enter_at: str | None = None
+    enter_delay_seconds = 0.0 if method == "send_keys" else 0.5
     try:
-        tmux.send_keys(target, text_to_send, press_enter=body.press_enter)
+        tmux.send_keys(
+            target,
+            text_to_send,
+            press_enter=body.press_enter,
+            enter_delay_seconds=enter_delay_seconds,
+        )
     except DeadPaneError as exc:
         # Pane died between validation and send. Already mapped to a
         # typed 409 before this refactor — keep that shape.
@@ -1471,10 +1623,39 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
         raise _send_failed(target, str(exc)) from exc
     if body.press_enter:
         press_enter_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    if safety_mode == "force":
+        if force_gate_audit_deferred:
+            try:
+                force_bypassed_gates = _force_bypass_gates(
+                    events_path=None,
+                    resolution="absent_clean",
+                    config=config,
+                    session_name=session_name,
+                    exempt_tool_ids=ask_exempt_ids,
+                )
+            except Exception:  # noqa: BLE001
+                force_bypassed_gates = []
+                logger.debug(
+                    "chat_send: force-bypass gate audit failed",
+                    exc_info=True,
+                )
+        _emit_force_bypass_audit(
+            config=config,
+            project_key=project_key,
+            project_root=project_root,
+            session_name=session_name,
+            target=target,
+            message_id=message_id,
+            text_to_send=text_to_send,
+            method=method,
+            press_enter=body.press_enter,
+            press_enter_at=press_enter_at,
+            bypassed_gates=force_bypassed_gates,
+        )
 
     return ChatSendResponse(
         ok=True,
-        message_id=f"msg_{uuid.uuid4().hex}",
+        message_id=message_id,
         session_name=session_name,
         window_target=target,
         characters_sent=len(text_to_send),

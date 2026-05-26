@@ -827,6 +827,7 @@ def _apply_filters_and_paginate(
             if ts < since_aware:
                 continue
         filtered.append(envelope)
+    filtered = _dedupe_envelopes_by_id(filtered)
 
     # Stable sort by (ts, original position). Original position is
     # preserved because Python's sort is stable, but we've already
@@ -865,6 +866,17 @@ def _apply_filters_and_paginate(
         page = [post_process(env) for env in page]
 
     return [_envelope_to_wire(env) for env in page], has_more, next_cursor
+
+
+def _dedupe_envelopes_by_id(envelopes: list[MessageEnvelope]) -> list[MessageEnvelope]:
+    seen: set[str] = set()
+    out: list[MessageEnvelope] = []
+    for envelope in envelopes:
+        if envelope.id in seen:
+            continue
+        seen.add(envelope.id)
+        out.append(envelope)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +980,7 @@ def _inline_subagent_transcript(
     *,
     allowed_roots: list[Path],
     actor_fallback: str,
+    include_thinking: bool = False,
 ) -> MessageEnvelope:
     """Enrich a ``subagent_result`` envelope with its subagent transcript.
 
@@ -1009,6 +1022,7 @@ def _inline_subagent_transcript(
             sub_path,
             actor_fallback=actor_fallback,
             limit=_SUBAGENT_INLINE_LIMIT,
+            include_thinking=include_thinking,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -1203,6 +1217,7 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
                 env,
                 allowed_roots=allowed_roots,
                 actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )
 
     rows, has_more, next_cursor = _apply_filters_and_paginate(

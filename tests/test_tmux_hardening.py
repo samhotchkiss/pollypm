@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -163,6 +162,61 @@ class TestSendKeysDeadPane:
 
         client.send_keys("%42", "hello")
         assert len(calls) == 2  # send-keys text + send-keys Enter
+
+    def test_send_keys_can_skip_enter_delay(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = TmuxClient()
+        calls: list[tuple[str, ...]] = []
+        sleeps: list[float] = []
+        monkeypatch.setattr(client, "is_pane_alive", lambda pane_id: True)
+        monkeypatch.setattr(
+            client,
+            "run",
+            lambda *args, **kwargs: (calls.append(args), _ok())[1],
+        )
+        monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+
+        client.send_keys(
+            "%42", "hello", press_enter=True, enter_delay_seconds=0.0,
+        )
+
+        assert len(calls) == 2
+        assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# Single-window probe
+# ---------------------------------------------------------------------------
+
+class TestGetWindow:
+    def test_get_window_parses_display_message(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = TmuxClient()
+        stdout = "s\t2\tmain\t1\t%7\tbash\t/tmp\t0\t1234\n"
+        monkeypatch.setattr(client, "run", lambda *args, **kwargs: _ok(stdout))
+
+        window = client.get_window("s:main")
+
+        assert window is not None
+        assert window.session == "s"
+        assert window.index == 2
+        assert window.name == "main"
+        assert window.pane_id == "%7"
+        assert window.pane_dead is False
+        assert window.pane_pid == 1234
+
+    def test_get_window_returns_none_on_missing_target(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = TmuxClient()
+        monkeypatch.setattr(client, "run", lambda *args, **kwargs: _fail())
+
+        assert client.get_window("s:missing") is None
 
 
 # ---------------------------------------------------------------------------

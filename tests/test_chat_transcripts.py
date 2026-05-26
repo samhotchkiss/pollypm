@@ -35,6 +35,7 @@ from pollypm.web_api.chat import (
     is_archive_stale,
     parse_events_jsonl,
     parse_events_jsonl_tail,
+    parse_raw_subagent_jsonl,
     resolve_transcript_path,
 )
 from pollypm.web_api.chat import transcripts as transcripts_module
@@ -609,6 +610,100 @@ def test_looks_like_subagent_result_detects_task_notification_block() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Raw Claude subagent JSONL parser
+# ---------------------------------------------------------------------------
+
+
+def test_raw_subagent_jsonl_emits_tool_blocks_and_skips_blank_text(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent.jsonl"
+    path.write_text(
+        "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "sessionId": "agent-1",
+                "timestamp": "2026-05-21T20:48:11Z",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_raw",
+                            "name": "Bash",
+                            "input": {"command": "pwd"},
+                        }
+                    ],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "sessionId": "agent-1",
+                "timestamp": "2026-05-21T20:48:12Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_raw",
+                            "content": [{"type": "text", "text": "/tmp/repo"}],
+                        }
+                    ],
+                },
+            }),
+        ])
+        + "\n"
+    )
+
+    envelopes = parse_raw_subagent_jsonl(path, actor_fallback="child")
+
+    assert [env.type for env in envelopes] == [
+        MessageType.TOOL_USE,
+        MessageType.TOOL_RESULT,
+    ]
+    assert envelopes[0].text == "[Bash] pwd"
+    assert envelopes[0].metadata["tool_use_id"] == "toolu_raw"
+    assert envelopes[0].metadata["tool_name"] == "Bash"
+    assert envelopes[1].text == "/tmp/repo"
+    assert envelopes[1].metadata["tool_use_id"] == "toolu_raw"
+    assert all(env.text for env in envelopes)
+
+
+def test_raw_subagent_jsonl_thinking_is_opt_in(tmp_path: Path) -> None:
+    path = tmp_path / "agent-thinking.jsonl"
+    path.write_text(json.dumps({
+        "type": "assistant",
+        "sessionId": "agent-1",
+        "timestamp": "2026-05-21T20:48:11Z",
+        "message": {
+            "model": "claude-opus-4-7",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "private child reasoning",
+                    "signature": "sig-child",
+                },
+                {"type": "text", "text": "visible child reply"},
+            ],
+        },
+    }) + "\n")
+
+    default_envs = parse_raw_subagent_jsonl(path, actor_fallback="child")
+    assert [env.type for env in default_envs] == [MessageType.TEXT]
+
+    thinking_envs = parse_raw_subagent_jsonl(
+        path,
+        actor_fallback="child",
+        include_thinking=True,
+    )
+    assert [env.type for env in thinking_envs] == [
+        MessageType.THINKING,
+        MessageType.TEXT,
+    ]
+    assert thinking_envs[0].text == "private child reasoning"
+    assert thinking_envs[0].metadata["signature"] == "sig-child"
+
+
+# ---------------------------------------------------------------------------
 # AskUserQuestion
 # ---------------------------------------------------------------------------
 
@@ -781,11 +876,28 @@ def test_codex_tool_result_extracts_output_text(tmp_path: Path) -> None:
     _write_events(events_path, [_codex_event(
         "tool_result",
         type="local_shell_result",
+        tool_use_id="call_1",
         output="file1\nfile2",
     )])
     envelopes = parse_events_jsonl(events_path)
     assert envelopes[0].type == MessageType.TOOL_RESULT
     assert envelopes[0].text == "file1\nfile2"
+    assert envelopes[0].metadata["tool_use_id"] == "call_1"
+
+
+def test_codex_reasoning_surfaces_as_thinking_when_opted_in(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [_codex_event(
+        "thinking",
+        text="Summarized reasoning.",
+        raw={"type": "reasoning", "summary": [{"text": "Summarized reasoning."}]},
+    )])
+
+    assert parse_events_jsonl(events_path) == []
+    envelopes = parse_events_jsonl(events_path, include_thinking=True)
+    assert envelopes[0].type == MessageType.THINKING
+    assert envelopes[0].text == "Summarized reasoning."
+    assert envelopes[0].metadata["provider"] == "codex"
 
 
 # ---------------------------------------------------------------------------
@@ -1373,6 +1485,45 @@ def test_resolve_transcript_filters_by_account_name(tmp_path: Path) -> None:
     assert alt_resolved.parent.name == "session-alt"
 
 
+def test_lookup_falls_back_to_fresh_same_cwd_provider_when_account_stale(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    project_root = tmp_path / "proj"
+    transcripts = project_root / ".pollypm" / "transcripts"
+    shared_cwd = str(tmp_path / "shared")
+    Path(shared_cwd).mkdir()
+    stale_event = _claude_event("user_turn", text="old")
+    stale_event["account_name"] = "claude_old"
+    stale_event["cwd"] = shared_cwd
+    (transcripts / "session-old").mkdir(parents=True)
+    old_path = transcripts / "session-old" / "events.jsonl"
+    old_path.write_text(json.dumps(stale_event) + "\n")
+    old_mtime = old_path.stat().st_mtime
+    time.sleep(0.05)
+    fresh_event = _claude_event("user_turn", text="new")
+    fresh_event["account_name"] = "claude_new"
+    fresh_event["cwd"] = shared_cwd
+    (transcripts / "session-new").mkdir(parents=True)
+    new_path = transcripts / "session-new" / "events.jsonl"
+    new_path.write_text(json.dumps(fresh_event) + "\n")
+    monkeypatch.setattr(
+        transcripts_module.time,
+        "time",
+        lambda: old_mtime + STALE_THRESHOLD_SECONDS + 5,
+    )
+
+    index = build_session_index(transcripts)
+    resolved = lookup_transcript_path(
+        index,
+        cwd=shared_cwd,
+        account_name="claude_old",
+        provider="claude",
+    )
+
+    assert resolved is not None
+    assert resolved.parent.name == "session-new"
+
+
 def test_build_session_index_skips_unreadable_events(tmp_path: Path) -> None:
     project_root = tmp_path / "proj"
     transcripts = project_root / ".pollypm" / "transcripts"
@@ -1495,6 +1646,30 @@ def test_envelope_ids_are_unique_within_file(tmp_path: Path) -> None:
     envelopes = parse_events_jsonl(events_path)
     ids = [e.id for e in envelopes]
     assert len(set(ids)) == len(ids)
+
+
+def test_parse_events_jsonl_dedupes_repeated_envelope_ids(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [
+        _claude_event(
+            "tool_call",
+            type="tool_use",
+            id="toolu_duplicate",
+            name="Bash",
+            input={"command": "pwd"},
+        ),
+        _claude_event(
+            "tool_call",
+            type="tool_use",
+            id="toolu_duplicate",
+            name="Bash",
+            input={"command": "pwd"},
+        ),
+    ])
+
+    envelopes = parse_events_jsonl(events_path)
+
+    assert [env.id for env in envelopes] == ["msg_toolu_duplicate"]
 
 
 def test_tool_call_envelope_id_uses_tool_use_id(tmp_path: Path) -> None:

@@ -826,6 +826,36 @@ def test_messages_endpoint_respects_limit(
     assert body["next_cursor"] == "msg_009"
 
 
+def test_messages_endpoint_dedupes_duplicate_ids_before_pagination(
+    client, auth_headers, patch_registry, patch_parser, tmp_path,
+):
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    envelopes = [
+        _env("dup", ts="2026-05-21T10:00:00Z", text="first"),
+        _env("dup", ts="2026-05-21T10:00:00Z", text="first"),
+        _env("unique", ts="2026-05-21T10:01:00Z", text="second"),
+    ]
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    patch_parser({archive: envelopes})
+
+    first = client.get(
+        "/api/v1/chat/operator/messages?direction=asc&limit=1",
+        headers=auth_headers,
+    ).json()
+    assert [m["id"] for m in first["messages"]] == ["dup"]
+    assert first["has_more"] is True
+    second = client.get(
+        f"/api/v1/chat/operator/messages?direction=asc&limit=1&since_id={first['next_cursor']}",
+        headers=auth_headers,
+    ).json()
+    assert [m["id"] for m in second["messages"]] == ["unique"]
+    assert second["has_more"] is False
+
+
 def test_messages_endpoint_since_id_walks_cursor(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
@@ -1696,6 +1726,38 @@ def test_messages_endpoint_include_subagents_inlines_with_real_parser(
                     "content": [{"type": "text", "text": "subagent reply"}],
                 },
             }),
+            json.dumps({
+                "type": "assistant",
+                "sessionId": "child-1",
+                "cwd": str(project_root),
+                "timestamp": "2026-05-21T10:00:06Z",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_child",
+                            "name": "Bash",
+                            "input": {"command": "pwd"},
+                        }
+                    ],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "sessionId": "child-1",
+                "cwd": str(project_root),
+                "timestamp": "2026-05-21T10:00:07Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_child",
+                            "content": [{"type": "text", "text": str(project_root)}],
+                        }
+                    ],
+                },
+            }),
         ]) + "\n"
     )
 
@@ -1778,15 +1840,19 @@ def test_messages_endpoint_include_subagents_inlines_with_real_parser(
     assert metadata["output_file"] == str(child_jsonl)
     transcript = metadata.get("subagent_transcript")
     assert isinstance(transcript, list)
-    assert len(transcript) == 2
+    assert len(transcript) == 4
     # First child envelope: user turn with "kick off" text; second:
-    # assistant turn with the reply.
+    # assistant turn with the reply; final two preserve child tool use.
     assert transcript[0]["role"] == "user"
     assert transcript[0]["type"] == "text"
     assert "kick off" in transcript[0]["text"]
     assert transcript[1]["role"] == "assistant"
     assert transcript[1]["type"] == "text"
     assert transcript[1]["text"] == "subagent reply"
+    assert transcript[2]["type"] == "tool_use"
+    assert transcript[2]["metadata"]["tool_use_id"] == "toolu_child"
+    assert transcript[3]["type"] == "tool_result"
+    assert transcript[3]["metadata"]["tool_use_id"] == "toolu_child"
     # Provenance marker so downstream consumers can distinguish
     # inlined-from-raw envelopes from the normalized stream.
     assert transcript[0]["metadata"]["source"] == "subagent_jsonl"

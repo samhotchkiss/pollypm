@@ -577,6 +577,65 @@ class TmuxClient:
             )
         return windows
 
+    def get_window(
+        self, target: str, *, timeout: int | None = None,
+    ) -> TmuxWindow | None:
+        """Return one tmux window by target without listing the session."""
+        fmt = (
+            "#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t"
+            "#{pane_current_command}\t#{pane_current_path}\t#{pane_dead}\t#{pane_pid}"
+        )
+        result = self.run(
+            "display-message",
+            "-t",
+            self._exact_target(target),
+            "-p",
+            fmt,
+            check=False,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            if result.returncode == 124:
+                raise subprocess.TimeoutExpired(
+                    cmd=["tmux", "display-message", "-t", target],
+                    timeout=timeout or self._DEFAULT_TIMEOUT,
+                )
+            return None
+        line = result.stdout.strip()
+        if not line:
+            return None
+        parts = line.split("\t", 8)
+        if len(parts) < 8:
+            return None
+        (
+            session,
+            index,
+            window_name,
+            active,
+            pane_id,
+            pane_current_command,
+            pane_current_path,
+            pane_dead,
+            *rest,
+        ) = parts
+        pane_pid: int | None = None
+        if rest:
+            try:
+                pane_pid = int(rest[0])
+            except ValueError:
+                pane_pid = None
+        return TmuxWindow(
+            session=session,
+            index=int(index),
+            name=window_name,
+            active=active == "1",
+            pane_id=pane_id,
+            pane_current_command=pane_current_command,
+            pane_current_path=pane_current_path,
+            pane_dead=pane_dead == "1",
+            pane_pid=pane_pid,
+        )
+
     def list_all_windows(self) -> list[TmuxWindow]:
         """List windows across ALL tmux sessions in a single subprocess call."""
         fmt = (
@@ -681,7 +740,14 @@ class TmuxClient:
         result = self.run("capture-pane", "-p", "-S", f"-{lines}", "-t", self._exact_target(target))
         return result.stdout
 
-    def send_keys(self, target: str, text: str, press_enter: bool = True) -> None:
+    def send_keys(
+        self,
+        target: str,
+        text: str,
+        press_enter: bool = True,
+        *,
+        enter_delay_seconds: float = 0.5,
+    ) -> None:
         """Send keys to a pane. Raises DeadPaneError if the target pane is dead."""
         import time
         resolved = self._exact_target(target)
@@ -735,7 +801,8 @@ class TmuxClient:
             self.run("send-keys", "-l", "-t", resolved, text)
         if press_enter:
             # Delay to let the terminal process pasted text before Enter.
-            time.sleep(0.5)
+            if enter_delay_seconds > 0:
+                time.sleep(enter_delay_seconds)
             self.run("send-keys", "-t", resolved, "Enter")
 
     def attach_session(self, name: str) -> int:

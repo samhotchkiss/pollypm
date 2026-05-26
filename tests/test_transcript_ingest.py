@@ -148,6 +148,105 @@ def test_sync_transcripts_once_normalizes_claude_and_codex_events(tmp_path: Path
     # See transcript_ingest.py:154.
 
 
+def test_sync_transcripts_once_normalizes_codex_response_items(tmp_path: Path) -> None:
+    config, _config_path = _config(tmp_path)
+    codex_file = (
+        config.accounts["codex_main"].home
+        / ".codex/sessions/2026/05/25/rollout-response-items.jsonl"
+    )
+    codex_file.parent.mkdir(parents=True, exist_ok=True)
+    codex_file.write_text(
+        "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-25T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-response-items",
+                    "cwd": str(config.project.root_dir),
+                },
+            }),
+            json.dumps({
+                "timestamp": "2026-05-25T00:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": str(config.project.root_dir), "model": "gpt-5.4"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-25T00:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Codex reply."}],
+                },
+            }),
+            json.dumps({
+                "timestamp": "2026-05-25T00:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call_shell",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"pwd\"}",
+                },
+            }),
+            json.dumps({
+                "timestamp": "2026-05-25T00:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_shell",
+                    "output": "/tmp/repo",
+                },
+            }),
+            json.dumps({
+                "timestamp": "2026-05-25T00:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [
+                        {"type": "summary_text", "text": "Visible reasoning."}
+                    ],
+                    "encrypted_content": "do-not-copy",
+                },
+            }),
+            json.dumps({
+                "timestamp": "2026-05-25T00:00:06Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "Agent alias."},
+            }),
+        ])
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events = [
+        json.loads(line)
+        for line in (
+            config.project.root_dir
+            / ".pollypm/transcripts/session-response-items/events.jsonl"
+        ).read_text().splitlines()
+    ]
+
+    assert [event["event_type"] for event in events] == [
+        "session_state",
+        "assistant_turn",
+        "tool_call",
+        "tool_result",
+        "thinking",
+        "assistant_turn",
+    ]
+    assert events[1]["payload"]["text"] == "Codex reply."
+    assert events[2]["payload"]["id"] == "call_shell"
+    assert events[2]["payload"]["name"] == "shell"
+    assert events[2]["payload"]["input"] == {"command": "pwd"}
+    assert events[3]["payload"]["tool_use_id"] == "call_shell"
+    assert events[3]["payload"]["content"] == "/tmp/repo"
+    assert events[4]["payload"]["text"] == "Visible reasoning."
+    assert "encrypted_content" not in events[4]["payload"]["raw"]
+    assert events[5]["payload"]["text"] == "Agent alias."
+
+
 def test_sync_transcripts_once_skips_non_dict_json_lines(tmp_path: Path, caplog) -> None:
     config, _config_path = _config(tmp_path)
     claude_file = config.accounts["claude_main"].home / ".claude/projects/demo/session-a.jsonl"

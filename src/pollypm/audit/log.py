@@ -212,6 +212,7 @@ EVENT_TIER4_ACTION = "audit.tier4_action"
 EVENT_TIER4_GLOBAL_ACTION = "audit.tier4_global_action"
 EVENT_TIER4_DEMOTED = "audit.tier4_demoted"
 EVENT_TIER4_BUDGET_EXHAUSTED = "audit.tier4_budget_exhausted"
+EVENT_CHAT_SEND_FORCE_BYPASS = "chat.send.force_bypass"
 # #1413 — emitted whenever the supervisor / on-demand path provisions a
 # project-scoped role session (e.g. reviewer-<project>) that did not
 # previously exist. The watchdog (#1414) reads this stream to surface

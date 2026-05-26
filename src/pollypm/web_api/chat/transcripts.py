@@ -210,8 +210,10 @@ def lookup_transcript_path(
     Matching is fingerprint-based, NOT "freshest under the project":
 
     1. ``cwd`` must match the surface's cwd (resolved). Required.
-    2. When ``account_name`` is given, entries with a different
-       ``account_name`` are filtered out.
+    2. When ``account_name`` is given, matching entries are preferred.
+       If the configured account points at a stale abandoned archive,
+       a fresher same-cwd/provider sibling may win so account binding
+       renames do not pin the surface to dead transcripts.
     3. When ``provider`` is given, entries with a different
        ``provider`` are filtered out.
     4. If multiple entries remain (e.g. a restarted session left two
@@ -225,16 +227,31 @@ def lookup_transcript_path(
         return None
     normalized = _normalize_cwd(cwd)
     best: _SessionIndexEntry | None = None
+    best_any_account: _SessionIndexEntry | None = None
     for entry in index:
         entry_cwd = entry.cwd_normalized or _normalize_cwd(entry.cwd)
         if entry_cwd != normalized:
             continue
-        if account_name and entry.account_name and entry.account_name != account_name:
-            continue
         if provider and entry.provider and entry.provider != provider:
+            continue
+        if best_any_account is None or entry.mtime > best_any_account.mtime:
+            best_any_account = entry
+        if account_name and entry.account_name and entry.account_name != account_name:
             continue
         if best is None or entry.mtime > best.mtime:
             best = entry
+    if best is not None:
+        if (
+            account_name
+            and best_any_account is not None
+            and best_any_account.path != best.path
+            and best_any_account.mtime > best.mtime
+            and (time.time() - best.mtime) > STALE_THRESHOLD_SECONDS
+        ):
+            return best_any_account.path
+        return best.path
+    if account_name and best_any_account is not None:
+        return best_any_account.path
     return best.path if best is not None else None
 
 
@@ -470,7 +487,8 @@ def parse_events_jsonl(
             "chat.transcripts: read failed for %s: %s",
             events_path, exc,
         )
-        return envelopes
+        return _dedupe_envelopes_by_id(envelopes)
+    envelopes = _dedupe_envelopes_by_id(envelopes)
     if cache_eligible and cached_mtime is not None:
         # Evict oldest insertion before storing the new entry. Python
         # dicts preserve insertion order so ``next(iter(...))`` gives
@@ -615,6 +633,7 @@ def parse_events_jsonl_tail(
                 actor_fallback=actor_fallback,
                 include_thinking=include_thinking,
             )[-limit:]
+        envelopes = _dedupe_envelopes_by_id(envelopes)
         if len(envelopes) >= limit:
             return envelopes[-limit:]
         if chunk_size >= file_size:
@@ -630,6 +649,17 @@ def parse_events_jsonl_tail(
         actor_fallback=actor_fallback,
         include_thinking=include_thinking,
     )[-limit:]
+
+
+def _dedupe_envelopes_by_id(envelopes: list[MessageEnvelope]) -> list[MessageEnvelope]:
+    seen: set[str] = set()
+    out: list[MessageEnvelope] = []
+    for envelope in envelopes:
+        if envelope.id in seen:
+            continue
+        seen.add(envelope.id)
+        out.append(envelope)
+    return out
 
 
 def _parse_tail_chunk(
@@ -1016,6 +1046,7 @@ def _envelope_tool_result(
     summary = _extract_text_from_blocks(
         payload.get("output") or payload.get("text") or payload.get("content"),
     )
+    tool_use_id = str(payload.get("tool_use_id") or payload.get("call_id") or "")
     return [MessageEnvelope(
         id=msg_id,
         ts=timestamp,
@@ -1023,7 +1054,11 @@ def _envelope_tool_result(
         actor="tool",
         type=MessageType.TOOL_RESULT,
         text=summary,
-        metadata={"tool_use_id": "", "is_error": False, "content": payload},
+        metadata={
+            "tool_use_id": tool_use_id,
+            "is_error": bool(payload.get("is_error", False)),
+            "content": payload,
+        },
     )]
 
 
@@ -1325,6 +1360,7 @@ def parse_raw_subagent_jsonl(
     *,
     actor_fallback: str = "subagent",
     limit: int | None = None,
+    include_thinking: bool = False,
 ) -> list[MessageEnvelope]:
     """Parse a raw Claude subagent JSONL into :class:`MessageEnvelope` rows.
 
@@ -1346,10 +1382,10 @@ def parse_raw_subagent_jsonl(
           }
         }
 
-    Each ``user`` / ``assistant`` line becomes one envelope; ``error``
-    lines become ``system_event`` envelopes with ``subtype=error``.
-    Anything else (``summary``, telemetry-only lines, malformed JSON)
-    is skipped.
+    ``user`` / ``assistant`` lines are expanded by content block so
+    tool-only turns do not become blank text envelopes. ``error`` lines
+    become ``system_event`` envelopes with ``subtype=error``. Anything
+    else (``summary``, telemetry-only lines, malformed JSON) is skipped.
 
     ``limit`` (optional): cap on emitted envelopes. ``None`` returns
     every envelope. The caller (the chat-messages route) sets a small
@@ -1385,13 +1421,16 @@ def parse_raw_subagent_jsonl(
                     continue
                 if not isinstance(obj, dict):
                     continue
-                envelope = _raw_subagent_line_to_envelope(
+                line_envelopes = _raw_subagent_line_to_envelopes(
                     obj,
                     index=index,
                     source_key=source_key,
                     actor_fallback=actor_fallback,
+                    include_thinking=include_thinking,
                 )
-                if envelope is not None:
+                for envelope in line_envelopes:
+                    if limit is not None and len(envelopes) >= limit:
+                        break
                     envelopes.append(envelope)
     except OSError as exc:
         logger.warning(
@@ -1401,78 +1440,213 @@ def parse_raw_subagent_jsonl(
     return envelopes
 
 
-def _raw_subagent_line_to_envelope(
+def _raw_subagent_line_to_envelopes(
     obj: dict[str, Any],
     *,
     index: int,
     source_key: str,
     actor_fallback: str,
-) -> MessageEnvelope | None:
-    """Map one raw Claude JSONL line to a :class:`MessageEnvelope`.
+    include_thinking: bool,
+) -> list[MessageEnvelope]:
+    """Map one raw Claude JSONL line to zero or more envelopes.
 
-    Returns ``None`` for line types we don't surface (``summary``,
+    Returns ``[]`` for line types we don't surface (``summary``,
     ``session_state``, malformed shapes). The id is deterministic per
-    ``(file, line index)`` so a repeated parse yields stable ids.
+    ``(file, line index, block index)`` so repeated parses are stable.
     """
     line_type = obj.get("type")
     timestamp = str(obj.get("timestamp") or "")
     msg_id = f"sub_{source_key}_{index:06d}"
     message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
     content = message.get("content") if isinstance(message, dict) else None
+    session_id = str(obj.get("sessionId") or "")
 
-    if line_type in _RAW_USER_TYPES:
-        text = _extract_text_from_blocks(content) or _extract_text_from_blocks(message)
+    def _base_metadata(model: str = "") -> dict[str, Any]:
+        metadata = {
+            "provider": "claude",
+            "source": "subagent_jsonl",
+            "session_id": session_id,
+        }
+        if model:
+            metadata["model"] = model
+        return metadata
+
+    def _text_envelope(
+        *,
+        block_id: str,
+        role: MessageRole,
+        actor: str,
+        text: str,
+        model: str = "",
+    ) -> MessageEnvelope | None:
+        if not text:
+            return None
         return MessageEnvelope(
-            id=msg_id,
+            id=block_id,
             ts=timestamp,
-            role=MessageRole.USER,
-            actor="user",
+            role=role,
+            actor=actor,
             type=MessageType.TEXT,
             text=text,
-            metadata={
-                "provider": "claude",
-                "source": "subagent_jsonl",
-                "session_id": str(obj.get("sessionId") or ""),
-            },
+            metadata=_base_metadata(model),
+        )
+
+    def _block_id(block_index: int) -> str:
+        return msg_id if block_index == 0 else f"{msg_id}_{block_index:02d}"
+
+    if line_type in _RAW_USER_TYPES:
+        return _raw_subagent_content_to_envelopes(
+            content if content is not None else message,
+            timestamp=timestamp,
+            block_id=_block_id,
+            role=MessageRole.USER,
+            actor="user",
+            actor_fallback=actor_fallback,
+            model="",
+            base_metadata=_base_metadata,
+            text_envelope=_text_envelope,
+            include_thinking=include_thinking,
         )
     if line_type in _RAW_ASSISTANT_TYPES:
-        text = _extract_text_from_blocks(content) or _extract_text_from_blocks(message)
         model_name = ""
         if isinstance(message, dict):
             raw_model = message.get("model")
             if isinstance(raw_model, str):
                 model_name = raw_model
-        return MessageEnvelope(
-            id=msg_id,
-            ts=timestamp,
+        return _raw_subagent_content_to_envelopes(
+            content if content is not None else message,
+            timestamp=timestamp,
+            block_id=_block_id,
             role=MessageRole.ASSISTANT,
             actor=actor_fallback,
-            type=MessageType.TEXT,
-            text=text,
-            metadata={
-                "provider": "claude",
-                "source": "subagent_jsonl",
-                "session_id": str(obj.get("sessionId") or ""),
-                "model": model_name,
-            },
+            actor_fallback=actor_fallback,
+            model=model_name,
+            base_metadata=_base_metadata,
+            text_envelope=_text_envelope,
+            include_thinking=include_thinking,
         )
     if line_type == "error":
         # Surface subagent errors as system_event so the caller's UI
         # doesn't lose them in the inlined stream.
-        return MessageEnvelope(
-            id=msg_id,
-            ts=timestamp,
-            role=MessageRole.SYSTEM,
-            actor="system",
-            type=MessageType.SYSTEM_EVENT,
-            text=_extract_text_from_blocks(obj.get("error")) or "(subagent error)",
-            metadata={
-                "subtype": "error",
-                "provider": "claude",
-                "source": "subagent_jsonl",
-            },
+        return [
+            MessageEnvelope(
+                id=msg_id,
+                ts=timestamp,
+                role=MessageRole.SYSTEM,
+                actor="system",
+                type=MessageType.SYSTEM_EVENT,
+                text=_extract_text_from_blocks(obj.get("error")) or "(subagent error)",
+                metadata={
+                    "subtype": "error",
+                    "provider": "claude",
+                    "source": "subagent_jsonl",
+                },
+            )
+        ]
+    return []
+
+
+def _raw_subagent_content_to_envelopes(
+    content: Any,
+    *,
+    timestamp: str,
+    block_id: Any,
+    role: MessageRole,
+    actor: str,
+    actor_fallback: str,
+    model: str,
+    base_metadata: Any,
+    text_envelope: Any,
+    include_thinking: bool,
+) -> list[MessageEnvelope]:
+    if not isinstance(content, list):
+        env = text_envelope(
+            block_id=block_id(0),
+            role=role,
+            actor=actor,
+            text=_extract_text_from_blocks(content),
+            model=model,
         )
-    return None
+        return [env] if env is not None else []
+
+    envelopes: list[MessageEnvelope] = []
+    for idx, block in enumerate(content):
+        current_id = block_id(idx)
+        if not isinstance(block, dict):
+            env = text_envelope(
+                block_id=current_id,
+                role=role,
+                actor=actor,
+                text=_extract_text_from_blocks(block),
+                model=model,
+            )
+            if env is not None:
+                envelopes.append(env)
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type == "text":
+            env = text_envelope(
+                block_id=current_id,
+                role=role,
+                actor=actor,
+                text=str(block.get("text") or ""),
+                model=model,
+            )
+            if env is not None:
+                envelopes.append(env)
+        elif block_type == "tool_use":
+            tool_name = str(block.get("name") or "")
+            raw_input = block.get("input")
+            tool_input = raw_input if isinstance(raw_input, dict) else {}
+            tool_use_id = str(block.get("id") or current_id)
+            envelopes.append(MessageEnvelope(
+                id=current_id,
+                ts=timestamp,
+                role=MessageRole.ASSISTANT,
+                actor=actor_fallback,
+                type=MessageType.TOOL_USE,
+                text=_format_tool_use_summary(tool_name, tool_input),
+                metadata={
+                    **base_metadata(model),
+                    "tool_use_id": tool_use_id,
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                },
+            ))
+        elif block_type == "tool_result":
+            tool_use_id = str(block.get("tool_use_id") or "")
+            content_blocks = block.get("content") or []
+            envelopes.append(MessageEnvelope(
+                id=current_id,
+                ts=timestamp,
+                role=MessageRole.TOOL,
+                actor="tool",
+                type=MessageType.TOOL_RESULT,
+                text=_extract_text_from_blocks(content_blocks),
+                metadata={
+                    **base_metadata(model),
+                    "tool_use_id": tool_use_id,
+                    "is_error": bool(block.get("is_error", False)),
+                    "content": content_blocks,
+                },
+            ))
+        elif block_type == "thinking" and include_thinking:
+            text = str(block.get("thinking") or block.get("text") or "")
+            if not text:
+                continue
+            envelopes.append(MessageEnvelope(
+                id=current_id,
+                ts=timestamp,
+                role=MessageRole.ASSISTANT,
+                actor=actor_fallback,
+                type=MessageType.THINKING,
+                text=text,
+                metadata={
+                    **base_metadata(model),
+                    "signature": str(block.get("signature") or ""),
+                },
+            ))
+    return envelopes
 
 
 __all__ = [

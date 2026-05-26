@@ -197,8 +197,13 @@ def list_tasks_endpoint(
     operation_id="getTask",
 )
 def get_task_endpoint(project: str, n: int, config: ConfigDep) -> TaskDetail:
-    if project not in config.projects:
-        raise not_found(f"Project not registered: {project}")
+    # §1.4.5 (#2338): don't pre-reject unknown project keys here. The
+    # list endpoint already returns rows for projects that drifted out
+    # of ``pollypm.toml`` when ``include_untracked=true``; if we 404 on
+    # the detail lookup the Web UI surfaces an opaque "not_found" the
+    # moment the operator clicks one of those rows. ``get_task_detail``
+    # now falls back to the workspace work-service and tags the
+    # response ``project_paused=True`` so renderers can explain it.
     detail = get_task_detail(config, project, n)
     if detail is None:
         raise not_found(f"Task not found: {project}/{n}")

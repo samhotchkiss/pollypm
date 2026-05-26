@@ -169,6 +169,12 @@ class TaskSummary(BaseModel):
     dwell_seconds: int | None = None
     age_seconds: int | None = None
     updated_at: datetime | None = None
+    # §1.4.5 (#2335): true when the task's project is not in the tracked
+    # set (either missing from config or ``tracked=false``). Lets task
+    # detail surfaces explain why a queued task is sitting un-claimed,
+    # and lets the Web UI render a paused-project badge symmetric with
+    # the list endpoint's ``untracked_filtered`` warning.
+    project_paused: bool | None = None
 
 
 class Transition(BaseModel):

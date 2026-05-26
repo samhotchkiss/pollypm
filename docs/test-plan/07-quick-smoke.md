@@ -35,7 +35,7 @@ If §07 is green, you can ship a small change. If §07 is red, **do not ship** �
 
 When you have 5 minutes (e.g., post-merge sanity, mid-incident):
 
-1. **REST liveness** (1 min) — `/health`, `/dashboard`, `/chat/sessions` all 200 + sub-second.
+1. **REST liveness** (1 min) — `/health` 200; `/dashboard` and `/chat/sessions` 200 with **warm** response sub-second (see warmup-then-measure note in REST liveness section — first hit may be cold).
 2. **Web UI load + 3 clicks** (2 min) — open `/ui/`, click 3 surfaces, verify each <1s.
 3. **Send-receive round-trip** (2 min) — Web → tmux (<1s), tmux → Web (<5s).
 
@@ -64,8 +64,16 @@ export TOKEN=$(cat ~/.pollypm/api-token)
 
 ### REST liveness (1 min)
 
+**Warmup-then-measure contract.** `scripts/smoke.py` discards a first request to `/dashboard` and `/chat/sessions` (cold hit; cache population is expected to take up to ~1.2s on a freshly-restarted `pm serve`) and asserts the **second** (warm) request is under 1.0s. This matches §06.4 separating cold vs. warm budgets. `/health` has no warmup and no timing assertion.
+
+If you're running curl manually rather than `scripts/smoke.py`, run each command **twice** and check the second timing — or open the Web UI first, wait ~5 seconds for caches to warm, then time the requests below.
+
 ```bash
 curl -sS $BASE/api/v1/health
+# Warmup hit (discard timing — cold cache):
+curl -sS -o /dev/null -H "Authorization: Bearer $TOKEN" $BASE/api/v1/dashboard
+curl -sS -o /dev/null -H "Authorization: Bearer $TOKEN" $BASE/api/v1/chat/sessions
+# Measured hit (warm — this is what the smoke contract asserts):
 curl -sS -o /dev/null -w "dashboard %{http_code} %{time_total}s\n" -H "Authorization: Bearer $TOKEN" $BASE/api/v1/dashboard
 curl -sS -o /dev/null -w "sessions %{http_code} %{time_total}s\n" -H "Authorization: Bearer $TOKEN" $BASE/api/v1/chat/sessions
 curl -sS -H "Authorization: Bearer $TOKEN" $BASE/api/v1/dashboard | jq '.daemon_status'
@@ -75,7 +83,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" $BASE/api/v1/chat/sessions | jq '.ses
 - ☐ `/health` returns `{"status":"ok",...}` 200.
 - ☐ `/dashboard` returns JSON with `daemon_status` present, 200.
 - ☐ `/chat/sessions` returns a list of >0 sessions.
-- ☐ Single-shot `/dashboard` and `/chat/sessions` are both comfortably under 1s. If not, run §06.
+- ☐ **Warm** `/dashboard` and `/chat/sessions` (second request) are both under 1.0s. A cold first-hit above 1s is **by design** (cache warmup). A **warmed** request exceeding 1.0s is a real failure — red the smoke and run §06.
 
 ### Web UI (3 min)
 

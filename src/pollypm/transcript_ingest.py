@@ -9,6 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pollypm.agent_refusal_detection import (
+    classify_pollypm_auth_claim,
+    contains_refusal_language,
+)
+from pollypm.audit.log import audit_record_agent_refusal
 from pollypm.models import AccountConfig, ProviderKind
 from pollypm.plugin_host import extension_host_for_root
 from pollypm.providers import get_provider
@@ -38,6 +43,9 @@ class TranscriptFileCursor:
     # transcript roots with thousands of archived jsonls were pinning
     # the rail daemon at ~170% CPU in os.lstat + readline loops.
     mtime: float = 0.0
+    pending_refusal_reason: str | None = None
+    pending_refusal_project_key: str | None = None
+    pending_refusal_actor: str | None = None
 
 
 @dataclass(slots=True)
@@ -183,6 +191,133 @@ def _project_root_for_key(config, project_key: str) -> Path:
     return config.project.root_dir
 
 
+def _provider_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "").lower()
+
+
+def _safe_resolved_path(value: Any) -> Path | None:
+    if value is None:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _matching_auth_sessions(
+    config: Any,
+    event: dict[str, Any],
+) -> list[tuple[str, Any]]:
+    """Return configured sessions matching a normalized transcript event.
+
+    Transcript archives identify provider ``session_id`` rather than the
+    PollyPM ``session_name``. Match on the same stable fingerprint the
+    chat registry uses: account, provider, cwd, and project key.
+    """
+    event_account = str(event.get("account_name") or "")
+    event_provider = _provider_value(event.get("provider"))
+    event_cwd = _safe_resolved_path(event.get("cwd"))
+    event_project = str(event.get("project_key") or "")
+    default_project = str(getattr(getattr(config, "project", None), "name", "") or "")
+
+    matches: list[tuple[str, Any]] = []
+    for name, session in (getattr(config, "sessions", {}) or {}).items():
+        if getattr(session, "enabled", True) is False:
+            continue
+        if event_account and str(getattr(session, "account", "") or "") != event_account:
+            continue
+        if event_provider and _provider_value(getattr(session, "provider", "")) != event_provider:
+            continue
+        session_cwd = _safe_resolved_path(getattr(session, "cwd", None))
+        if event_cwd is not None and session_cwd is not None and event_cwd != session_cwd:
+            continue
+        session_project = str(getattr(session, "project", "") or default_project)
+        if event_project and session_project and event_project != session_project:
+            continue
+        matches.append((str(name), session))
+    return matches
+
+
+def _clear_pending_refusal(cursor: TranscriptFileCursor) -> None:
+    cursor.pending_refusal_reason = None
+    cursor.pending_refusal_project_key = None
+    cursor.pending_refusal_actor = None
+
+
+def _observe_refusal_audit_event(
+    config: Any,
+    cursor: TranscriptFileCursor,
+    event: dict[str, Any],
+) -> None:
+    """Emit refusal audit events when a suspicious prompt is visibly refused.
+
+    The detector intentionally only writes compact metadata via
+    :func:`audit_record_agent_refusal`; it never persists the prompt or
+    marker text, because the marker line may contain a session token.
+    """
+    event_type = str(event.get("event_type") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+
+    if event_type == "user_turn":
+        text = payload.get("text") if isinstance(payload, dict) else ""
+        matches = _matching_auth_sessions(config, event)
+        valid_tokens = [
+            getattr(session, "auth_token", "")
+            for _name, session in matches
+        ]
+        reason = classify_pollypm_auth_claim(
+            text if isinstance(text, str) else "",
+            valid_auth_tokens=valid_tokens,
+        )
+        if reason is None:
+            _clear_pending_refusal(cursor)
+            return
+        cursor.pending_refusal_reason = reason
+        cursor.pending_refusal_project_key = str(
+            event.get("project_key")
+            or getattr(getattr(config, "project", None), "name", "")
+            or "_workspace"
+        )
+        cursor.pending_refusal_actor = (
+            matches[0][0]
+            if len(matches) == 1
+            else str(event.get("session_id") or "agent")
+        )
+        return
+
+    if cursor.pending_refusal_reason is None:
+        return
+
+    if event_type == "assistant_turn":
+        text = payload.get("text") if isinstance(payload, dict) else ""
+        if contains_refusal_language(text if isinstance(text, str) else ""):
+            project_key = (
+                cursor.pending_refusal_project_key
+                or str(event.get("project_key") or "")
+                or "_workspace"
+            )
+            audit_record_agent_refusal(
+                project=project_key,
+                actor=cursor.pending_refusal_actor or str(event.get("session_id") or "agent"),
+                reason=cursor.pending_refusal_reason,
+                source="pollypm-auth",
+                subject="pollypm-auth",
+                project_path=_project_root_for_key(config, project_key),
+            )
+        _clear_pending_refusal(cursor)
+        return
+
+    if event_type in {
+        "tool_call",
+        "tool_result",
+        "token_usage",
+        "turn_end",
+        "session_state",
+        "error",
+    }:
+        _clear_pending_refusal(cursor)
+
+
 def _transcript_root(project_root: Path) -> Path:
     return project_transcripts_dir(project_root)
 
@@ -213,6 +348,11 @@ def _load_cursor_state(config) -> TranscriptCursorState:
                 cwd=payload.get("cwd"),
                 model_name=payload.get("model_name"),
                 mtime=float(payload.get("mtime", 0.0) or 0.0),
+                pending_refusal_reason=payload.get("pending_refusal_reason"),
+                pending_refusal_project_key=payload.get(
+                    "pending_refusal_project_key",
+                ),
+                pending_refusal_actor=payload.get("pending_refusal_actor"),
             )
     return TranscriptCursorState(files=files)
 
@@ -227,6 +367,9 @@ def _save_cursor_state(config, state: TranscriptCursorState) -> None:
                 "cwd": cursor.cwd,
                 "model_name": cursor.model_name,
                 "mtime": cursor.mtime,
+                "pending_refusal_reason": cursor.pending_refusal_reason,
+                "pending_refusal_project_key": cursor.pending_refusal_project_key,
+                "pending_refusal_actor": cursor.pending_refusal_actor,
             }
             for file_path, cursor in state.files.items()
         }
@@ -925,6 +1068,13 @@ def _scan_file(config, account_name: str, account: AccountConfig, path: Path, st
                     events = []
                 for event in events:
                     _append_event(config, event)
+                    try:
+                        _observe_refusal_audit_event(config, cursor, event)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "transcript_ingest: refusal-audit detector failed",
+                            exc_info=True,
+                        )
     except OSError:
         return
     cursor.mtime = mtime

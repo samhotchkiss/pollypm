@@ -35,11 +35,13 @@ def test_pg_sessions_upsert_list_roundtrip(pg_schema_pool):
     from pollypm.storage.pg_sessions import (
         get_session_window,
         list_sessions,
+        session_exists,
         upsert_session,
     )
 
     assert list_sessions(pool=pg_schema_pool) == []
     assert get_session_window("nope", pool=pg_schema_pool) is None
+    assert session_exists("nope", pool=pg_schema_pool) is False
 
     upsert_session(
         name="worker-alpha",
@@ -57,6 +59,10 @@ def test_pg_sessions_upsert_list_roundtrip(pg_schema_pool):
     assert rows[0].project == "alpha"
     assert rows[0].window_name == "alpha-1"
     assert get_session_window("worker-alpha", pool=pg_schema_pool) == "alpha-1"
+    assert session_exists("worker-alpha", pool=pg_schema_pool) is True
+    with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+        assert session_exists("worker-alpha", cur=cur) is True
+        assert session_exists("missing", cur=cur) is False
 
     # Re-upserting the same name overwrites (no duplicate row).
     upsert_session(

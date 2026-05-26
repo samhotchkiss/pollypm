@@ -24,6 +24,7 @@ Sessions:
   StateStore's compound prune (see #1528 + #232 for the alert/memory
   carve-outs preserved here)
 * :func:`get_session_window` — SELECT window_name FROM sessions WHERE name=…
+* :func:`session_exists` — true when a sessions-row exists for a name
 
 Events (backed by ``messages`` with ``type='event'``):
 
@@ -57,7 +58,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pollypm.storage.records import EventRecord, SessionRecord, SessionRuntimeRecord
 
@@ -280,6 +281,29 @@ def get_session_window(
     if row is None:
         return None
     return str(row[0])
+
+
+def session_exists(
+    session_name: str,
+    *,
+    cur: Any | None = None,
+    pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
+) -> bool:
+    """Return True when ``session_name`` exists in the sessions registry.
+
+    ``cur`` lets callers validate inside an existing transaction without
+    borrowing another pool connection while holding locks.
+    """
+    if cur is not None:
+        cur.execute(
+            "SELECT 1 FROM sessions WHERE name = %s",
+            (session_name,),
+        )
+        return cur.fetchone() is not None
+    return get_session_window(
+        session_name, pool=pool, config=config
+    ) is not None
 
 
 # --------------------------------------------------------------------- #
@@ -610,6 +634,7 @@ __all__ = [
     "prune_sessions",
     "recent_events",
     "record_event",
+    "session_exists",
     "upsert_session",
     "upsert_session_runtime",
 ]

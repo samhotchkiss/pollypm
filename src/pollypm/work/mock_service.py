@@ -7,8 +7,9 @@ consumer tests, and proving the protocol is sufficient.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from collections.abc import Iterable
 from copy import deepcopy
+from datetime import datetime, timezone
 
 from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.work.flow_engine import resolve_flow
@@ -85,7 +86,12 @@ class MockWorkService:
     Flow templates are resolved from the filesystem (same as SQLite service).
     """
 
-    def __init__(self, project_path: str | None = None) -> None:
+    def __init__(
+        self,
+        project_path: str | None = None,
+        *,
+        session_names: Iterable[str] | None = None,
+    ) -> None:
         self._tasks: dict[str, Task] = {}
         self._counter: dict[str, int] = {}  # per-project task number counters
         self._flows: dict[str, FlowTemplate] = {}
@@ -98,6 +104,29 @@ class MockWorkService:
         # Keyed by (project, task_number). Stored as plain dicts so tests
         # can inspect / mutate the row shape directly.
         self._worker_sessions: dict[tuple[str, int], dict] = {}
+        self._session_names: set[str] = {
+            name for name in (session_names or []) if name
+        }
+
+    def register_session(self, session_name: str) -> None:
+        """Register a valid target session for in-memory reassignment tests."""
+        if session_name:
+            self._session_names.add(session_name)
+
+    def _validate_reassign_target_session(self, session_name: str) -> None:
+        target = session_name.strip()
+        if not target or target != session_name:
+            raise ValidationError(
+                "Cannot reassign task: target assignee must be a "
+                "non-empty registered session name with no surrounding "
+                "whitespace."
+            )
+        if target not in self._session_names:
+            raise ValidationError(
+                f"Cannot reassign task to unknown session "
+                f"{target!r}. Create or register the session before "
+                f"handing off work to it."
+            )
 
     # ------------------------------------------------------------------
     # Flow resolution
@@ -508,6 +537,7 @@ class MockWorkService:
                 f"(spec §P-9); it refuses draft (queue + claim first) "
                 f"and terminal (done / cancelled) tasks."
             )
+        self._validate_reassign_target_session(new_assignee)
         old_assignee = task.assignee
         task.assignee = new_assignee
         task.updated_at = _now()

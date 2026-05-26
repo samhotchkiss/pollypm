@@ -28,8 +28,22 @@ import pytest
 @pytest.fixture()
 def pg_service(pg_schema_pool):
     from pollypm.work.pg_service import PgWorkService
+    from pollypm.storage.pg_sessions import upsert_session
 
-    return PgWorkService(pool=pg_schema_pool, ro_pool=None)
+    service = PgWorkService(pool=pg_schema_pool, ro_pool=None)
+    for name in ("alice", "bob", "pete", "nora", "olga"):
+        upsert_session(
+            name=name,
+            role="worker",
+            project="demo",
+            provider="codex",
+            account="test",
+            cwd="/tmp/demo",
+            window_name=name,
+            pool=pg_schema_pool,
+        )
+
+    return service
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +281,29 @@ def test_reassign_task_optional_reason_lands_in_breadcrumb(pg_service):
     )
     assert len(entries) == 1
     assert "pete went offline" in entries[0].text
+
+
+def test_reassign_task_rejects_unknown_target_session(pg_service):
+    """Unknown assignee strings must not strand active tasks (#2370)."""
+    from pollypm.work.service_support import ValidationError
+
+    task = _make_draft(
+        pg_service, roles={"worker": "pete", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="pete")
+
+    with pytest.raises(ValidationError, match="unknown session"):
+        pg_service.reassign_task(
+            task.task_id, new_assignee="ghost-session", actor="api"
+        )
+
+    refetched = pg_service.get(task.task_id)
+    assert refetched.assignee == "pete"
+    entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert entries == []
 
 
 def test_reassign_task_missing_task_raises(pg_service):

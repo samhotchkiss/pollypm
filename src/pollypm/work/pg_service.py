@@ -471,6 +471,32 @@ class PgWorkService:
             (f"work_tasks.worker_cap:{project}",),
         )
 
+    def _validate_reassign_target_session(
+        self, session_name: str, *, cur: Any | None = None
+    ) -> None:
+        """Fail closed unless ``session_name`` exists in the session registry."""
+        target = session_name.strip()
+        if not target or target != session_name:
+            raise ValidationError(
+                "Cannot reassign task: target assignee must be a "
+                "non-empty registered session name with no surrounding "
+                "whitespace."
+            )
+        from pollypm.storage.pg_sessions import session_exists
+
+        exists = session_exists(
+            target,
+            cur=cur,
+            pool=self._ro_pool or self._pool,
+            config=self._config,
+        )
+        if not exists:
+            raise ValidationError(
+                f"Cannot reassign task to unknown session "
+                f"{target!r}. Create or register the session before "
+                f"handing off work to it."
+            )
+
     def _count_capacity_consuming_tasks_locked(
         self,
         cur,
@@ -2572,6 +2598,7 @@ class PgWorkService:
                         f"`pm task next`, or queue + claim this one "
                         f"if it is still draft."
                     )
+                self._validate_reassign_target_session(new_assignee, cur=cur)
                 # Column write — same SQL shape as update(assignee=...)
                 # but inline so the context-log INSERT lands in the
                 # same transaction.

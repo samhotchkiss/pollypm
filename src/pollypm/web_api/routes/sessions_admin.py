@@ -129,6 +129,14 @@ from pollypm.session_health import (
 from pollypm.session_health import (
     storage_session_name as _shared_storage_session_name,
 )
+from pollypm.audit.log import (
+    EVENT_SESSION_PAUSE_PAUSED,
+    EVENT_SESSION_PAUSE_REFUSED,
+    EVENT_SESSION_PAUSE_RESUMED,
+)
+from pollypm.session_paused import (
+    emit_pause_operator_action as _emit_pause_operator_action,
+)
 from pollypm.session_paused import (
     load_paused_state as _load_paused_state,
 )
@@ -261,6 +269,19 @@ class RestartSessionRequest(BaseModel):
             "Bypass a human-held session lease. This does not bypass the "
             "mid-turn safety probe; use safety=force for that."
         ),
+    )
+
+
+class SessionPauseMutationRequest(BaseModel):
+    """Optional operator context for pause/resume audit rows."""
+
+    actor: str = Field(
+        default="operator",
+        description="Operator identity to stamp into the audit event.",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="Operator-supplied reason for the pause/resume action.",
     )
 
 
@@ -452,6 +473,14 @@ _PAUSE_PARTIAL_ENFORCEMENT_NOTE = (
     "not yet treated as daemon-loop dispatch. The marker is visible via "
     "GET /api/v1/sessions on the separate `paused` field."
 )
+
+
+def _pause_mutation_actor_reason(
+    body: SessionPauseMutationRequest | None,
+) -> tuple[str, str | None]:
+    if body is None:
+        return "operator", None
+    return body.actor, body.reason
 
 
 # ---------------------------------------------------------------------------
@@ -1250,7 +1279,11 @@ def interrupt_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
         },
     },
 )
-def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
+def pause_session_endpoint(
+    name: str,
+    config: ConfigDep,
+    body: SessionPauseMutationRequest | None = None,
+) -> ActionResult:
     """POST /api/v1/sessions/{name}/pause — write the pause marker.
 
     **Partial enforcement.** The pause marker is HONORED by the
@@ -1274,6 +1307,7 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     session returns 200 with no state change.
     """
     _find_session(config, name)  # 404 if unknown
+    actor, reason = _pause_mutation_actor_reason(body)
     try:
         with _pause_marker_lock(config):
             # PR #2081 round 3 finding 2 — go through the discriminated
@@ -1291,6 +1325,21 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
                     if getattr(config.project, "base_dir", None) is not None
                     else "<unknown>"
                 )
+                _emit_pause_operator_action(
+                    config,
+                    event=EVENT_SESSION_PAUSE_REFUSED,
+                    session_name=name,
+                    actor=actor,
+                    reason=reason,
+                    paused_count_after=None,
+                    status="warn",
+                    extra_metadata={
+                        "operation": "pause",
+                        "refused_reason": "marker_unreadable",
+                        "marker_path": str(marker_path),
+                        "marker_reason": state.reason,
+                    },
+                )
                 raise _marker_unreadable(
                     name, str(marker_path), state.reason,
                 )
@@ -1299,6 +1348,14 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
             # working set.
             names = set(state.names)
             if name in names:
+                _emit_pause_operator_action(
+                    config,
+                    event=EVENT_SESSION_PAUSE_PAUSED,
+                    session_name=name,
+                    actor=actor,
+                    reason=reason,
+                    paused_count_after=len(names),
+                )
                 return ActionResult(
                     ok=True,
                     message=(
@@ -1308,6 +1365,7 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
                 )
             names.add(name)
             _save_paused_names(config, names)
+            paused_count_after = len(names)
     except APIError:
         raise
     except RuntimeError as exc:
@@ -1323,6 +1381,14 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
             f"Cannot write pause marker for {name!r}: {exc!s}",
             hint="Check filesystem permissions on ~/.pollypm.",
         ) from exc
+    _emit_pause_operator_action(
+        config,
+        event=EVENT_SESSION_PAUSE_PAUSED,
+        session_name=name,
+        actor=actor,
+        reason=reason,
+        paused_count_after=paused_count_after,
+    )
     return ActionResult(
         ok=True,
         message=f"tagged {name} paused — {_PAUSE_PARTIAL_ENFORCEMENT_NOTE}",
@@ -1353,7 +1419,11 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
         },
     },
 )
-def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
+def resume_session_endpoint(
+    name: str,
+    config: ConfigDep,
+    body: SessionPauseMutationRequest | None = None,
+) -> ActionResult:
     """POST /api/v1/sessions/{name}/resume — clear the pause marker.
 
     Idempotent inverse of :func:`pause_session_endpoint`. The same
@@ -1363,6 +1433,7 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     operator actions.
     """
     _find_session(config, name)  # 404 if unknown
+    actor, reason = _pause_mutation_actor_reason(body)
     try:
         with _pause_marker_lock(config):
             # PR #2081 round 3 finding 2 — same discriminated-reader
@@ -1379,11 +1450,34 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
                     if getattr(config.project, "base_dir", None) is not None
                     else "<unknown>"
                 )
+                _emit_pause_operator_action(
+                    config,
+                    event=EVENT_SESSION_PAUSE_REFUSED,
+                    session_name=name,
+                    actor=actor,
+                    reason=reason,
+                    paused_count_after=None,
+                    status="warn",
+                    extra_metadata={
+                        "operation": "resume",
+                        "refused_reason": "marker_unreadable",
+                        "marker_path": str(marker_path),
+                        "marker_reason": state.reason,
+                    },
+                )
                 raise _marker_unreadable(
                     name, str(marker_path), state.reason,
                 )
             names = set(state.names)
             if name not in names:
+                _emit_pause_operator_action(
+                    config,
+                    event=EVENT_SESSION_PAUSE_RESUMED,
+                    session_name=name,
+                    actor=actor,
+                    reason=reason,
+                    paused_count_after=len(names),
+                )
                 return ActionResult(
                     ok=True,
                     message=(
@@ -1393,6 +1487,7 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
                 )
             names.discard(name)
             _save_paused_names(config, names)
+            paused_count_after = len(names)
     except APIError:
         raise
     except RuntimeError as exc:
@@ -1404,6 +1499,14 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
             f"Cannot write pause marker for {name!r}: {exc!s}",
             hint="Check filesystem permissions on ~/.pollypm.",
         ) from exc
+    _emit_pause_operator_action(
+        config,
+        event=EVENT_SESSION_PAUSE_RESUMED,
+        session_name=name,
+        actor=actor,
+        reason=reason,
+        paused_count_after=paused_count_after,
+    )
     return ActionResult(
         ok=True,
         message=f"cleared pause tag on {name} — {_PAUSE_PARTIAL_ENFORCEMENT_NOTE}",
@@ -1415,6 +1518,7 @@ __all__ = [
     "SessionDetail",
     "SessionHealthSnapshot",
     "SessionInfo",
+    "SessionPauseMutationRequest",
     "SessionsListResponse",
     "get_session_endpoint",
     "list_sessions_endpoint",

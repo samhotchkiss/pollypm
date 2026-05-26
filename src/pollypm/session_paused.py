@@ -134,6 +134,8 @@ PAUSE_SKIP_EVENT_TYPE = "session.pause.skip"
 PAUSE_MARKER_UNREADABLE_EVENT_TYPE = "session.pause.marker_unreadable"
 PAUSE_MARKER_RESTORED_EVENT_TYPE = "session.pause.marker_restored"
 UNREADABLE_PAUSED_REASON = "marker_unreadable"
+PAUSE_OPERATOR_DEFAULT_ACTOR = "operator"
+PAUSE_OPERATOR_DEFAULT_REASON = "operator_request"
 
 
 # --- Marker state ---------------------------------------------------
@@ -359,6 +361,59 @@ def save_paused_names(config: Any, names: set[str] | list[str]) -> None:
     payload = sorted(set(names))
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     tmp.replace(path)
+
+
+def emit_pause_operator_action(
+    config: Any,
+    *,
+    event: str,
+    session_name: str,
+    actor: str | None = None,
+    reason: str | None = None,
+    paused_count_after: int | None,
+    status: str = "ok",
+    extra_metadata: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort audit emit for operator pause/resume route actions.
+
+    Unlike ``session.pause.skip`` sweep breadcrumbs, these API actions
+    are intentionally not throttled. A repeated pause/resume request is
+    still a human/operator action worth preserving in the durable log.
+    """
+    try:
+        from pollypm.audit.log import emit as _audit_emit
+    except Exception:  # noqa: BLE001
+        logger.debug("session pause operator audit import failed", exc_info=True)
+        return
+
+    clean_actor = str(actor or "").strip() or PAUSE_OPERATOR_DEFAULT_ACTOR
+    clean_reason = str(reason or "").strip() or PAUSE_OPERATOR_DEFAULT_REASON
+    metadata: dict[str, Any] = {
+        "session_name": session_name,
+        "actor": clean_actor,
+        "reason": clean_reason,
+        "paused_count_after": paused_count_after,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    project_key, project_path = _project_audit_context(config)
+    try:
+        _audit_emit(
+            event=event,
+            project=project_key,
+            subject=session_name,
+            actor=clean_actor,
+            status=status,
+            metadata=metadata,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "session pause operator audit emit failed for %s/%s",
+            event,
+            session_name,
+            exc_info=True,
+        )
 
 
 @contextmanager
@@ -1014,9 +1069,12 @@ __all__ = [
     "PAUSE_MARKER_RESTORED_EVENT_TYPE",
     "PAUSE_MARKER_UNREADABLE_EVENT_TYPE",
     "PAUSE_MARKER_UNREADABLE_THROTTLE_SECONDS",
+    "PAUSE_OPERATOR_DEFAULT_ACTOR",
+    "PAUSE_OPERATOR_DEFAULT_REASON",
     "PAUSE_SKIP_EVENT_TYPE",
     "PAUSE_SKIP_THROTTLE_SECONDS",
     "UNREADABLE_PAUSED_REASON",
+    "emit_pause_operator_action",
     "is_paused",
     "load_paused_names",
     "load_paused_state",

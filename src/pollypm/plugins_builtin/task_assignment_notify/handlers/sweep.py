@@ -109,6 +109,12 @@ RATE_BREAKER_MAX_ABANDONMENTS = 5
 logger = logging.getLogger(__name__)
 
 _TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
+_AUTO_CLAIM_ACTOR = "auto_claim_sweep"
+_AUTO_CLAIM_EVENT_RECOVERED = "auto_claim_recovered"
+_AUTO_CLAIM_EVENT_SPAWNED = "auto_claim_spawned"
+_AUTO_CLAIM_EVENT_SKIPPED_PLAN_MISSING = "auto_claim_skipped_plan_missing"
+_AUTO_CLAIM_EVENT_FAILED = "auto_claim_failed"
+_AUTO_CLAIM_EVENT_CIRCUIT_BREAKER = "auto_claim_circuit_breaker"
 
 # Work statuses the sweeper cares about — those where a machine actor is
 # the expected next mover. ``in_progress`` / ``rework`` are gated on an
@@ -1483,7 +1489,7 @@ def _emit_task_reclaimed_audit(
             event=EVENT_TASK_RECLAIMED,
             project=str(project_key),
             subject=str(task_id),
-            actor="auto_claim_sweep",
+            actor=_AUTO_CLAIM_ACTOR,
             status="ok",
             project_path=Path(project_path) if project_path is not None else None,
             metadata={
@@ -1498,6 +1504,64 @@ def _emit_task_reclaimed_audit(
         logger.debug(
             "task_auto_claim: task.reclaimed audit failed for %s",
             task_id,
+            exc_info=True,
+        )
+
+
+def _emit_auto_claim_audit(
+    services: Any,
+    *,
+    project: Any,
+    task: Any | None,
+    outcome: str,
+    status: str = "ok",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort audit breadcrumb for concrete auto-claim outcomes."""
+    project_key = getattr(project, "key", None)
+    if not project_key:
+        return
+    task_id = getattr(task, "task_id", None) if task is not None else None
+    task_number = (
+        getattr(task, "task_number", None) if task is not None else None
+    )
+    project_path = getattr(project, "path", None) or getattr(
+        services, "project_root", None,
+    )
+    event_metadata: dict[str, Any] = {
+        "source": "task_assignment.sweep",
+        "outcome": outcome,
+        "project": str(project_key),
+    }
+    if task_id:
+        event_metadata["task_id"] = str(task_id)
+    if task_number is not None:
+        try:
+            event_metadata["task_number"] = int(task_number)
+        except (TypeError, ValueError):
+            event_metadata["task_number"] = str(task_number)
+    if metadata:
+        event_metadata.update(metadata)
+    try:
+        from pollypm.audit.log import emit as audit_emit
+    except Exception:  # noqa: BLE001
+        logger.debug("task_auto_claim: audit import failed", exc_info=True)
+        return
+    try:
+        audit_emit(
+            event=outcome,
+            project=str(project_key),
+            subject=str(task_id or project_key),
+            actor=_AUTO_CLAIM_ACTOR,
+            status=status,
+            project_path=Path(project_path) if project_path is not None else None,
+            metadata=event_metadata,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_auto_claim: audit emit failed for %s/%s",
+            project_key,
+            outcome,
             exc_info=True,
         )
 
@@ -1735,14 +1799,27 @@ def _recover_dead_claims(
         streak_tripped = streak >= MAX_CONSECUTIVE_ABANDONMENTS
         rate_tripped = rate_count >= RATE_BREAKER_MAX_ABANDONMENTS
         if streak_tripped or rate_tripped:
-            by_outcome["auto_claim_circuit_breaker"] = (
-                by_outcome.get("auto_claim_circuit_breaker", 0) + 1
+            by_outcome[_AUTO_CLAIM_EVENT_CIRCUIT_BREAKER] = (
+                by_outcome.get(_AUTO_CLAIM_EVENT_CIRCUIT_BREAKER, 0) + 1
             )
             _emit_spawn_failed_persistent_alert(
                 services,
                 project=project_key,
                 task_id=task_id,
                 streak=max(streak, rate_count),
+            )
+            _emit_auto_claim_audit(
+                services,
+                project=project,
+                task=task,
+                outcome=_AUTO_CLAIM_EVENT_CIRCUIT_BREAKER,
+                status="error",
+                metadata={
+                    "reason": "spawn failure circuit breaker tripped",
+                    "streak": streak,
+                    "rate_count": rate_count,
+                    "rate_window_seconds": RATE_BREAKER_WINDOW_SECONDS,
+                },
             )
             logger.warning(
                 "task_auto_claim: circuit-breaker tripped for %s "
@@ -1762,7 +1839,7 @@ def _recover_dead_claims(
                 )
             release(
                 task_id,
-                "auto_claim_sweep",
+                _AUTO_CLAIM_ACTOR,
                 reason="worker session missing",
             )
         except Exception:  # noqa: BLE001
@@ -1771,8 +1848,8 @@ def _recover_dead_claims(
                 task_id, exc_info=True,
             )
             continue
-        by_outcome["auto_claim_recovered"] = (
-            by_outcome.get("auto_claim_recovered", 0) + 1
+        by_outcome[_AUTO_CLAIM_EVENT_RECOVERED] = (
+            by_outcome.get(_AUTO_CLAIM_EVENT_RECOVERED, 0) + 1
         )
         _emit_task_reclaimed_audit(
             services,
@@ -1780,13 +1857,22 @@ def _recover_dead_claims(
             task=task,
             reason="worker session missing; stale claim released",
         )
+        _emit_auto_claim_audit(
+            services,
+            project=project,
+            task=task,
+            outcome=_AUTO_CLAIM_EVENT_RECOVERED,
+            metadata={
+                "reason": "worker session missing; stale claim released",
+            },
+        )
         # Record an event so the activity log shows the auto-recovery.
         msg_store = getattr(services, "msg_store", None)
         if msg_store is not None:
             try:
                 msg_store.append_event(
                     scope=project_key,
-                    sender="auto_claim_sweep",
+                    sender=_AUTO_CLAIM_ACTOR,
                     subject="worker_session_recovered",
                     payload={
                         "task_id": task_id,
@@ -1869,6 +1955,21 @@ def _auto_claim_next(
     target = candidates[0]
     task_id = getattr(target, "task_id", None)
     if not task_id:
+        totals["by_outcome"][_AUTO_CLAIM_EVENT_FAILED] = (
+            totals["by_outcome"].get(_AUTO_CLAIM_EVENT_FAILED, 0) + 1
+        )
+        _emit_auto_claim_audit(
+            services,
+            project=project,
+            task=target,
+            outcome=_AUTO_CLAIM_EVENT_FAILED,
+            status="error",
+            metadata={
+                "reason": "missing_task_id",
+                "active_workers_before": len(active),
+                "cap": cap,
+            },
+        )
         return
 
     # Gate: plan must be approved before we can claim for the project.
@@ -1880,19 +1981,60 @@ def _auto_claim_next(
     enforce_plan = (
         project_enforce if project_enforce is not None else global_enforce
     )
-    if enforce_plan and not task_bypasses_plan_gate(target):
+    try:
+        bypasses_plan_gate = task_bypasses_plan_gate(target)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "task_auto_claim: plan-bypass check failed for %s; "
+            "skipping auto-claim tick",
+            task_id, exc_info=True,
+        )
+        totals["by_outcome"][_AUTO_CLAIM_EVENT_FAILED] = (
+            totals["by_outcome"].get(_AUTO_CLAIM_EVENT_FAILED, 0) + 1
+        )
+        _emit_auto_claim_audit(
+            services,
+            project=project,
+            task=target,
+            outcome=_AUTO_CLAIM_EVENT_FAILED,
+            status="error",
+            metadata={
+                "reason": "plan_bypass_check_failed",
+                "error": str(exc),
+                "active_workers_before": len(active),
+                "cap": cap,
+            },
+        )
+        return
+    if enforce_plan and not bypasses_plan_gate:
         try:
             if not has_acceptable_plan(
                 project_key, Path(project_path), work,
                 plan_dir=getattr(services, "plan_dir", "docs/plan"),
             ):
-                totals["by_outcome"]["auto_claim_skipped_plan_missing"] = (
-                    totals["by_outcome"].get("auto_claim_skipped_plan_missing", 0) + 1
+                totals["by_outcome"][_AUTO_CLAIM_EVENT_SKIPPED_PLAN_MISSING] = (
+                    totals["by_outcome"].get(
+                        _AUTO_CLAIM_EVENT_SKIPPED_PLAN_MISSING,
+                        0,
+                    )
+                    + 1
                 )
                 _emit_plan_missing_alert(
                     services,
                     project=project_key,
                     example_task_id=task_id,
+                )
+                _emit_auto_claim_audit(
+                    services,
+                    project=project,
+                    task=target,
+                    outcome=_AUTO_CLAIM_EVENT_SKIPPED_PLAN_MISSING,
+                    status="warn",
+                    metadata={
+                        "reason": "acceptable plan missing",
+                        "active_workers_before": len(active),
+                        "cap": cap,
+                    },
                 )
                 if plan_missing_projects is not None:
                     plan_missing_projects.add(project_key)
@@ -1903,28 +2045,65 @@ def _auto_claim_next(
                 "skipping auto-claim tick",
                 project_key, exc_info=True,
             )
+            totals["by_outcome"][_AUTO_CLAIM_EVENT_FAILED] = (
+                totals["by_outcome"].get(_AUTO_CLAIM_EVENT_FAILED, 0) + 1
+            )
+            _emit_auto_claim_audit(
+                services,
+                project=project,
+                task=target,
+                outcome=_AUTO_CLAIM_EVENT_FAILED,
+                status="error",
+                metadata={
+                    "reason": "plan_gate_check_failed",
+                    "active_workers_before": len(active),
+                    "cap": cap,
+                },
+            )
             return
 
     try:
-        work.claim(task_id, "auto_claim_sweep")
+        work.claim(task_id, _AUTO_CLAIM_ACTOR)
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "task_auto_claim: claim(%s) failed: %s", task_id, exc,
             exc_info=True,
         )
-        totals["by_outcome"]["auto_claim_failed"] = (
-            totals["by_outcome"].get("auto_claim_failed", 0) + 1
+        totals["by_outcome"][_AUTO_CLAIM_EVENT_FAILED] = (
+            totals["by_outcome"].get(_AUTO_CLAIM_EVENT_FAILED, 0) + 1
+        )
+        _emit_auto_claim_audit(
+            services,
+            project=project,
+            task=target,
+            outcome=_AUTO_CLAIM_EVENT_FAILED,
+            status="error",
+            metadata={
+                "reason": str(exc),
+                "active_workers_before": len(active),
+                "cap": cap,
+            },
         )
         return
-    totals["by_outcome"]["auto_claim_spawned"] = (
-        totals["by_outcome"].get("auto_claim_spawned", 0) + 1
+    totals["by_outcome"][_AUTO_CLAIM_EVENT_SPAWNED] = (
+        totals["by_outcome"].get(_AUTO_CLAIM_EVENT_SPAWNED, 0) + 1
+    )
+    _emit_auto_claim_audit(
+        services,
+        project=project,
+        task=target,
+        outcome=_AUTO_CLAIM_EVENT_SPAWNED,
+        metadata={
+            "active_workers_before": len(active),
+            "cap": cap,
+        },
     )
     msg_store = getattr(services, "msg_store", None)
     if msg_store is not None:
         try:
             msg_store.append_event(
                 scope=project_key,
-                sender="auto_claim_sweep",
+                sender=_AUTO_CLAIM_ACTOR,
                 subject="worker_auto_claimed",
                 payload={
                     "task_id": task_id,

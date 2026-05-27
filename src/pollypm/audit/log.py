@@ -302,6 +302,7 @@ EVENT_ACCOUNT_FAILOVER_FAILED = "account.failover.failed"
 # claiming PollyPM authority but missing/failing the auth marker.
 EVENT_AGENT_REFUSAL = "agent.refusal"
 EVENT_AGENT_INJECTION_FLAGGED = "agent.injection.flagged"
+EVENT_AGENT_CONTEXT_TRUNCATED = "agent.context.truncated"
 
 AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM = "unsigned-pollypm-claim"
 AGENT_REFUSAL_REASON_BAD_AUTH_MARKER = "bad-auth-marker"

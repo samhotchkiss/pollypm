@@ -93,30 +93,59 @@ class ClassifierRule:
 
 
 # Compiled once at import — ``re.IGNORECASE`` so we match whatever
-# casing Claude or Codex happens to emit this week. The alternation
-# covers the explicit operator-visible phrasings *and* Claude's own
-# "I need to summarize" self-narration (which sometimes appears before
-# the header banner does).
-_CONTEXT_FULL_RE = re.compile(
+# casing Claude or Codex happens to emit this week. The branch labels
+# feed the canonical audit metadata for ``agent.context.truncated``.
+_CONTEXT_FULL_BRANCH_RE = re.compile(
     r"(?:"
     r"context\s+is\s+getting\s+full"
     r"|approaching\s+context\s+limit"
     r"|context\s+window\s+(?:is\s+)?(?:almost\s+)?(?:nearly\s+)?full"
     r"|\u26a0\ufe0f?\s*context\s+window"        # ⚠️ context window
-    r"|\u26a0\ufe0f?\s*context\s+low"           # ⚠️ context low
+    r")",
+    re.IGNORECASE,
+)
+
+_CONTEXT_LOW_BRANCH_RE = re.compile(
+    r"(?:"
+    r"\u26a0\ufe0f?\s*context\s+low"            # ⚠️ context low
     r"|context\s+low"
-    r"|i\s+(?:need|should)\s+to\s+summariz[e]"
+    r")",
+    re.IGNORECASE,
+)
+
+_SUMMARIZE_ANNOUNCE_BRANCH_RE = re.compile(
+    r"(?:"
+    r"i\s+(?:need|should)\s+to\s+summariz[e]"
     r"|let\s+me\s+summariz[e]\s+(?:the\s+)?conversation"
     r"|i['\u2019]ll\s+summariz[e]\s+(?:the\s+)?conversation"
     r")",
     re.IGNORECASE,
 )
 
+_CONTEXT_TRIGGER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("context_full", _CONTEXT_FULL_BRANCH_RE),
+    ("context_low", _CONTEXT_LOW_BRANCH_RE),
+    ("summarize_announce", _SUMMARIZE_ANNOUNCE_BRANCH_RE),
+)
+
 
 def _match_context_full(pane_text: str) -> bool:
     if not pane_text:
         return False
-    return _CONTEXT_FULL_RE.search(pane_text) is not None
+    return any(
+        pattern.search(pane_text) is not None
+        for _, pattern in _CONTEXT_TRIGGER_PATTERNS
+    )
+
+
+def context_truncation_trigger(pane_text: str) -> str | None:
+    """Return the stable context-limit trigger label for audit metadata."""
+    if not pane_text:
+        return None
+    for trigger, pattern in _CONTEXT_TRIGGER_PATTERNS:
+        if pattern.search(pane_text) is not None:
+            return trigger
+    return None
 
 
 # Traceback / explicit Error: block. The literal ``Traceback (most

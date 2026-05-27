@@ -576,6 +576,7 @@ def _pane_text_classify_body(
         RULES,
         USER_VISIBLE_RULES,
         classify_pane,
+        context_truncation_trigger,
         rule_by_name,
     )
 
@@ -594,6 +595,7 @@ def _pane_text_classify_body(
     alerts_raised = 0
     alerts_cleared = 0
     inbox_items_emitted = 0
+    context_audit_events_emitted = 0
     capture_failures = 0
     pm_turn_transitions = 0  # #1633 — active → ended PM turn flips this tick.
     match_counts: dict[str, int] = {name: 0 for name in all_rule_names}
@@ -703,6 +705,16 @@ def _pane_text_classify_body(
                                 "failed for %s/%s", session_name, rule_name,
                                 exc_info=True,
                             )
+                        if rule_name == "context_full":
+                            if _emit_context_truncated_audit_event(
+                                session_name=session_name,
+                                trigger=(
+                                    context_truncation_trigger(pane_text)
+                                    or "context_full"
+                                ),
+                                pane_text=pane_text,
+                            ):
+                                context_audit_events_emitted += 1
                 except Exception:  # noqa: BLE001
                     logger.debug(
                         "pane_text_classify: upsert_alert failed "
@@ -746,6 +758,7 @@ def _pane_text_classify_body(
         "alerts_raised": alerts_raised,
         "alerts_cleared": alerts_cleared,
         "inbox_items_emitted": inbox_items_emitted,
+        "context_audit_events_emitted": context_audit_events_emitted,
         "capture_failures": capture_failures,
         "match_counts": match_counts,
         # #1633 — count of PM personas that just transitioned to
@@ -753,6 +766,40 @@ def _pane_text_classify_body(
         # one ``pm.turn_ended`` audit event.
         "pm_turn_transitions": pm_turn_transitions,
     }
+
+
+def _emit_context_truncated_audit_event(
+    *,
+    session_name: str,
+    trigger: str,
+    pane_text: str,
+) -> bool:
+    """Emit the canonical audit row for context-limit pane detections."""
+    try:
+        from pollypm.audit.log import (
+            EVENT_AGENT_CONTEXT_TRUNCATED,
+            emit as audit_emit,
+        )
+
+        audit_emit(
+            event=EVENT_AGENT_CONTEXT_TRUNCATED,
+            project="_workspace",
+            subject=session_name,
+            actor="audit_watchdog",
+            status="warn",
+            metadata={
+                "trigger": trigger,
+                "pane_excerpt": (pane_text or "")[-200:],
+            },
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "pane_text_classify: agent.context.truncated audit emit failed "
+            "for %s", session_name,
+            exc_info=True,
+        )
+        return False
 
 
 def _emit_pane_pattern_inbox_item(

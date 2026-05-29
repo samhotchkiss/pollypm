@@ -223,12 +223,18 @@ def _node_relpath(request) -> str:
 
 
 def _needs_live_state_isolation(request) -> bool:
-    """True for the issue #2177 target subset."""
+    """True for tests that must not touch operator HOME or ambient pg."""
     rel = _node_relpath(request)
     return (
         rel.startswith("tests/web_api/")
+        or rel == "tests/test_supervisor.py"
         or rel.startswith("tests/test_work_service")
     )
+
+
+def _needs_pg_schema_isolation(request) -> bool:
+    """True when a module must run through ``pg_schema_pool``."""
+    return _node_relpath(request) == "tests/test_supervisor.py"
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -251,9 +257,9 @@ def _isolate_web_api_and_work_service_live_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Sandbox HOME/config and guard PG DSN resolution for #2177 tests.
+    """Sandbox HOME/config and guard PG DSN resolution for live-state tests.
 
-    The targeted web_api/work_service tests should never read the
+    The targeted web_api/work_service/supervisor tests should never read the
     operator's ``~/.pollypm`` or fall through to the default local
     ``pollypm`` Postgres database. Production code still sees normal
     public config/env seams; the fixture just binds those seams to a
@@ -287,6 +293,13 @@ def _isolate_web_api_and_work_service_live_state(
         sandbox_pollypm / "api-token",
         monkeypatch,
     )
+
+    if _needs_pg_schema_isolation(request):
+        # Supervisor construction opens the unified pg message Store
+        # immediately. Bind those tests to the same per-test schema seam
+        # used by the pg storage suites before any Supervisor can fall
+        # through to pg_pool.DEFAULT_DSN.
+        request.getfixturevalue("pg_schema_pool")
 
     try:
         from pollypm.storage import pg_pool

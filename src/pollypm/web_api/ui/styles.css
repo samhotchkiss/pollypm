@@ -500,6 +500,16 @@ section#message-pane {
   font-size: 13px;
   margin: 8px 0 16px;
 }
+.empty-briefing {
+  color: var(--text-body);
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 12px 0 16px;
+  max-height: 45vh;
+  overflow: auto;
+  text-align: left;
+  white-space: pre-wrap;
+}
 .empty-actions {
   display: flex;
   justify-content: center;
@@ -645,6 +655,77 @@ section#message-pane {
 
 .dashboard-rollups {
   padding: 0 12px 16px;
+}
+.dashboard-headline {
+  display: block;
+  width: 100%;
+  margin: 0 0 10px;
+  padding: 11px 12px;
+  border: 1px solid rgba(91, 138, 255, 0.45);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.dashboard-headline:hover {
+  background: var(--bg-row-hover);
+}
+.dashboard-headline:focus {
+  outline: none;
+  border-color: var(--info);
+}
+.dashboard-headline-title {
+  color: var(--text-heading-bright);
+  font-size: 13px;
+  font-weight: 700;
+}
+.dashboard-headline-detail {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.quota-card {
+  border: 1px solid var(--border-line);
+  border-radius: 6px;
+  background: var(--bg-row);
+  margin: 0 0 8px;
+  padding: 10px 12px;
+}
+.quota-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.quota-summary {
+  color: var(--text-heading-bright);
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 5px;
+}
+.quota-bar {
+  height: 5px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.22);
+}
+.quota-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--working);
+}
+.quota-warn .quota-fill { background: var(--attention); }
+.quota-critical .quota-fill { background: var(--blocked); }
+.quota-secondary,
+.quota-tokens {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
 }
 .rollup-card {
   display: block;
@@ -862,7 +943,21 @@ section#message-pane {
   padding: 3px 7px;
   color: var(--text-body);
   background: var(--bg-elevated);
+  cursor: pointer;
+  font: inherit;
   font-size: 11px;
+}
+.alert-action:hover:not(:disabled) {
+  background: var(--bg-row-hover);
+  border-color: var(--info);
+}
+.alert-action:focus {
+  outline: none;
+  border-color: var(--info);
+}
+.alert-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .fetch-retry {

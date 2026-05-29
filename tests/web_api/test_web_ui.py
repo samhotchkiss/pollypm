@@ -1168,6 +1168,8 @@ def test_ui_app_js_has_alerts_panel_hooks(client: TestClient) -> None:
     for expected in (
         "selectAlerts",
         "/alerts?limit=100",
+        "/actions/acknowledge",
+        "alert acknowledged",
         "/doctor/report",
         "/doctor/run",
         "session-drift",
@@ -1187,9 +1189,11 @@ def test_ui_app_js_has_inbox_panel_hooks(client: TestClient) -> None:
         "/archive",
         "/snooze",
         "/reply",
+        'verb = decision === "approve" ? "approve" : "rework"',
+        "plan approved",
         "Load more",
         "Type filtering is unavailable",
-        "Plan approve/reject API is not available",
+        "rejected from web UI",
     ):
         assert expected in body
 
@@ -1206,7 +1210,8 @@ def test_ui_empty_state_points_to_inbox_without_modal(client: TestClient) -> Non
     """First-run/no-selection state is an inline action surface."""
     body = client.get("/ui/app.js").text
     assert "renderNoSelection" in body
-    assert "No surface selected" in body
+    assert "All handled - Polly's got it" in body
+    assert "include_briefing" in body
     assert "Open inbox" in body
     assert "Refresh" in body
 
@@ -1678,6 +1683,7 @@ def test_render_dashboard_real_payload_executes() -> None:
             "alert_count": 3,
             "sweep_count_24h": 12,
             "message_count_24h": 47,
+            "recovery_count_24h": 2,
             "tracked_count": 5,
         },
         "daemon_status": "up",
@@ -1690,6 +1696,17 @@ def test_render_dashboard_real_payload_executes() -> None:
         "scoped_fields": [],
         "projects": [],
         "recent_messages": [],
+        "tokens": {"today": 1234, "total": 5678},
+        "account_usages": [{
+            "account_name": "claude_primary",
+            "provider": "claude",
+            "email": "claude@example.com",
+            "used_pct": 42,
+            "summary": "58% left this week",
+            "severity": "ok",
+            "limit_label": "weekly limit",
+            "reset_at": "",
+        }],
     }
     rendered = _node_render_dashboard(payload)
 
@@ -1700,6 +1717,7 @@ def test_render_dashboard_real_payload_executes() -> None:
 
     # Each counter's label appears.
     for label in (
+        "Claude headroom",
         "inbox",
         "plan reviews",
         "alerts",
@@ -1722,6 +1740,9 @@ def test_render_dashboard_real_payload_executes() -> None:
     assert ">up<" in rendered, "daemon status 'up' missing"
     assert ">4<" in rendered, "active_sessions count (len=4) missing"
     assert ">5<" in rendered, "tracked_count value 5 missing"
+    assert "58% left this week" in rendered, "quota summary missing"
+    assert "1234 today / 5678 total tokens" in rendered, "token line missing"
+    assert "5 things need you" in rendered, "lead headline missing"
     assert 'role="button"' in rendered
     assert 'title="Open inbox"' in rendered
     assert 'title="Open alerts"' in rendered

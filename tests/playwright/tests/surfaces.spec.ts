@@ -319,7 +319,7 @@ test.describe("surfaces", () => {
       releaseEvent = resolve;
     });
 
-    await page.route("**/api/v1/dashboard", (route) => {
+    await page.route("**/api/v1/dashboard**", (route) => {
       dashboardRequests += 1;
       return route.fulfill({
         status: 200,
@@ -414,7 +414,7 @@ test.describe("surfaces", () => {
     await stubEmptyTasks(page);
 
     let dashboardRequests = 0;
-    await page.route("**/api/v1/dashboard", (route) => {
+    await page.route("**/api/v1/dashboard**", (route) => {
       dashboardRequests += 1;
       return route.fulfill({
         status: 200,
@@ -456,7 +456,7 @@ test.describe("surfaces", () => {
     await stubEmptyTasks(page);
 
     let dashboardRequests = 0;
-    await page.route("**/api/v1/dashboard", (route) => {
+    await page.route("**/api/v1/dashboard**", (route) => {
       dashboardRequests += 1;
       return route.fulfill({
         status: 200,
@@ -499,7 +499,7 @@ test.describe("surfaces", () => {
       releaseFirst = resolve;
     });
 
-    await page.route("**/api/v1/dashboard", async (route) => {
+    await page.route("**/api/v1/dashboard**", async (route) => {
       dashboardRequests += 1;
       if (dashboardRequests === 1) {
         await firstRequestGate;
@@ -534,7 +534,7 @@ test.describe("surfaces", () => {
     await stubEmptyActivity(page);
 
     let dashboardRequests = 0;
-    await page.route("**/api/v1/dashboard", (route) => {
+    await page.route("**/api/v1/dashboard**", (route) => {
       dashboardRequests += 1;
       return route.fulfill({
         status: 200,
@@ -578,7 +578,7 @@ test.describe("surfaces", () => {
 
   test("initial rail load requests sessions tasks and projects in parallel", async ({ page }) => {
     await stubEmptyActivity(page);
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -631,7 +631,7 @@ test.describe("surfaces", () => {
   test("projects render on cold load before sessions and tasks finish", async ({ page }) => {
     await installHealthyEventSource(page);
     await stubEmptyActivity(page);
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -701,7 +701,7 @@ test.describe("surfaces", () => {
     await page.addInitScript(() => {
       (window as any).__POLLYPM_RAIL_REQUEST_TIMEOUT_MS = 50;
     });
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -752,7 +752,7 @@ test.describe("surfaces", () => {
     await page.addInitScript(() => {
       (window as any).__POLLYPM_RAIL_REQUEST_TIMEOUT_MS = 1000;
     });
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -816,7 +816,7 @@ test.describe("surfaces", () => {
   test("initial center-pane state shows inline next actions", async ({ page }) => {
     await page.goto("/ui/");
     await expect(page.locator("#pane-title")).toHaveText("Ready");
-    await expect(page.locator(".empty-title")).toHaveText("No surface selected");
+    await expect(page.locator(".empty-title")).toContainText(/handled|need|Loading/);
     await expect(page.locator(".empty-action.primary")).toHaveText("Open inbox");
     await expect(page.locator("#send-input")).toBeDisabled();
     await expect(page.locator("#send-button")).toBeDisabled();
@@ -983,7 +983,7 @@ test.describe("surfaces", () => {
         body: JSON.stringify({ sessions: [] }),
       }),
     );
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1214,7 +1214,7 @@ test.describe("surfaces", () => {
     await stubEmptyProjects(page);
     await stubEmptySessions(page);
     await stubEmptyTasks(page);
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1288,7 +1288,7 @@ test.describe("surfaces", () => {
     await stubEmptyProjects(page);
     await stubEmptySessions(page);
     await stubEmptyTasks(page);
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",

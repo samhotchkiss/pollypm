@@ -592,6 +592,103 @@ def test_stuck_draft_terminator_durable_across_scan_project_calls(
     )
 
 
+def test_stuck_draft_terminator_counts_central_findings_when_project_log_misses(
+    now: datetime,
+    tmp_path: Path,
+) -> None:
+    """Production regression: per-project logs may miss audit.finding rows.
+
+    ``scan_project`` still reads lifecycle events from the per-project
+    log, but the stuck_draft terminator must count the central
+    ``audit.finding`` rows that were durably written there.
+    """
+    from pollypm.audit.log import emit as audit_emit, project_log_path
+
+    project = "booktalk"
+    project_path = tmp_path / project
+    (project_path / ".pollypm").mkdir(parents=True)
+    per_project = project_log_path(project_path)
+    assert per_project is not None
+
+    subject = f"{project}/158"
+    for i in range(STUCK_DRAFT_TERMINATOR_THRESHOLD):
+        emit_finding(
+            Finding(
+                rule=RULE_STUCK_DRAFT,
+                project=project,
+                subject=subject,
+                message=f"central-only stuck_draft finding #{i}",
+                recommendation="rec",
+            ),
+            project_path=None,
+        )
+
+    audit_emit(
+        event=EVENT_TASK_CREATED,
+        project=project,
+        subject=subject,
+        actor="audit_watchdog",
+        metadata={
+            "title": (
+                "Project booktalk has 3 queued task(s) but no claim / "
+                "execution / status-change activity for the entire scan window."
+            ),
+        },
+        project_path=project_path,
+    )
+
+    central = central_log_path(project)
+    central_lines: list[str] = []
+    finding_ts_base = now - timedelta(minutes=45)
+    finding_idx = 0
+    for raw in central.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        obj = json.loads(raw)
+        if obj.get("event") == "audit.finding":
+            obj["ts"] = (
+                finding_ts_base + timedelta(minutes=finding_idx)
+            ).isoformat()
+            finding_idx += 1
+        central_lines.append(json.dumps(obj))
+    central.write_text("\n".join(central_lines) + "\n", encoding="utf-8")
+
+    per_project_lines: list[str] = []
+    for raw in per_project.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        obj = json.loads(raw)
+        if obj.get("event") == EVENT_TASK_CREATED:
+            obj["ts"] = (now - timedelta(minutes=15)).isoformat()
+        per_project_lines.append(json.dumps(obj))
+    per_project.write_text(
+        "\n".join(per_project_lines) + "\n",
+        encoding="utf-8",
+    )
+
+    findings = [
+        f
+        for f in scan_project(project, project_path=project_path, now=now)
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings == [], (
+        "central audit.finding rows should trip the terminator even "
+        "when the per-project lifecycle log has no finding rows"
+    )
+
+    rows = [
+        json.loads(line)
+        for line in per_project.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    terminator_rows = [
+        r for r in rows
+        if r["event"] == EVENT_STUCK_DRAFT_TERMINATED
+        and r.get("subject") == subject
+    ]
+    assert len(terminator_rows) == 1
+
+
 def test_stuck_draft_event_path_cross_checks_open_tasks_status(now: datetime) -> None:
     """#1869: when ``open_tasks`` is supplied, the event-based fallback
     must not fire for tasks that are no longer in draft state.

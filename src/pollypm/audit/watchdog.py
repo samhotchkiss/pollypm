@@ -2746,6 +2746,94 @@ _QUEUE_MOTION_EVENTS: frozenset[str] = frozenset({
 })
 
 
+_QUEUE_WITHOUT_MOTION_TITLE_RE = re.compile(
+    r"^Project\s+(?P<project>\S+)\s+has\s+\d+\s+queued task\(s\) "
+    r"but no claim / execution / status-change activity\b"
+)
+
+
+def _task_status_value(task: Any) -> str:
+    status = getattr(task, "work_status", None)
+    value = getattr(status, "value", status)
+    return value if isinstance(value, str) else ""
+
+
+def _task_scalar_value(task: Any, attr: str) -> str:
+    raw = getattr(task, attr, "") or ""
+    value = getattr(raw, "value", raw)
+    return value if isinstance(value, str) else str(value)
+
+
+def _task_label_set(task: Any) -> set[str]:
+    labels = getattr(task, "labels", None) or ()
+    if isinstance(labels, str):
+        labels = (labels,)
+    out: set[str] = set()
+    try:
+        for label in labels:
+            out.add(str(label))
+    except TypeError:
+        return set()
+    return out
+
+
+def _is_unactioned_queue_without_motion_task(
+    task: Any,
+    *,
+    project_key: str,
+) -> bool:
+    """Return True for an existing unqueued watchdog operator draft.
+
+    The tier-3 materializer writes these as ordinary work tasks so the
+    pure probe can only inspect the open-task snapshot. Keep the match
+    narrow: same project, still ``draft``, watchdog/operator-shaped,
+    and carrying the queue_without_motion subject/body produced by the
+    shipped prompt path. Older production rows may have no
+    ``created_by`` but do carry the title shape and watchdog label.
+    """
+    if _task_status_value(task) != "draft":
+        return False
+    project = _task_scalar_value(task, "project")
+    if project and project != project_key:
+        return False
+
+    labels = _task_label_set(task)
+    kind = _task_scalar_value(task, "kind")
+    created_by = _task_scalar_value(task, "created_by")
+    watchdog_shaped = (
+        kind == "watchdog_operator_dispatch"
+        or "watchdog" in labels
+        or created_by == "audit_watchdog"
+    )
+    if not watchdog_shaped:
+        return False
+
+    title = _task_scalar_value(task, "title")
+    match = _QUEUE_WITHOUT_MOTION_TITLE_RE.match(title)
+    if match is not None:
+        return match.group("project") == project_key
+
+    body = (
+        _task_scalar_value(task, "description")
+        + "\n"
+        + _task_scalar_value(task, "body")
+    )
+    return (
+        f"Project {project_key} is wedged" in body
+        and "queued_subjects" in body
+        and "threshold_seconds" in body
+    )
+
+
+def _has_unactioned_queue_without_motion_task(ctx: ProbeContext) -> bool:
+    return any(
+        _is_unactioned_queue_without_motion_task(
+            task, project_key=ctx.project_key,
+        )
+        for task in ctx.open_tasks or ()
+    )
+
+
 def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
     """Safety-net probe: queued tasks but no recent activity events.
 
@@ -2801,6 +2889,8 @@ def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
             last_activity_ts = ts
             last_activity_event = ev.event
     if last_activity_ts is not None and last_activity_ts >= cutoff:
+        return []
+    if _has_unactioned_queue_without_motion_task(ctx):
         return []
 
     last_iso = last_activity_ts.isoformat() if last_activity_ts else None
@@ -3043,6 +3133,83 @@ def scan_events(
     return findings
 
 
+def _audit_event_merge_key(ev: AuditEvent) -> tuple[str, str, str, str, str, str, str]:
+    try:
+        metadata = json.dumps(
+            ev.metadata or {},
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        metadata = str(ev.metadata or {})
+    return (
+        ev.ts,
+        ev.project,
+        ev.event,
+        ev.subject,
+        ev.actor,
+        ev.status,
+        metadata,
+    )
+
+
+def _merge_central_stuck_draft_signals(
+    events: Sequence[AuditEvent],
+    *,
+    project: str,
+    since: str,
+    project_path: Path | str | None,
+) -> list[AuditEvent]:
+    """Merge durable central stuck_draft signal rows into project readback.
+
+    ``read_events(..., project_path=...)`` intentionally prefers the
+    per-project log for lifecycle events, but production has emitted
+    some watchdog-owned ``audit.finding`` rows only to the central tail.
+    The stuck_draft terminator counts those durable rows, so the
+    cadence readback supplements the per-project event stream with the
+    central stuck_draft findings and prior terminator breadcrumbs only.
+    Other detectors keep seeing the project-local lifecycle source.
+    """
+    if project_path is None:
+        return list(events)
+
+    from pollypm.audit.log import read_events
+
+    merged = list(events)
+    seen = {_audit_event_merge_key(ev) for ev in merged}
+
+    for event_name in (EVENT_AUDIT_FINDING, EVENT_STUCK_DRAFT_TERMINATED):
+        try:
+            central_events = read_events(
+                project,
+                since=since,
+                event=event_name,
+                project_path=None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: central stuck_draft signal read failed",
+                exc_info=True,
+            )
+            continue
+        for ev in central_events:
+            meta = ev.metadata or {}
+            if event_name == EVENT_AUDIT_FINDING and (
+                meta.get("rule") != RULE_STUCK_DRAFT
+            ):
+                continue
+            key = _audit_event_merge_key(ev)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(ev)
+
+    merged.sort(key=lambda ev: ev.ts)
+    return merged
+
+
 def scan_project(
     project: str,
     *,
@@ -3097,6 +3264,12 @@ def scan_project(
     ).isoformat()
     events = read_events(
         project,
+        since=since,
+        project_path=project_path,
+    )
+    events = _merge_central_stuck_draft_signals(
+        events,
+        project=project,
         since=since,
         project_path=project_path,
     )

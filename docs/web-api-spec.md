@@ -481,6 +481,9 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | GET    | `/api/v1/projects` | List registered projects with state, glyph, counts |
 | POST   | `/api/v1/projects` | Register a project (mirrors `pm add-project`) |
 | GET    | `/api/v1/projects/{key}` | Project drilldown — state, recent activity, top tasks, pending plan review |
+| GET    | `/api/v1/dashboard` | Dashboard/cockpit aggregate state (`?project=&include_briefing=&include_token_history=`) |
+| GET    | `/api/v1/alerts` | Open action-required alerts with cockpit action descriptors |
+| POST   | `/api/v1/alerts/{alert_id}/actions/{kind}` | Run an alert action. `acknowledge` clears the alert and records the alert-cleared activity event |
 | POST   | `/api/v1/projects/{key}/plan` | Kick off `pm project plan` (initial or replan) |
 | POST   | `/api/v1/projects/{key}/chat` | Send a chat message to the project's PM persona |
 | POST   | `/api/v1/chat/{session_name}/send` | Send a message to a chat surface (operator/architect/advisor/worker) via tmux |
@@ -488,7 +491,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | GET    | `/api/v1/projects/{key}/plan` | Structured plan body (`?version=N` matches the active version only — see §7) |
 | GET    | `/api/v1/tasks/{project}/{n}` | Task detail — status, node, executions, transitions |
 | POST   | `/api/v1/tasks/{project}/{n}/approve` | Approve plan or code review |
-| POST   | `/api/v1/tasks/{project}/{n}/reject` | Reject + capture reason |
+| POST   | `/api/v1/tasks/{project}/{n}/rework` | Reject + capture reason, returning the task to rework |
 | POST   | `/api/v1/tasks/{project}/{n}/queue` | Queue a draft task; failed pre-queue gates return `422 validation_error` |
 | POST   | `/api/v1/tasks/{project}/{n}/claim` | Claim a queued task (activate first node, keep `assignee` role-derived, record request `actor` as `claimed_by_session`, fires `queued→in_progress`). Returns `429 worker_cap_exceeded` when the project is at `max_parallel_workers` (#2064 round-11). Post-commit cap races may roll the row back to `queued`; the response `message` and `warnings[]` describe the actual state |
 | POST   | `/api/v1/tasks/{project}/{n}/cancel` | Cancel a non-terminal task (mapped to `svc.cancel`; optional `reason` — absent reasons resolve to `"cancelled via API"` in the audit row). In-progress tasks require `?force=true`; without it the API returns `409 confirmation_required` |
@@ -676,11 +679,10 @@ pattern:
    `judgment_calls` as a checklist, `body` as collapsed markdown,
    `critic_synthesis` as a sidebar.
 3. Approve: `POST /api/v1/tasks/{project}/{n}/approve` with
-   `{ "kind": "plan" }` (the action body discriminates plan vs
-   code-review approvals; see OpenAPI for `ApproveRequest`).
-4. Reject: `POST /api/v1/tasks/{project}/{n}/reject` with
-   `{ "reason": "..." }` — the reason is required and non-empty
-   per `validation_error`.
+   `{ "actor": "operator", "reason": "..." }`.
+4. Reject: `POST /api/v1/tasks/{project}/{n}/rework` with
+   `{ "actor": "operator", "reason": "..." }` — the reason is
+   required and non-empty per `validation_error`.
 
 Cockpit semantics to mirror: PR #1421's approve flow displays a
 toast with a 10-second undo. The frontend gets the same affordance

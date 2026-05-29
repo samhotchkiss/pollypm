@@ -818,6 +818,50 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /alerts/{alert_id}/actions/{kind}:
+    post:
+      tags: [Alerts]
+      operationId: runAlertAction
+      summary: Run an action for an alert
+      description: |
+        Runs a supported alert action against a single alert row. The
+        web UI currently exposes the mutating `acknowledge` action,
+        which clears the alert via the configured message-store facade
+        and records the same alert-cleared activity event as cockpit
+        and CLI clear paths.
+      parameters:
+        - in: path
+          name: alert_id
+          required: true
+          schema: { type: integer }
+          description: Alert row id.
+        - in: path
+          name: kind
+          required: true
+          schema: { type: string }
+          description: Alert action kind. Only `acknowledge` is mutating today.
+      responses:
+        "200":
+          description: Alert action result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertActionResult"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: Alert storage unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 
   /chat/sessions:
     get:
@@ -3350,6 +3394,19 @@ components:
         hint:
           type: string
           nullable: true
+
+    AlertActionResult:
+      type: object
+      required: [ok, message, alert_id, status]
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        alert_id:
+          type: integer
+        status:
+          type: string
 
     AlertResponse:
       type: object

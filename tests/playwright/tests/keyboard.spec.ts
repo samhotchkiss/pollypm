@@ -50,7 +50,7 @@ async function stubBasics(page: import("@playwright/test").Page) {
 // Stub the dashboard read endpoint the UI fires on init so this spec
 // doesn't race live daemon state under fullyParallel runs.
 async function stubDashboard(page: import("@playwright/test").Page) {
-  await page.route("**/api/v1/dashboard", (route) =>
+  await page.route("**/api/v1/dashboard**", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",

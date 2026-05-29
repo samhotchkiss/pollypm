@@ -93,7 +93,7 @@ test.describe("dashboard rail", () => {
   test("rollup cards are focusable buttons that drill into visible state", async ({ page }) => {
     await installQuietEventSource(page);
     await stubSurfaces(page);
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -115,7 +115,7 @@ test.describe("dashboard rail", () => {
     const expected: Array<[RegExp, string]> = [
       [/inbox/i, "Inbox"],
       [/plan reviews/i, "Inbox"],
-      [/alerts/i, "Dashboard: alerts"],
+      [/alerts/i, "Alerts"],
       [/activity/i, "operator"],
       [/daemon/i, "Dashboard: daemon"],
       [/active sessions/i, "operator"],
@@ -128,7 +128,7 @@ test.describe("dashboard rail", () => {
     const rollups = page.locator("#dashboard-rollups");
 
     for (const [name, title] of expected) {
-      const card = rollups.getByRole("button", { name });
+      const card = rollups.locator(".rollup-card").filter({ hasText: name });
       await expect(card).toBeVisible();
       await expect(card).toHaveAttribute("aria-label", /Open dashboard detail/);
       await card.focus();
@@ -156,7 +156,7 @@ test.describe("dashboard rail", () => {
       releaseSecond = resolve;
     });
 
-    await page.route("**/api/v1/dashboard", async (route) => {
+    await page.route("**/api/v1/dashboard**", async (route) => {
       dashboardRequests += 1;
       if (dashboardRequests === 2) {
         await secondRequestGate;
@@ -202,7 +202,7 @@ test.describe("dashboard rail", () => {
       releaseFirst = resolve;
     });
 
-    await page.route("**/api/v1/dashboard", async (route) => {
+    await page.route("**/api/v1/dashboard**", async (route) => {
       dashboardRequests += 1;
       if (dashboardRequests === 1) {
         await firstRequestGate;

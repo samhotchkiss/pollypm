@@ -43,7 +43,7 @@ test.describe("mobile viewport", () => {
 
   test("surface list renders at 360px before optional task rail request completes", async ({ page }) => {
     await page.setViewportSize({ width: 360, height: 800 });
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",

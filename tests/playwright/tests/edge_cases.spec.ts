@@ -41,7 +41,7 @@ async function stubTasks(page: import("@playwright/test").Page) {
 // doesn't race live daemon state. Each test below additionally stubs
 // /chat/sessions to whatever shape it needs.
 async function stubDashboard(page: import("@playwright/test").Page) {
-  await page.route("**/api/v1/dashboard", (route) =>
+  await page.route("**/api/v1/dashboard**", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -163,7 +163,7 @@ test.describe("edge cases", () => {
         body: JSON.stringify({ error: { code: "internal", message: "x" } }),
       }),
     );
-    await page.route("**/api/v1/dashboard", (route) =>
+    await page.route("**/api/v1/dashboard**", (route) =>
       route.fulfill({
         status: 500,
         contentType: "application/json",

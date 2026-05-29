@@ -51,7 +51,7 @@ async function stubMessages(page: import("@playwright/test").Page) {
 // so this spec stays a pure unit of the send-message flow and doesn't
 // race live daemon state under fullyParallel runs.
 async function stubDashboard(page: import("@playwright/test").Page) {
-  await page.route("**/api/v1/dashboard", (route) =>
+  await page.route("**/api/v1/dashboard**", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",

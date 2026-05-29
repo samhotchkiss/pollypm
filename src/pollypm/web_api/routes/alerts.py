@@ -22,12 +22,20 @@ from pollypm.cockpit_alert_actions import (
 )
 from pollypm.cockpit_alerts import alert_channel, is_operational_alert
 from pollypm.storage.records import AlertRecord
-from pollypm.web_api.errors import service_unavailable
+from pollypm.web_api.errors import invalid_request, not_found, service_unavailable
 from pollypm.web_api.routes._deps import ConfigDep
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Alerts"])
+
+_ALERT_ACTION_RESPONSES = {
+    "400": {"description": "Unsupported alert action."},
+    "401": {"description": "Missing or invalid bearer token."},
+    "404": {"description": "Alert not found."},
+    "422": {"description": "Path parameter validation failed."},
+    "503": {"description": "Alert storage unavailable."},
+}
 
 
 class AlertActionResponse(BaseModel):
@@ -56,6 +64,13 @@ class AlertsResponse(BaseModel):
     generated_at: datetime
     total: int
     alerts: list[AlertResponse] = Field(default_factory=list)
+
+
+class AlertActionResult(BaseModel):
+    ok: bool = True
+    message: str
+    alert_id: int
+    status: str
 
 
 def _task_project_key(task_id: str | None) -> str | None:
@@ -112,6 +127,42 @@ def _read_open_alerts(config: Any) -> list[AlertRecord]:
         ) from exc
 
 
+def _read_alert(config: Any, alert_id: int) -> AlertRecord:
+    try:
+        from pollypm.storage.pg_alerts import get_alert
+
+        alert = get_alert(alert_id, config=config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("alerts: get_alert failed: %s", exc, exc_info=True)
+        raise service_unavailable(
+            "Failed to load alert",
+            hint="Retry shortly; check `pm doctor` for pg pool health.",
+        ) from exc
+    if alert is None:
+        raise not_found(
+            f"Alert not found: {alert_id}",
+            hint="Refresh alerts; the row may have been cleared already.",
+        )
+    return alert
+
+
+def _clear_alert(config: Any, alert: AlertRecord) -> None:
+    try:
+        from pollypm.store.registry import get_store
+
+        get_store(config).clear_alert(
+            alert.session_name,
+            alert.alert_type,
+            who_cleared="manual:web-alert-action",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("alerts: clear_alert failed: %s", exc, exc_info=True)
+        raise service_unavailable(
+            "Failed to acknowledge alert",
+            hint="Retry shortly; check `pm doctor` for pg pool health.",
+        ) from exc
+
+
 @router.get(
     "/alerts",
     response_model=AlertsResponse,
@@ -150,10 +201,41 @@ def list_alerts_endpoint(
     )
 
 
+@router.post(
+    "/alerts/{alert_id}/actions/{kind}",
+    response_model=AlertActionResult,
+    summary="Run an action for an alert",
+    operation_id="runAlertAction",
+    responses=_ALERT_ACTION_RESPONSES,
+)
+def run_alert_action_endpoint(
+    alert_id: int,
+    kind: str,
+    config: ConfigDep,
+) -> AlertActionResult:
+    if kind != "acknowledge":
+        raise invalid_request(
+            f"Unsupported alert action: {kind}",
+            hint="Only acknowledge is a mutating web alert action today.",
+        )
+    alert = _read_alert(config, alert_id)
+    if alert.status == "open":
+        _clear_alert(config, alert)
+    updated = _read_alert(config, alert_id)
+    return AlertActionResult(
+        ok=True,
+        message=f"acknowledged alert #{alert_id}",
+        alert_id=alert_id,
+        status=updated.status,
+    )
+
+
 __all__ = [
     "AlertActionResponse",
+    "AlertActionResult",
     "AlertResponse",
     "AlertsResponse",
     "list_alerts_endpoint",
+    "run_alert_action_endpoint",
     "router",
 ]

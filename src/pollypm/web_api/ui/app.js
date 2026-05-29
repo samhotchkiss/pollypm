@@ -77,6 +77,8 @@
     surfacesInFlight: false,
     surfacesRefreshQueued: false,
     surfacesQueuedPreserveErrors: false,
+    dashboardData: null,
+    dashboardBriefingRequested: false,
     dashboardInFlight: false,
     dashboardRefreshQueued: false,
     historyInFlight: {},
@@ -109,6 +111,7 @@
       doctorLoading: false,
       doctorError: null,
       doctorRunInFlight: false,
+      actionInFlight: {},
     },
     pendingMessages: {},
     inbox: {
@@ -1097,17 +1100,7 @@
     state.selectedKind = null;
     state.selectedSurface = null;
     state.selectedTaskKey = null;
-    $("pane-title").textContent = "Select a surface";
-    $("pane-meta").textContent = "";
-    $("send-input").disabled = true;
-    $("send-button").disabled = true;
-    const list = $("message-list");
-    clearMessageList(list);
-    list.appendChild(el("div", {
-      class: "message-empty",
-      text: "No surface selected.",
-    }));
-    updateStopAgentButton();
+    renderNoSelection();
   }
 
   function ensureSelectionVisible() {
@@ -1154,6 +1147,104 @@
     if (state.auditExpanded[name]) loadAuditForSurface(name);
   }
 
+  function numeric(value) {
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  }
+
+  function plural(count, singular, pluralText) {
+    return count === 1 ? singular : (pluralText || singular + "s");
+  }
+
+  function blockedProjectCount(data) {
+    const projects = data && Array.isArray(data.projects) ? data.projects : [];
+    return projects.filter((project) => {
+      const projectState = String(project.state || "").toLowerCase();
+      if (projectState === "blocked" || projectState === "on_hold") return true;
+      const counts = project.task_counts && typeof project.task_counts === "object"
+        ? project.task_counts : {};
+      return numeric(counts.blocked) + numeric(counts.on_hold) > 0;
+    }).length;
+  }
+
+  function dashboardStatus(data) {
+    if (!data || typeof data !== "object") {
+      return {
+        title: "Loading workspace state...",
+        detail: "Dashboard state is loading.",
+        actionLabel: "Open inbox",
+        target: "inbox",
+      };
+    }
+    const rollups = data.rollups && typeof data.rollups === "object"
+      ? data.rollups : {};
+    const planReviews = numeric(rollups.pending_plan_reviews);
+    const alerts = numeric(rollups.alert_count);
+    const blockedProjects = blockedProjectCount(data);
+    const total = planReviews + alerts + blockedProjects;
+    if (total === 0) {
+      const sweeps = numeric(rollups.sweep_count_24h);
+      const recoveries = numeric(rollups.recovery_count_24h);
+      const proof = sweeps || recoveries
+        ? "24h: " + sweeps + " "
+          + plural(sweeps, "sweep") + " / " + recoveries + " "
+          + plural(recoveries, "recovery", "recoveries") + "."
+        : "No plan reviews, blockers, or alerts waiting.";
+      return {
+        title: "All handled - Polly's got it",
+        detail: proof,
+        actionLabel: "Open inbox",
+        target: "inbox",
+      };
+    }
+    if (planReviews > 0) {
+      return {
+        title: total + " " + plural(total, "thing") + " "
+          + (total === 1 ? "needs" : "need") + " you",
+        detail: planReviews + " "
+          + plural(planReviews, "plan review") + " waiting.",
+        actionLabel: "Open plan reviews",
+        target: "plan-review",
+      };
+    }
+    if (blockedProjects > 0) {
+      return {
+        title: total + " " + plural(total, "thing") + " "
+          + (total === 1 ? "needs" : "need") + " you",
+        detail: blockedProjects + " "
+          + plural(blockedProjects, "blocked project") + " waiting.",
+        actionLabel: "Open blocked tasks",
+        target: "blocked-tasks",
+      };
+    }
+    return {
+      title: total + " " + plural(total, "thing") + " "
+        + (total === 1 ? "needs" : "need") + " you",
+      detail: alerts + " " + plural(alerts, "alert") + " waiting.",
+      actionLabel: "Open alerts",
+      target: "alerts",
+    };
+  }
+
+  function runDashboardStatusAction(status) {
+    if (!status) return;
+    if (status.target === "plan-review") {
+      selectInbox({ type: "plan_review" });
+      return;
+    }
+    if (status.target === "blocked-tasks") {
+      state.taskStatusFilter = "blocked";
+      const filter = $("task-status-filter");
+      if (filter) filter.value = state.taskStatusFilter;
+      loadSurfaces();
+      return;
+    }
+    if (status.target === "alerts") {
+      selectAlerts();
+      return;
+    }
+    selectInbox();
+  }
+
   function renderNoSelection() {
     state.selectedKind = null;
     state.selectedSurface = null;
@@ -1181,12 +1272,17 @@
     });
     const list = $("message-list");
     clearMessageList(list);
+    const status = dashboardStatus(state.dashboardData);
+    const briefing = state.dashboardData
+      && typeof state.dashboardData.briefing === "string"
+      && state.dashboardData.briefing.trim()
+      ? state.dashboardData.briefing.trim()
+      : "";
     list.appendChild(el("div", { class: "empty-state" }, [
-      el("div", { class: "empty-title", text: "No surface selected" }),
-      el("div", {
-        class: "empty-copy",
-        text: "Choose a chat or task from the rail, or review items waiting in the inbox.",
-      }),
+      el("div", { class: "empty-title", text: status.title }),
+      briefing
+        ? el("div", { class: "empty-briefing", text: briefing })
+        : el("div", { class: "empty-copy", text: status.detail }),
       el("div", { class: "empty-actions" }, [openInbox, refresh]),
     ]));
     renderSurfaces();
@@ -2034,13 +2130,64 @@
     }
   }
 
-  function renderAlertAction(action) {
+  function alertActionKey(item, action) {
+    return String(item.id != null ? item.id : item.session_name || "alert")
+      + ":" + String(action.kind || "action");
+  }
+
+  function setAlertAction(item, action, active) {
+    const key = alertActionKey(item, action);
+    if (active) state.alerts.actionInFlight[key] = true;
+    else delete state.alerts.actionInFlight[key];
+    renderAlertsView();
+  }
+
+  async function acknowledgeAlert(item, action) {
+    if (item.id == null) return;
+    setAlertAction(item, action, true);
+    try {
+      await apiJson(
+        API + "/alerts/" + encodeURIComponent(String(item.id))
+          + "/actions/acknowledge",
+        { method: "POST" },
+      );
+      showToast("ok", "alert acknowledged");
+      await loadAlerts();
+      pollDashboard();
+      loadActivity();
+    } catch (err) {
+      showToast("error", "acknowledge failed: " + err.message);
+    } finally {
+      setAlertAction(item, action, false);
+    }
+  }
+
+  function routeAlertToInbox(action) {
+    const parsed = parseTaskKey(action.task_id || "");
+    const project = action.project_key || (parsed && parsed.project) || "";
+    const filters = { type: "plan_review" };
+    if (project) filters.project = project;
+    selectInbox(filters);
+  }
+
+  function renderAlertAction(item, action) {
     const detail = action.hint || action.kind || "";
-    const node = el("span", {
+    const node = el("button", {
       class: "alert-action",
+      type: "button",
       text: action.label || action.kind || "Action",
     });
     if (detail) node.setAttribute("title", detail);
+    if (action.kind === "acknowledge") {
+      const key = alertActionKey(item, action);
+      node.disabled = Boolean(state.alerts.actionInFlight[key]) || item.id == null;
+      node.addEventListener("click", () => acknowledgeAlert(item, action));
+    } else if (action.kind === "route_inbox") {
+      node.addEventListener("click", () => routeAlertToInbox(action));
+    } else {
+      node.disabled = true;
+      node.setAttribute("aria-disabled", "true");
+    }
     return node;
   }
 
@@ -2063,7 +2210,7 @@
       children.push(el(
         "div",
         { class: "alert-actions" },
-        actions.map((action) => renderAlertAction(action)),
+        actions.map((action) => renderAlertAction(item, action)),
       ));
     }
     return el("div", { class: "alert-row" }, children);
@@ -2244,15 +2391,76 @@
     return btn;
   }
 
-  function disabledPlanReviewButton(label) {
+  function taskRefFromInboxItem(item) {
+    const metadata = item && item.metadata && typeof item.metadata === "object"
+      ? item.metadata : {};
+    return parseTaskKey(item.task_id || metadata.task_id || item.id || "");
+  }
+
+  function disabledInboxAction(label, title) {
     const btn = el("button", {
       class: "inbox-action disabled",
       type: "button",
       text: label,
-      title: "Plan approve/reject API is not available in this branch.",
+      title: title,
     });
     btn.disabled = true;
     return btn;
+  }
+
+  async function runPlanReviewDecision(item, decision) {
+    const ref = taskRefFromInboxItem(item);
+    if (!ref) {
+      showToast("error", "plan task id missing");
+      return;
+    }
+    const key = item.id + ":plan-" + decision;
+    const verb = decision === "approve" ? "approve" : "rework";
+    const path = API + "/tasks/" + encodeURIComponent(ref.project)
+      + "/" + encodeURIComponent(ref.task_number) + "/" + verb;
+    const body = { actor: OPERATOR_ACTOR };
+    if (decision === "approve") {
+      body.reason = "approved from web UI";
+    } else {
+      body.reason = "rejected from web UI";
+    }
+    setInboxAction(key, true);
+    try {
+      await apiJson(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      showToast(
+        "ok",
+        decision === "approve" ? "plan approved" : "plan rejected",
+      );
+      state.inbox.selectedId = null;
+      state.inbox.detail = null;
+      state.inbox.replyDraft = "";
+      await loadInbox(true);
+      pollDashboard();
+      loadSurfaces();
+    } catch (err) {
+      state.inbox.error = err;
+      showToast("error", decision + " failed: " + err.message);
+      renderInboxView();
+    } finally {
+      setInboxAction(key, false);
+    }
+  }
+
+  function planReviewButton(item, decision, label, extraClass) {
+    if (!taskRefFromInboxItem(item)) {
+      return disabledInboxAction(label, "Plan task id is missing.");
+    }
+    return inboxActionButton(
+      item,
+      "plan-" + decision,
+      label,
+      () => runPlanReviewDecision(item, decision),
+      extraClass,
+    );
   }
 
   function renderInboxFilters() {
@@ -2379,8 +2587,8 @@
         inboxActionButton(item, "archive", "Archive", archiveInboxItem, "danger"),
       ];
       if (item.type === "plan_review") {
-        rowActions.push(disabledPlanReviewButton("Approve"));
-        rowActions.push(disabledPlanReviewButton("Reject"));
+        rowActions.push(planReviewButton(item, "approve", "Approve"));
+        rowActions.push(planReviewButton(item, "reject", "Reject", "danger"));
       }
       const row = el("div", {
         class: (
@@ -2472,8 +2680,8 @@
     });
     const decisionActions = [];
     if (detail.type === "plan_review") {
-      decisionActions.push(disabledPlanReviewButton("Approve"));
-      decisionActions.push(disabledPlanReviewButton("Reject"));
+      decisionActions.push(planReviewButton(detail, "approve", "Approve"));
+      decisionActions.push(planReviewButton(detail, "reject", "Reject", "danger"));
     }
     return el("div", { class: "inbox-detail" }, [
       el("div", { class: "inbox-detail-title", text: detail.subject || detail.id }),
@@ -2631,12 +2839,17 @@
     try {
       const params = new URLSearchParams();
       if (state.selectedProject) params.set("project", state.selectedProject);
+      const includeBriefing = !state.dashboardBriefingRequested;
+      if (includeBriefing) params.set("include_briefing", "true");
       const query = params.toString();
       const data = await apiJson(
         API + "/dashboard" + (query ? "?" + query : ""),
         { signal: request.signal },
       );
+      state.dashboardData = data;
+      if (includeBriefing) state.dashboardBriefingRequested = true;
       renderDashboard(data);
+      if (state.selectedKind === null) renderNoSelection();
     } catch (err) {
       if (isAbortError(err)) return;
       renderDashboardError(err);
@@ -2769,6 +2982,80 @@
     return button;
   }
 
+  function buildDashboardHeadline(data) {
+    const status = dashboardStatus(data);
+    const button = el("button", {
+      type: "button",
+      class: "dashboard-headline",
+      "aria-label": status.actionLabel + ": " + status.title,
+    }, [
+      el("div", { class: "dashboard-headline-title", text: status.title }),
+      el("div", { class: "dashboard-headline-detail", text: status.detail }),
+    ]);
+    button.addEventListener("click", () => runDashboardStatusAction(status));
+    return button;
+  }
+
+  function quotaSeverityClass(severity) {
+    const value = String(severity || "").toLowerCase();
+    if (value === "critical" || value === "error") return "quota-critical";
+    if (value === "warn" || value === "warning") return "quota-warn";
+    return "quota-ok";
+  }
+
+  function clampedPercent(value) {
+    const pct = numeric(value);
+    if (pct < 0) return 0;
+    if (pct > 100) return 100;
+    return pct;
+  }
+
+  function buildQuotaCard(data) {
+    const usages = data && Array.isArray(data.account_usages)
+      ? data.account_usages : [];
+    const tokens = data && data.tokens && typeof data.tokens === "object"
+      ? data.tokens : {};
+    if (usages.length === 0 && tokens.today == null && tokens.total == null) {
+      return null;
+    }
+    const primary = usages[0] || {};
+    const pct = clampedPercent(primary.used_pct);
+    const children = [
+      el("div", { class: "quota-label", text: "Claude headroom" }),
+    ];
+    if (primary.summary) {
+      children.push(el("div", {
+        class: "quota-summary",
+        text: primary.summary,
+      }));
+    } else {
+      children.push(el("div", {
+        class: "quota-summary",
+        text: "Usage details unavailable.",
+      }));
+    }
+    const fill = el("div", { class: "quota-fill" });
+    fill.setAttribute("style", "width: " + pct + "%;");
+    children.push(el("div", { class: "quota-bar" }, [fill]));
+    if (usages.length > 1) {
+      const backup = usages[1];
+      children.push(el("div", {
+        class: "quota-secondary",
+        text: "+ backup: " + (backup.summary || backup.account_name || "available"),
+      }));
+    }
+    if (tokens.today != null || tokens.total != null) {
+      children.push(el("div", {
+        class: "quota-tokens",
+        text: String(tokens.today || 0) + " today / "
+          + String(tokens.total || 0) + " total tokens",
+      }));
+    }
+    return el("div", {
+      class: "quota-card " + quotaSeverityClass(primary.severity),
+    }, children);
+  }
+
   function renderDashboard(data) {
     const box = $("dashboard-rollups");
     box.innerHTML = "";
@@ -2788,6 +3075,10 @@
     const scopedFields = Array.isArray(data.scoped_fields)
       ? data.scoped_fields : [];
     const cards = [];
+
+    box.appendChild(buildDashboardHeadline(data));
+    const quotaCard = buildQuotaCard(data);
+    if (quotaCard) box.appendChild(quotaCard);
 
     // --- counters from rollups ------------------------------------------
     if (typeof rollups.open_inbox_count === "number") {

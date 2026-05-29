@@ -38,7 +38,7 @@ async function stubChrome(page: import("@playwright/test").Page) {
       body: JSON.stringify({ items: [] }),
     }),
   );
-  await page.route("**/api/v1/dashboard", (route) =>
+  await page.route("**/api/v1/dashboard**", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -82,7 +82,7 @@ test.describe("inbox panel", () => {
     await expect(page.locator("[data-inbox-id='demo/1']")).toContainText("Plan ready");
   });
 
-  test("dashboard inbox card opens browsable list with load more and disabled plan decisions", async ({ page }) => {
+  test("dashboard inbox card opens browsable list with load more and plan decisions", async ({ page }) => {
     await stubChrome(page);
 
     const inboxUrls: string[] = [];
@@ -122,7 +122,7 @@ test.describe("inbox panel", () => {
     await page.locator(".rollup-card[title='Open inbox']").click();
     await expect(page.locator("#pane-title")).toHaveText("Inbox");
     await expect(page.locator("[data-inbox-id='demo/1']")).toContainText("Plan ready");
-    await expect(page.locator(".inbox-action.disabled", { hasText: "Approve" })).toBeDisabled();
+    await expect(page.locator(".inbox-action", { hasText: "Approve" }).first()).toBeEnabled();
 
     await page.locator(".inbox-load-more").click();
     await expect(page.locator("[data-inbox-id='demo/2']")).toContainText("Follow-up question");
@@ -130,6 +130,48 @@ test.describe("inbox panel", () => {
 
     await page.locator("[data-inbox-id='demo/1']").click();
     await expect(page.locator(".inbox-thread-body")).toContainText("Please review.");
+  });
+
+  test("plan review decisions call task lifecycle endpoints", async ({ page }) => {
+    await stubChrome(page);
+
+    let approveActor = "";
+    let rejectReason = "";
+
+    await page.route("**/api/v1/inbox?**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [ITEM], next_cursor: null }),
+      }),
+    );
+    await page.route("**/api/v1/tasks/demo/1/approve", async (route) => {
+      approveActor = (await route.request().postDataJSON()).actor;
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, message: "approved demo/1", task: ITEM }),
+      });
+    });
+    await page.route("**/api/v1/tasks/demo/1/rework", async (route) => {
+      rejectReason = (await route.request().postDataJSON()).reason;
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, message: "rework demo/1", task: ITEM }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.locator(".rollup-card[title='Open inbox']").click();
+    const row = page.locator("[data-inbox-id='demo/1']");
+    await expect(row).toBeVisible();
+
+    await row.locator(".inbox-action", { hasText: "Approve" }).click();
+    await expect.poll(() => approveActor).toBe("operator");
+
+    await row.locator(".inbox-action", { hasText: "Reject" }).click();
+    await expect.poll(() => rejectReason).toContain("web UI");
   });
 
   test("inbox filters and actions call existing API routes", async ({ page }) => {

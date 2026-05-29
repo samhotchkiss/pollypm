@@ -104,6 +104,69 @@ def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
     assert any("API version 99" in item for item in host.errors)
 
 
+def test_extension_host_disables_plugin_on_validation_failure(tmp_path: Path) -> None:
+    bad_plugin = tmp_path / ".pollypm" / "plugins" / "bad_validation"
+    _write_plugin(
+        bad_plugin,
+        name="bad_validation",
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='bad_validation', providers={'broken': object()})\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+
+    assert "bad_validation" not in host.plugins()
+    disabled = host.disabled_plugins["bad_validation"]
+    assert disabled.reason == "load_error"
+    assert "Provider factory 'broken' is not callable" in disabled.detail
+    assert any(
+        error.plugin == "bad_validation"
+        and error.stage == "validate"
+        and "Provider factory 'broken' is not callable" in error.message
+        for error in host.load_errors()
+    )
+
+
+def test_extension_host_disables_plugin_on_validation_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "validation_raises"
+    _write_plugin(
+        plugin_dir,
+        name="validation_raises",
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='validation_raises')\n"
+        ),
+    )
+
+    import pollypm.plugin_host as plugin_host
+
+    real_validate = plugin_host.validate_plugin
+
+    def _validate(plugin):
+        if plugin.name == "validation_raises":
+            raise RuntimeError("validator unavailable")
+        return real_validate(plugin)
+
+    monkeypatch.setattr(plugin_host, "validate_plugin", _validate)
+
+    host = ExtensionHost(tmp_path)
+
+    assert "validation_raises" not in host.plugins()
+    disabled = host.disabled_plugins["validation_raises"]
+    assert disabled.reason == "load_error"
+    assert "validator unavailable" in disabled.detail
+    assert any(
+        error.plugin == "validation_raises"
+        and error.stage == "validate"
+        and "validator unavailable" in error.message
+        for error in host.load_errors()
+    )
+
+
 def test_extension_host_load_errors_capture_broken_plugin(tmp_path: Path) -> None:
     """#960: a plugin that fails to import must show up on the public
     :meth:`ExtensionHost.load_errors` accessor with structured fields
@@ -632,7 +695,11 @@ def test_project_plugin_shadows_user_plugin(monkeypatch, tmp_path: Path) -> None
         manifest_extras='[[capabilities]]\nkind = "provider"\nname = "mine"\n',
         body=(
             "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
-            "class UserMarker: pass\n"
+            "class UserMarker:\n"
+            "    name = 'user'\n"
+            "    def transcript_sources(self): return []\n"
+            "    def build_launch_command(self, *a, **k): return []\n"
+            "    def collect_usage_snapshot(self): return None\n"
             "plugin = PollyPMPlugin(name='shadow_test', providers={'x': UserMarker})\n"
         ),
     )
@@ -642,7 +709,11 @@ def test_project_plugin_shadows_user_plugin(monkeypatch, tmp_path: Path) -> None
         manifest_extras='[[capabilities]]\nkind = "provider"\nname = "mine"\n',
         body=(
             "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
-            "class ProjectMarker: pass\n"
+            "class ProjectMarker:\n"
+            "    name = 'project'\n"
+            "    def transcript_sources(self): return []\n"
+            "    def build_launch_command(self, *a, **k): return []\n"
+            "    def collect_usage_snapshot(self): return None\n"
             "plugin = PollyPMPlugin(name='shadow_test', providers={'x': ProjectMarker})\n"
         ),
     )
@@ -1025,8 +1096,6 @@ def test_initialize_content_paths_shortcut(tmp_path: Path) -> None:
     host.plugins()
     degraded = host.initialize_plugins()
     assert degraded == {}
-    # Introspect the plugin module to get COLLECTED
-    plugin = host.plugins()["cp_shortcut"]
     # API content_paths returned something (3 paths: bundled + user + project).
     # Resolve via the host directly to confirm equivalence.
     assert len(host.content_paths("cp_shortcut", kind="skill")) >= 3

@@ -22,9 +22,12 @@ Example:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Union
+
+logger = logging.getLogger(__name__)
 
 ProviderFactory = Callable[[], object]
 RuntimeFactory = Callable[[], object]
@@ -762,12 +765,28 @@ class PluginAPI:
             record = getattr(store, "record_event", None)
             if callable(record):
                 record(
-                    kind=f"plugin.{self._plugin_name}.{name}",
-                    payload=payload or {},
+                    "plugin",
+                    self._plugin_name,
+                    f"plugin.{self._plugin_name}.{name}",
+                    payload or {},
                 )
+        except TypeError as exc:
+            logger.warning(
+                "Plugin '%s' emit_event could not call state_store.record_event "
+                "for event '%s': %s",
+                self._plugin_name,
+                name,
+                exc,
+            )
         except Exception:  # noqa: BLE001
-            # Events are best-effort observability — swallow.
-            pass
+            # Events are best-effort observability; keep runtime store
+            # failures out of plugin initialization noise.
+            logger.debug(
+                "Plugin '%s' emit_event failed for event '%s'",
+                self._plugin_name,
+                name,
+                exc_info=True,
+            )
 
 
 @dataclass(slots=True)

@@ -56,6 +56,17 @@ PLUGIN_API_VERSION = "1"
 PLUGIN_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
+def _validation_summary(result: object) -> str:
+    """Return a compact validation detail without depending on old result shapes."""
+    errors = [str(error) for error in (getattr(result, "errors", None) or [])]
+    if errors:
+        return "; ".join(errors)
+    checks = [str(check) for check in (getattr(result, "checks", None) or [])]
+    if checks:
+        return "; ".join(checks)
+    return "validation failed"
+
+
 def _validate_plugin_name(plugin_name: str) -> str:
     """Reject ambiguous or path-like plugin names at the host boundary."""
     if not PLUGIN_NAME_PATTERN.fullmatch(plugin_name):
@@ -662,8 +673,8 @@ class ExtensionHost:
             # Validate the plugin implements its declared interfaces
             try:
                 result = validate_plugin(plugin)
-                if not result.passed:
-                    failures = ", ".join(c.message for c in result.checks if not c.passed)
+                if not getattr(result, "passed", False):
+                    failures = _validation_summary(result)
                     self._record_error(
                         f"Plugin {name} failed validation: {failures}",
                         plugin=name,
@@ -677,6 +688,8 @@ class ExtensionHost:
                     plugin=name,
                     stage="validate",
                 )
+                _mark_disabled(name, source, "load_error", f"validation error: {exc}")
+                return
             if name in loaded:
                 logger.warning(
                     "Plugin '%s' from source '%s' overrides earlier registration from source '%s'",

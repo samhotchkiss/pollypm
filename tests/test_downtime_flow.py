@@ -17,8 +17,6 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
-
 import pytest
 
 from pollypm.plugins_builtin.downtime.flow_validator import (
@@ -306,11 +304,13 @@ class TestInitializeHookValidates:
         from pollypm.jobs import JobHandlerRegistry
         from pollypm.plugins_builtin.downtime import plugin as plugin_module
 
-        events: list[tuple[str, dict]] = []
+        events: list[tuple[str, str, str, dict]] = []
 
         class _StubStore:
-            def record_event(self, *, kind: str, payload: dict) -> None:
-                events.append((kind, payload))
+            def record_event(
+                self, scope: str, sender: str, subject: str, payload: dict,
+            ) -> None:
+                events.append((scope, sender, subject, payload))
 
         api = PluginAPI(
             plugin_name="downtime",
@@ -319,7 +319,11 @@ class TestInitializeHookValidates:
             state_store=_StubStore(),
         )
         plugin_module.initialize(api)
-        init_events = [p for k, p in events if k.endswith(".initialize")]
+        init_events = [
+            p
+            for _scope, _sender, subject, p in events
+            if subject.endswith(".initialize")
+        ]
         assert init_events, "initialize event not emitted"
         payload = init_events[-1]
         assert payload["flow_validator_ok"] is True

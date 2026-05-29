@@ -19,7 +19,7 @@ from pollypm.plugin_api.v1 import (
     RailItemRegistration,
     RailRegistry,
 )
-from pollypm.plugin_host import ExtensionHost, PluginManifest
+from pollypm.plugin_host import ExtensionHost
 
 
 def _noop_handler(ctx: RailContext) -> PanelSpec:
@@ -163,6 +163,46 @@ def test_plugin_api_rail_without_api_raises() -> None:
     api = PluginAPI(plugin_name="demo", roster_api=None, jobs_api=None)
     with pytest.raises(RuntimeError, match="RailAPI not available"):
         _ = api.rail
+
+
+def test_plugin_api_emit_event_calls_store_contract_positionally() -> None:
+    calls: list[tuple[str, str, str, dict[str, object]]] = []
+
+    class _Store:
+        def record_event(
+            self, scope: str, sender: str, subject: str, payload: dict[str, object],
+        ) -> int:
+            calls.append((scope, sender, subject, payload))
+            return 1
+
+    api = PluginAPI(
+        plugin_name="demo", roster_api=None, jobs_api=None, state_store=_Store(),
+    )
+
+    api.emit_event("ready", {"ok": True})
+
+    assert calls == [("plugin", "demo", "plugin.demo.ready", {"ok": True})]
+
+
+def test_plugin_api_emit_event_logs_signature_drift(caplog) -> None:
+    import logging
+
+    class _LegacyStore:
+        def record_event(self, *, kind: str, payload: dict[str, object]) -> None:
+            raise AssertionError("old contract should not be called")
+
+    api = PluginAPI(
+        plugin_name="demo", roster_api=None, jobs_api=None, state_store=_LegacyStore(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="pollypm.plugin_api.v1"):
+        api.emit_event("ready", {"ok": True})
+
+    assert any(
+        "emit_event could not call state_store.record_event" in rec.message
+        and "ready" in rec.message
+        for rec in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------

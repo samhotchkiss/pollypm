@@ -1431,6 +1431,22 @@ def cockpit_socket_reap_handler(payload: dict[str, Any]) -> dict[str, Any]:
     return {"reaped": len(reaped)}
 
 
+def cockpit_pane_reap_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reap old cockpit-pane processes that are no longer live tmux panes."""
+    from pollypm.cockpit_pane_reaper import reap_orphan_cockpit_panes
+
+    raw_min_age = payload.get("min_age_s") if isinstance(payload, dict) else None
+    try:
+        min_age_s = int(raw_min_age) if raw_min_age is not None else 300
+    except (TypeError, ValueError):
+        min_age_s = 300
+    reaped = reap_orphan_cockpit_panes(
+        min_age_s=min_age_s,
+        protect_live_tmux_panes=True,
+    )
+    return {"reaped": len(reaped)}
+
+
 def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop flushed + silent notification_staging rows older than 30d."""
     from pollypm.work import create_work_service

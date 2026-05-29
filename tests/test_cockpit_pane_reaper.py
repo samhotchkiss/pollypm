@@ -408,6 +408,77 @@ def test_current_uid_override_filters_to_supplied_uid() -> None:
     assert reaped == []
 
 
+def test_min_age_threshold_preserves_young_pane(
+    sentinel: subprocess.Popen,
+) -> None:
+    ps_runner = _make_ps_runner(
+        [
+            _ps_line(
+                sentinel.pid,
+                "00:01:00",
+                "python -m pollypm cockpit-pane activity",
+            ),
+        ]
+    )
+
+    reaped = reap_orphan_cockpit_panes(
+        ps_runner=ps_runner,
+        min_age_s=300,
+    )
+
+    assert reaped == []
+    assert sentinel.poll() is None
+
+
+def test_live_tmux_pane_pid_protection_preserves_pane(
+    sentinel: subprocess.Popen,
+) -> None:
+    ps_runner = _make_ps_runner(
+        [
+            _ps_line(
+                sentinel.pid,
+                "00:10:00",
+                "python -m pollypm cockpit-pane activity",
+            ),
+        ]
+    )
+
+    reaped = reap_orphan_cockpit_panes(
+        ps_runner=ps_runner,
+        protect_live_tmux_panes=True,
+        tmux_pane_pid_runner=lambda: f"{sentinel.pid}\n",
+    )
+
+    assert reaped == []
+    assert sentinel.poll() is None
+
+
+def test_live_tmux_pane_pid_protection_fails_closed(
+    sentinel: subprocess.Popen,
+) -> None:
+    ps_runner = _make_ps_runner(
+        [
+            _ps_line(
+                sentinel.pid,
+                "00:10:00",
+                "python -m pollypm cockpit-pane activity",
+            ),
+        ]
+    )
+
+    def _tmux_unavailable() -> str:
+        raise OSError("tmux unavailable")
+
+    reaped = reap_orphan_cockpit_panes(
+        ps_runner=ps_runner,
+        protect_live_tmux_panes=True,
+        tmux_pane_pid_runner=_tmux_unavailable,
+    )
+
+    assert reaped == []
+    assert sentinel.poll() is None
+
+
 def test_malformed_uid_column_skips_row() -> None:
     """A row with a non-integer ``uid`` column (e.g. the literal
     ``ps`` header) is dropped — we never signal a row we can't
@@ -438,3 +509,32 @@ def test_pane_process_dataclass_is_frozen() -> None:
     assert proc.pane_kind == "activity"
     with pytest.raises(Exception):  # frozen dataclass → FrozenInstanceError
         proc.pid = 9999  # type: ignore[misc]
+
+
+def test_cockpit_pane_reap_registered_on_roster_every_5m() -> None:
+    from pollypm.heartbeat import Roster
+    from pollypm.heartbeat.roster import EverySchedule
+    from pollypm.plugin_api.v1 import RosterAPI
+    from pollypm.plugins_builtin.core_recurring.plugin import plugin as core_plugin
+
+    roster = Roster()
+    api = RosterAPI(roster, plugin_name="core_recurring")
+    core_plugin.register_roster(api)
+
+    entries = {entry.handler_name: entry for entry in roster.entries}
+    entry = entries.get("cockpit_pane.reap")
+    assert entry is not None, "cockpit_pane.reap missing from roster"
+    assert isinstance(entry.schedule, EverySchedule)
+    assert int(entry.schedule.interval.total_seconds()) == 300
+
+
+def test_cockpit_pane_reap_handler_registered() -> None:
+    from pollypm.jobs import JobHandlerRegistry
+    from pollypm.plugin_api.v1 import JobHandlerAPI
+    from pollypm.plugins_builtin.core_recurring.plugin import plugin as core_plugin
+
+    registry = JobHandlerRegistry()
+    api = JobHandlerAPI(registry, plugin_name="core_recurring")
+    core_plugin.register_handlers(api)
+
+    assert "cockpit_pane.reap" in registry.names()

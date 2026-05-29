@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -532,6 +533,18 @@ _PROGRESS_SIGNAL_EXEMPT_ROLES: frozenset[str] = frozenset({
 class LocalHeartbeatBackend(HeartbeatBackend):
     name = "local"
     _UNMANAGED_WINDOW_ALERT_PREFIX = "unmanaged_window:"
+    _UNMANAGED_WINDOW_RECONCILE_PREFIXES = (
+        "pm-",
+        "polly",
+        "operator",
+        "reviewer",
+        "worker-",
+        "architect",
+        "planner",
+        "critic-",
+    )
+    _SESSION_REPAIR_MIN_INTERVAL_S = 300.0
+    _last_session_repair_at_by_root: dict[str, float] = {}
     _WORKER_ACTIONABLE_STATUSES = frozenset({"queued", "in_progress", "blocked"})
     _MUTATING_SESSION_ROLES = frozenset(
         {
@@ -596,6 +609,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
     )
 
     def run(self, api, *, snapshot_lines: int = 200):
+        self._maybe_repair_sessions_table(api)
         self._process_unmanaged_windows(api)
         for context in api.list_sessions():
             try:
@@ -774,8 +788,117 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                         subject=window.window_name,
                     ),
                 )
+            if alert_type in existing_alert_types:
+                self._reconcile_persistent_unmanaged_window(
+                    api, window, alert_type=alert_type,
+                )
         for alert_type in existing_alert_types - current_alert_types:
             api.clear_alert("heartbeat", alert_type)
+
+    def _maybe_repair_sessions_table(self, api) -> None:
+        supervisor = getattr(api, "supervisor", None)
+        repair = getattr(supervisor, "repair_sessions_table", None)
+        if not callable(repair):
+            return
+        config = getattr(supervisor, "config", None)
+        project = getattr(config, "project", None)
+        root = str(
+            getattr(project, "root_dir", "")
+            or getattr(project, "base_dir", "")
+            or "default"
+        )
+        now = time.monotonic()
+        last = self._last_session_repair_at_by_root.get(root)
+        if (
+            last is not None
+            and now - last < self._SESSION_REPAIR_MIN_INTERVAL_S
+        ):
+            return
+        self._last_session_repair_at_by_root[root] = now
+        try:
+            repaired = int(repair() or 0)
+        except Exception:  # noqa: BLE001
+            logger.debug("heartbeat: sessions-table repair failed", exc_info=True)
+            return
+        if repaired <= 0:
+            return
+        from pollypm.events.summaries import activity_summary
+
+        row_word = "row" if repaired == 1 else "rows"
+        _emit_routed_event(
+            api,
+            session_name="heartbeat",
+            event_type="session_table_repair",
+            message=activity_summary(
+                summary=f"Repaired {repaired} sessions-table {row_word}",
+                severity="routine",
+                verb="repaired",
+                subject="sessions table",
+                repaired=repaired,
+            ),
+        )
+
+    def _reconcile_persistent_unmanaged_window(
+        self,
+        api,
+        window,
+        *,
+        alert_type: str,
+    ) -> None:
+        window_name = str(getattr(window, "window_name", "") or "")
+        if not any(
+            window_name.startswith(prefix)
+            for prefix in self._UNMANAGED_WINDOW_RECONCILE_PREFIXES
+        ):
+            return
+        if not bool(getattr(window, "pane_dead", False)):
+            return
+        supervisor = getattr(api, "supervisor", None)
+        session_service = getattr(supervisor, "session_service", None)
+        tmux = getattr(session_service, "tmux", None)
+        kill_window = getattr(tmux, "kill_window", None)
+        if not callable(kill_window):
+            return
+        target = str(
+            getattr(window, "pane_id", "")
+            or f"{getattr(window, 'tmux_session', '')}:{window_name}"
+        )
+        if not target:
+            return
+        try:
+            kill_window(target)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "heartbeat: failed to reap unmanaged dead window %s",
+                window_name,
+                exc_info=True,
+            )
+            return
+        message = (
+            f"Reaped unmanaged tmux window {window_name} in session "
+            f"{getattr(window, 'tmux_session', '')} after it stayed pane_dead"
+        )
+        from pollypm.events.summaries import activity_summary
+
+        _emit_routed_event(
+            api,
+            session_name="heartbeat",
+            event_type="unmanaged_window_reaped",
+            message=activity_summary(
+                summary=message,
+                severity="recommendation",
+                verb="reaped",
+                subject=window_name,
+            ),
+        )
+        try:
+            api.clear_alert("heartbeat", alert_type)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "heartbeat: failed to clear unmanaged-window alert %s",
+                alert_type,
+                exc_info=True,
+            )
 
     def _process_session(self, api, context: HeartbeatSessionContext) -> None:
         alerts: list[str] = []

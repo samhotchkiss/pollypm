@@ -40,6 +40,9 @@ HTTP guardrails added in round 2:
 from __future__ import annotations
 
 import re
+import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
@@ -51,6 +54,7 @@ from pollypm.audit.query import (
     iter_matching_events,
     parse_since,
     resolve_target_files,
+    walk_log_chain,
 )
 from pollypm.web_api.errors import invalid_request
 from pollypm.web_api.models import Event
@@ -71,6 +75,31 @@ _GREP_LIMIT_MAX = 1000
 # regexes without giving an attacker room for a 50 KB catastrophic
 # backtracker (Codex round-1 P0 ReDoS finding).
 _PATTERN_LENGTH_MAX = 200
+
+# Activity polls can overlap across browser refreshes/SSE refresh bursts, and
+# ``/audit/stats`` is the expensive half of the activity rail. Keep a tiny,
+# freshness-bounded process-local cache so repeated calls for the same log
+# signature don't re-walk the same rotation chain.
+_STATS_CACHE_TTL_SECONDS = 10.0
+_STATS_CACHE_MAX_ENTRIES = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _AuditStatsCacheKey:
+    project: str
+    since: str
+    deadline_seconds: float
+    target_signature: tuple[tuple[str, int | None, int | None], ...]
+
+
+@dataclass(slots=True)
+class _AuditStatsCacheEntry:
+    expires_at: float
+    response: "AuditStatsResponse"
+
+
+_STATS_CACHE_LOCK = threading.Lock()
+_STATS_CACHE: dict[_AuditStatsCacheKey, _AuditStatsCacheEntry] = {}
 
 
 class AuditGrepResponse(BaseModel):
@@ -249,6 +278,70 @@ def _coerce_record_to_event(record: dict[str, Any]) -> Event | None:
         # ``int(record.get("schema"))`` etc. can blow up on garbage
         # input types — treat the same as a validation miss.
         return None
+
+
+def _stat_signature(path: Any) -> tuple[str, int | None, int | None]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), None, None)
+    return (str(path), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _stats_target_signature(
+    targets: list[Any],
+) -> tuple[tuple[str, int | None, int | None], ...]:
+    signature: list[tuple[str, int | None, int | None]] = []
+    for live_path in targets:
+        seen_any = False
+        for chain_path in walk_log_chain(live_path):
+            seen_any = True
+            signature.append(_stat_signature(chain_path))
+        if not seen_any:
+            signature.append(_stat_signature(live_path))
+    return tuple(signature)
+
+
+def _get_stats_cache(
+    key: _AuditStatsCacheKey,
+    *,
+    now: float,
+) -> AuditStatsResponse | None:
+    with _STATS_CACHE_LOCK:
+        entry = _STATS_CACHE.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at <= now:
+            _STATS_CACHE.pop(key, None)
+            return None
+        return entry.response
+
+
+def _store_stats_cache(
+    key: _AuditStatsCacheKey,
+    response: AuditStatsResponse,
+    *,
+    now: float,
+) -> None:
+    with _STATS_CACHE_LOCK:
+        if len(_STATS_CACHE) >= _STATS_CACHE_MAX_ENTRIES:
+            expired = [
+                cache_key
+                for cache_key, entry in _STATS_CACHE.items()
+                if entry.expires_at <= now
+            ]
+            for cache_key in expired:
+                _STATS_CACHE.pop(cache_key, None)
+            while len(_STATS_CACHE) >= _STATS_CACHE_MAX_ENTRIES:
+                oldest_key = min(
+                    _STATS_CACHE,
+                    key=lambda cache_key: _STATS_CACHE[cache_key].expires_at,
+                )
+                _STATS_CACHE.pop(oldest_key, None)
+        _STATS_CACHE[key] = _AuditStatsCacheEntry(
+            expires_at=now + _STATS_CACHE_TTL_SECONDS,
+            response=response,
+        )
 
 
 @router.get(
@@ -464,13 +557,24 @@ def stats_audit_endpoint(
     since_dt = _parse_since_or_400(since)
     targets = resolve_target_files(project_filter=project, config=config)
 
+    cache_key = _AuditStatsCacheKey(
+        project=project or "",
+        since=(since or "").strip(),
+        deadline_seconds=round(float(deadline_seconds), 3),
+        target_signature=_stats_target_signature(targets),
+    )
+    now = time.monotonic()
+    cached = _get_stats_cache(cache_key, now=now)
+    if cached is not None:
+        return cached
+
     aggregate = aggregate_recent_stats(
         targets=targets,
         since=since_dt,
         deadline_s=deadline_seconds,
     )
 
-    return AuditStatsResponse(
+    response = AuditStatsResponse(
         total=aggregate.total,
         by_event=aggregate.by_event,
         by_severity=aggregate.by_severity,
@@ -480,6 +584,8 @@ def stats_audit_endpoint(
         _corrupt_archives_skipped=aggregate.corrupt_archives_skipped,
         _malformed_rows_skipped=aggregate.malformed_rows_skipped,
     )
+    _store_stats_cache(cache_key, response, now=now)
+    return response
 
 
 __all__ = [

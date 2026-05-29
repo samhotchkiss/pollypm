@@ -325,6 +325,8 @@ def test_ui_app_js_selects_inbox_for_deep_link(client: TestClient) -> None:
     body = client.get("/ui/app.js").text
     assert 'path === "/ui/inbox"' in body
     assert "selectInbox();" in body
+    assert 'path === "/ui/alerts"' in body
+    assert "selectAlerts();" in body
 
 
 def test_ui_static_css_served(client: TestClient) -> None:
@@ -1147,11 +1149,30 @@ def test_ui_app_js_activity_stats_has_timeout_and_retry(client: TestClient) -> N
     body = client.get("/ui/app.js").text
     for expected in (
         "ACTIVITY_REQUEST_TIMEOUT_MS = 3000",
+        "ACTIVITY_STATS_REQUEST_TIMEOUT_MS = 5000",
         "ACTIVITY_STATS_DEADLINE_SECONDS = 2.5",
         "apiJsonOptionalWithTimeout",
         "_truncated_by_deadline",
+        "activityStatsNote",
+        "stats partial",
+        "stats unavailable:",
         "activity unavailable:",
         "Retry loading activity",
+    ):
+        assert expected in body
+
+
+def test_ui_app_js_has_alerts_panel_hooks(client: TestClient) -> None:
+    """The dashboard alert count opens an API-backed alerts surface."""
+    body = client.get("/ui/app.js").text
+    for expected in (
+        "selectAlerts",
+        "/alerts?limit=100",
+        "/doctor/report",
+        "/doctor/run",
+        "session-drift",
+        "Run session drift",
+        "Open alerts",
     ):
         assert expected in body
 
@@ -1235,14 +1256,15 @@ const payload = JSON.parse(process.argv[2]);
 
 // ---- minimal DOM shim --------------------------------------------------
 function makeNode(tag) {
-  const node = {
-    tagName: (tag || "div").toUpperCase(),
-    children: [],
-    attrs: {},
-    className: "",
-    textContent: "",
-    style: {},
-  };
+    const node = {
+      tagName: (tag || "div").toUpperCase(),
+      children: [],
+      attrs: {},
+      className: "",
+      textContent: "",
+      dataset: {},
+      style: {},
+    };
   Object.defineProperty(node, "innerHTML", {
     get() {
       function render(n) {
@@ -1702,6 +1724,7 @@ def test_render_dashboard_real_payload_executes() -> None:
     assert ">5<" in rendered, "tracked_count value 5 missing"
     assert 'role="button"' in rendered
     assert 'title="Open inbox"' in rendered
+    assert 'title="Open alerts"' in rendered
 
     # Color-coding contract: daemon=up → rollup-working; alert_count>0
     # → rollup-blocked. Pin these too so a future restyle that drops

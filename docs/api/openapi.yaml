@@ -111,6 +111,8 @@ tags:
       recent messages, token usage, and account quotas. SSE streaming
       variant (`/dashboard/stream`) ships in a follow-up PR per Phase 2
       §3.2.
+  - name: Alerts
+    description: Open alert drill-down rows for dashboard rollups.
   - name: Config
     description: |
       Read-only view of the loaded `PollyPMConfig`. Credential-shaped
@@ -773,6 +775,44 @@ paths:
             Backing-store / gather failure (`service_unavailable`).
             Distinct from a daemon-down state, which is returned as a
             200 response with `daemon_status: "down"`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /alerts:
+    get:
+      tags: [Alerts]
+      operationId: listAlerts
+      summary: List currently open alerts
+      description: |
+        Returns currently open alerts from the canonical alert storage
+        facade, newest first, with the same action-plan descriptors the
+        cockpit alert detail uses. By default operational heartbeat /
+        supervisor noise is filtered so this list mirrors the dashboard
+        action-required alert rollup.
+      parameters:
+        - in: query
+          name: include_operational
+          schema: { type: boolean, default: false }
+          description: Include operational heartbeat/supervisor alerts.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+          description: Maximum alert rows to return.
+      responses:
+        "200":
+          description: Open alert rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: Alert storage unavailable.
           content:
             application/json:
               schema:
@@ -3287,6 +3327,82 @@ components:
           description: Whether Tailscale CGNAT peers are accepted without bearer or cookie credentials.
         build:
           $ref: "#/components/schemas/RuntimeBuildInfo"
+
+    AlertActionResponse:
+      type: object
+      required: [kind, label]
+      properties:
+        kind:
+          type: string
+          description: Stable action discriminator from the cockpit alert-action registry.
+        label:
+          type: string
+          description: Short operator-facing action label.
+        session_name:
+          type: string
+          nullable: true
+        project_key:
+          type: string
+          nullable: true
+        task_id:
+          type: string
+          nullable: true
+        hint:
+          type: string
+          nullable: true
+
+    AlertResponse:
+      type: object
+      required:
+        - session_name
+        - alert_type
+        - severity
+        - message
+        - status
+        - channel
+        - created_at
+        - updated_at
+        - actions
+      properties:
+        id:
+          type: integer
+          nullable: true
+          description: Alert row id when available.
+        session_name:
+          type: string
+        alert_type:
+          type: string
+        severity:
+          type: string
+        message:
+          type: string
+        status:
+          type: string
+        channel:
+          type: string
+          enum: [operational, informational, action_required]
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        actions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AlertActionResponse"
+
+    AlertsResponse:
+      type: object
+      required: [generated_at, total, alerts]
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        total:
+          type: integer
+        alerts:
+          type: array
+          items:
+            $ref: "#/components/schemas/AlertResponse"
 
     DoctorCheck:
       type: object

@@ -49,6 +49,7 @@
     && railRequestTimeoutOverride > 0
   ) ? railRequestTimeoutOverride : 10000;
   const ACTIVITY_REQUEST_TIMEOUT_MS = 3000;
+  const ACTIVITY_STATS_REQUEST_TIMEOUT_MS = 5000;
   const ACTIVITY_STATS_DEADLINE_SECONDS = 2.5;
 
   const state = {
@@ -94,10 +95,21 @@
     activitySince: ACTIVITY_DEFAULT_SINCE,
     activityEntries: [],
     activityStats: null,
+    activityStatsNote: null,
     activityLoading: false,
     activityError: null,
     activityInFlight: false,
     activityRefreshQueued: false,
+    alerts: {
+      items: [],
+      loading: false,
+      error: null,
+      reloadQueued: false,
+      doctorReport: null,
+      doctorLoading: false,
+      doctorError: null,
+      doctorRunInFlight: false,
+    },
     pendingMessages: {},
     inbox: {
       items: [],
@@ -1944,6 +1956,207 @@
     loadInbox(true);
   }
 
+  function selectAlerts() {
+    state.selectedKind = "alerts";
+    state.selectedSurface = null;
+    state.selectedTaskKey = null;
+    state.inbox.selectedId = null;
+    $("pane-title").textContent = "Alerts";
+    $("pane-meta").textContent = "";
+    $("send-input").disabled = true;
+    $("send-button").disabled = true;
+    updateStopAgentButton();
+    renderSurfaces();
+    renderAlertsView();
+    loadAlerts();
+    loadDoctorReport();
+  }
+
+  async function loadAlerts() {
+    if (state.alerts.loading) {
+      state.alerts.reloadQueued = true;
+      return;
+    }
+    state.alerts.loading = true;
+    state.alerts.error = null;
+    renderAlertsView();
+    try {
+      const data = await apiJson(API + "/alerts?limit=100");
+      state.alerts.items = Array.isArray(data.alerts) ? data.alerts : [];
+    } catch (err) {
+      state.alerts.error = err;
+      state.alerts.items = [];
+    } finally {
+      state.alerts.loading = false;
+      renderAlertsView();
+      if (state.alerts.reloadQueued) {
+        state.alerts.reloadQueued = false;
+        loadAlerts();
+      }
+    }
+  }
+
+  async function loadDoctorReport() {
+    if (state.alerts.doctorLoading) return;
+    state.alerts.doctorLoading = true;
+    state.alerts.doctorError = null;
+    renderAlertsView();
+    try {
+      state.alerts.doctorReport = await apiJson(API + "/doctor/report");
+    } catch (err) {
+      if (err && err.status === 404) {
+        state.alerts.doctorReport = null;
+      } else {
+        state.alerts.doctorError = err;
+      }
+    } finally {
+      state.alerts.doctorLoading = false;
+      renderAlertsView();
+    }
+  }
+
+  async function runSessionDriftCheck() {
+    if (state.alerts.doctorRunInFlight) return;
+    state.alerts.doctorRunInFlight = true;
+    state.alerts.doctorError = null;
+    renderAlertsView();
+    try {
+      state.alerts.doctorReport = await apiJson(API + "/doctor/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ check: "session-drift", fix: false }),
+      });
+    } catch (err) {
+      state.alerts.doctorError = err;
+    } finally {
+      state.alerts.doctorRunInFlight = false;
+      renderAlertsView();
+    }
+  }
+
+  function renderAlertAction(action) {
+    const detail = action.hint || action.kind || "";
+    const node = el("span", {
+      class: "alert-action",
+      text: action.label || action.kind || "Action",
+    });
+    if (detail) node.setAttribute("title", detail);
+    return node;
+  }
+
+  function renderAlertRow(item) {
+    const label = [
+      item.severity || "alert",
+      item.channel || "",
+    ].filter(Boolean).join(" · ");
+    const actions = Array.isArray(item.actions) ? item.actions : [];
+    const children = [
+      el("div", { class: "alert-row-head" }, [
+        el("span", { class: "alert-session", text: item.session_name || "unknown" }),
+        el("span", { class: "alert-updated", text: formatShortTime(item.updated_at) }),
+      ]),
+      el("div", { class: "alert-row-type", text: item.alert_type || "alert" }),
+      el("div", { class: "alert-row-message", text: item.message || "" }),
+      el("div", { class: "alert-row-meta", text: label }),
+    ];
+    if (actions.length > 0) {
+      children.push(el(
+        "div",
+        { class: "alert-actions" },
+        actions.map((action) => renderAlertAction(action)),
+      ));
+    }
+    return el("div", { class: "alert-row" }, children);
+  }
+
+  function sessionDriftRow(report) {
+    const checks = report && Array.isArray(report.checks) ? report.checks : [];
+    return checks.find((check) => check.name === "session-drift") || null;
+  }
+
+  function renderDoctorDriftPanel() {
+    const run = el("button", {
+      type: "button",
+      class: "empty-action",
+      text: state.alerts.doctorRunInFlight ? "Running..." : "Run session drift",
+      "aria-label": "Run session drift doctor check",
+    });
+    run.disabled = state.alerts.doctorRunInFlight;
+    run.addEventListener("click", () => runSessionDriftCheck());
+
+    const children = [
+      el("div", { class: "alert-panel-title", text: "Session drift" }),
+    ];
+    if (state.alerts.doctorLoading) {
+      children.push(el("div", {
+        class: "alert-row-message",
+        text: "loading doctor report...",
+      }));
+    } else if (state.alerts.doctorError) {
+      children.push(el("div", {
+        class: "alert-row-message alert-error",
+        text: "doctor unavailable: " + state.alerts.doctorError.message,
+      }));
+    } else {
+      const row = sessionDriftRow(state.alerts.doctorReport);
+      if (row) {
+        children.push(el("div", {
+          class: "alert-row-message",
+          text: (row.status || (row.passed ? "ok" : "warning")),
+        }));
+        if (row.why) {
+          children.push(el("div", { class: "alert-row-meta", text: row.why }));
+        }
+        if (row.fix) {
+          children.push(el("div", { class: "alert-row-meta", text: row.fix }));
+        }
+      } else {
+        children.push(el("div", {
+          class: "alert-row-message",
+          text: "No cached session-drift report.",
+        }));
+      }
+    }
+    children.push(el("div", { class: "empty-actions" }, [run]));
+    return el("div", { class: "alert-doctor" }, children);
+  }
+
+  function renderAlertsView() {
+    if (state.selectedKind !== "alerts") return;
+    const list = $("message-list");
+    clearMessageList(list);
+    const children = [];
+    children.push(renderDoctorDriftPanel());
+    if (state.alerts.loading) {
+      children.push(el("div", {
+        class: "activity-empty",
+        text: "loading alerts...",
+      }));
+    } else if (state.alerts.error) {
+      const retry = el("button", {
+        type: "button",
+        class: "fetch-retry",
+        text: "Retry",
+        "aria-label": "Retry loading alerts",
+      });
+      retry.addEventListener("click", () => loadAlerts());
+      children.push(el("div", { class: "activity-empty" }, [
+        document.createTextNode("alerts unavailable: " + state.alerts.error.message),
+        retry,
+      ]));
+    } else if (state.alerts.items.length === 0) {
+      children.push(el("div", {
+        class: "activity-empty",
+        text: "no action-required alerts",
+      }));
+    } else {
+      for (const item of state.alerts.items) {
+        children.push(renderAlertRow(item));
+      }
+    }
+    list.appendChild(el("div", { class: "alerts-panel" }, children));
+  }
+
   async function loadInbox(reset, omitType, preserveSelection) {
     if (state.inbox.loading || state.inbox.loadingMore) {
       state.inbox.reloadQueued = true;
@@ -2530,6 +2743,10 @@
         selectInbox(card.filter || undefined);
         return;
       }
+      if (card.target === "alerts") {
+        selectAlerts();
+        return;
+      }
       renderDashboardDrilldown(card);
     };
   }
@@ -2615,10 +2832,10 @@
         dashboardCardAction({
           label: "alerts",
           value: rollups.alert_count,
-          target: "detail",
-          detail: "Shows the current alert count.",
+          target: "alerts",
+          detail: "Opens the current alert list.",
         }, data),
-        "Show alert count",
+        "Open alerts",
       ));
     }
 
@@ -2742,6 +2959,7 @@
     state.activityInFlight = true;
     state.activityLoading = true;
     state.activityError = null;
+    state.activityStatsNote = null;
     renderActivity();
     try {
       const [grepResult, statsResult] = await Promise.allSettled([
@@ -2749,7 +2967,7 @@
           "activity feed", activityGrepPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
         ),
         apiJsonOptionalWithTimeout(
-          "activity stats", activityStatsPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
+          "activity stats", activityStatsPath(), ACTIVITY_STATS_REQUEST_TIMEOUT_MS,
         ),
       ]);
       if (grepResult.status === "fulfilled") {
@@ -2764,19 +2982,19 @@
       state.activityStats = statsResult.status === "fulfilled"
         ? statsResult.value : null;
       if (statsResult.status === "rejected" && !state.activityError) {
-        state.activityError = statsResult.reason instanceof Error
+        const err = statsResult.reason instanceof Error
           ? statsResult.reason
           : new Error(String(statsResult.reason));
+        state.activityStatsNote = "stats unavailable: " + err.message;
       } else if (
         statsResult.status === "fulfilled"
         && statsResult.value
         && statsResult.value._truncated_by_deadline
-        && !state.activityError
       ) {
         const lines = Number(statsResult.value._lines_scanned || 0);
-        state.activityError = new Error(
-          "activity stats timed out"
-          + (lines > 0 ? " after scanning " + lines + " lines" : ""),
+        state.activityStatsNote = (
+          "stats partial"
+          + (lines > 0 ? " after scanning " + lines + " lines" : "")
         );
       }
     } finally {
@@ -2854,6 +3072,12 @@
         el("span", { class: "activity-chip-label", text: card[0] }),
         el("span", { class: "activity-chip-value", text: String(card[1]) }),
       ]));
+    }
+    if (state.activityStatsNote) {
+      summaryBox.appendChild(el("div", {
+        class: "activity-note",
+        text: state.activityStatsNote,
+      }));
     }
   }
 
@@ -3165,6 +3389,7 @@
       ? window.location.pathname.replace(/\/+$/, "")
       : "";
     if (path === "/ui/inbox") return "inbox";
+    if (path === "/ui/alerts") return "alerts";
     return null;
   }
 
@@ -3175,8 +3400,11 @@
     wireActivityControls();
     wireSendForm();
     wireStopAgentButton();
-    if (initialUiRoute() === "inbox") {
+    const route = initialUiRoute();
+    if (route === "inbox") {
       selectInbox();
+    } else if (route === "alerts") {
+      selectAlerts();
     } else {
       renderNoSelection();
     }
@@ -3199,6 +3427,7 @@
     selectSurface: selectSurface,
     selectTask: selectTask,
     selectInbox: selectInbox,
+    selectAlerts: selectAlerts,
     interruptSurface: interruptSurface,
     loadInbox: loadInbox,
     renderInboxView: renderInboxView,

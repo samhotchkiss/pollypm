@@ -746,6 +746,16 @@ section#message-pane {
   font-weight: 600;
   margin-top: 2px;
 }
+.activity-note {
+  grid-column: 1 / -1;
+  padding: 7px 8px;
+  border: 1px solid var(--waiting);
+  border-radius: 6px;
+  color: var(--waiting);
+  background: rgba(240, 196, 90, 0.08);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
 .activity-feed {
   display: flex;
   flex-direction: column;
@@ -783,6 +793,76 @@ section#message-pane {
   color: var(--text-body);
   font-size: 11.5px;
   overflow-wrap: anywhere;
+}
+
+.alerts-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.alert-doctor,
+.alert-row {
+  padding: 10px 11px;
+  border: 1px solid var(--border-line);
+  border-radius: 6px;
+  background: var(--bg-row);
+}
+.alert-panel-title {
+  color: var(--text-heading-bright);
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.alert-row-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.alert-session {
+  color: var(--text-label);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.alert-updated {
+  flex: 0 0 auto;
+}
+.alert-row-type {
+  color: var(--blocked);
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.alert-row-message {
+  color: var(--text-body);
+  font-size: 12.5px;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+.alert-row-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+.alert-error {
+  color: var(--blocked);
+}
+.alert-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.alert-action {
+  border: 1px solid var(--border-line);
+  border-radius: 6px;
+  padding: 3px 7px;
+  color: var(--text-body);
+  background: var(--bg-elevated);
+  font-size: 11px;
 }
 
 .fetch-retry {

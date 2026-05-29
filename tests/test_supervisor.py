@@ -847,6 +847,34 @@ def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Pa
     assert created_windows[0][3] is True
 
 
+def test_fresh_launch_rotation_persists_before_replanning(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from pollypm.config import load_config, write_config
+
+    config = _config(tmp_path)
+    old_token = "a" * 64
+    config.sessions["operator"].auth_token = old_token
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    loaded = load_config(config_path)
+    supervisor = Supervisor(loaded)
+    monkeypatch.setattr(
+        "pollypm.session_auth.mint_auth_token",
+        lambda: "b" * 64,
+    )
+
+    assert supervisor.launch_by_session("operator").session.auth_token == old_token
+    supervisor._rotate_auth_tokens_for_fresh_launches(["operator"])
+
+    new_token = "b" * 64
+    assert supervisor.config.sessions["operator"].auth_token == new_token
+    assert supervisor.launch_by_session("operator").session.auth_token == new_token
+    persisted = config_path.read_text(encoding="utf-8")
+    assert f'auth_token = "{new_token}"' in persisted
+    assert f'auth_token = "{old_token}"' not in persisted
+
+
 def test_write_snapshot_targets_pane_id_for_mounted_windows(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)

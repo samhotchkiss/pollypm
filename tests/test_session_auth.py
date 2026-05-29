@@ -42,6 +42,8 @@ from pollypm.session_auth import (
     ensure_session_auth_tokens,
     format_auth_marker,
     mint_auth_token,
+    rotate_session_auth_token,
+    strip_auth_marker,
 )
 
 
@@ -92,6 +94,15 @@ def test_format_auth_marker_empty_for_missing_token() -> None:
     """
     assert format_auth_marker("") == ""
     assert format_auth_marker(None) == ""
+
+
+def test_strip_auth_marker_removes_leading_marker_only() -> None:
+    token = "deadbeef" * 8
+    body = "WATCHDOG ESCALATION\n\nProject: demo"
+    assert strip_auth_marker(format_auth_marker(token) + body) == body
+    assert strip_auth_marker(body) == body
+    embedded = body + "\n" + format_auth_marker(token)
+    assert strip_auth_marker(embedded) == embedded
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +177,21 @@ def test_ensure_session_auth_tokens_is_idempotent(tmp_path: Path) -> None:
     }
     assert minted == 0
     assert before == after
+
+
+def test_rotate_session_auth_token_replaces_existing_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _bare_config(tmp_path)
+    config.sessions["architect"].auth_token = "a" * 64
+    monkeypatch.setattr("pollypm.session_auth.mint_auth_token", lambda: "b" * 64)
+
+    token = rotate_session_auth_token(config, "architect")
+
+    assert token == "b" * 64
+    assert config.sessions["architect"].auth_token == "b" * 64
+    assert config.sessions["reviewer"].auth_token == ""
+    assert rotate_session_auth_token(config, "missing") is None
 
 
 # ---------------------------------------------------------------------------

@@ -1096,8 +1096,6 @@ def test_initialize_content_paths_shortcut(tmp_path: Path) -> None:
     host.plugins()
     degraded = host.initialize_plugins()
     assert degraded == {}
-    # Introspect the plugin module to get COLLECTED
-    plugin = host.plugins()["cp_shortcut"]
     # API content_paths returned something (3 paths: bundled + user + project).
     # Resolve via the host directly to confirm equivalence.
     assert len(host.content_paths("cp_shortcut", kind="skill")) >= 3

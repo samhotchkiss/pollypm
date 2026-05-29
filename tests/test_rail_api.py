@@ -19,7 +19,7 @@ from pollypm.plugin_api.v1 import (
     RailItemRegistration,
     RailRegistry,
 )
-from pollypm.plugin_host import ExtensionHost, PluginManifest
+from pollypm.plugin_host import ExtensionHost
 
 
 def _noop_handler(ctx: RailContext) -> PanelSpec:

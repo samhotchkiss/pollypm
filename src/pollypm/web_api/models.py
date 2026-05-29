@@ -46,6 +46,27 @@ class ValidationErrorResponse(ErrorResponse):
 # ---------------------------------------------------------------------------
 
 
+class RuntimeBuildInfo(BaseModel):
+    package_name: str
+    version: str
+    package_path: str | None = None
+    package_file: str | None = None
+    dist_info_path: str | None = None
+    direct_url: str | None = None
+    direct_url_editable: bool | None = None
+    direct_url_vcs: str | None = None
+    direct_url_vcs_commit_id: str | None = None
+    source_checkout: str | None = None
+    source_git_sha: str | None = None
+    source_git_commit_time: str | None = None
+    served_git_sha: str | None = None
+    served_git_commit_time: str | None = None
+    package_mtime: str | None = None
+    package_mtime_path: str | None = None
+    stale: bool | None = None
+    stale_reason: str | None = None
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     version: str
@@ -53,6 +74,7 @@ class HealthResponse(BaseModel):
     started_at: datetime
     auth_mode: Literal["tailnet_trust", "bearer_only"]
     tailnet_trust_enabled: bool
+    build: RuntimeBuildInfo
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +840,7 @@ __all__ = [
     "ProjectActivityEntry",
     "ProjectDrilldown",
     "ProjectListResponse",
+    "RuntimeBuildInfo",
     "StorageConfigFiles",
     "StorageEntry",
     "StorageReport",

@@ -600,6 +600,7 @@ from pollypm.doctor import plugins as _doctor_plugins
 
 check_pm_binary_resolves = _doctor_install_state.check_pm_binary_resolves
 check_installed_version_matches_pyproject = _doctor_install_state.check_installed_version_matches_pyproject
+check_deploy_source_staleness = _doctor_install_state.check_deploy_source_staleness
 check_config_file = _doctor_install_state.check_config_file
 check_provider_account_configured = _doctor_install_state.check_provider_account_configured
 check_storage_backend = _doctor_install_state.check_storage_backend
@@ -4331,6 +4332,7 @@ def _registered_checks() -> list[Check]:
         # Install state
         Check("pm-binary", check_pm_binary_resolves, "install"),
         Check("pollypm-version-matches", check_installed_version_matches_pyproject, "install", severity="warning"),
+        Check("pollypm-source-staleness", check_deploy_source_staleness, "install", severity="warning"),
         Check("config-file", check_config_file, "install"),
         Check("provider-account", check_provider_account_configured, "install"),
         Check("storage-backend", check_storage_backend, "install"),

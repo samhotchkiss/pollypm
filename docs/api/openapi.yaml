@@ -167,6 +167,16 @@ paths:
                     version: 0.1.0
                     schema_version: 1
                     started_at: "2026-05-07T12:00:00Z"
+                    auth_mode: bearer_only
+                    tailnet_trust_enabled: false
+                    build:
+                      package_name: pollypm
+                      version: 0.1.0
+                      package_path: /Users/sam/.local/share/uv/tools/pollypm/lib/python3.13/site-packages/pollypm
+                      source_checkout: /Users/sam/dev/pollypm
+                      source_git_sha: 0123456789abcdef0123456789abcdef01234567
+                      served_git_sha: null
+                      stale: false
 
   /doctor:
     get:
@@ -3177,9 +3187,84 @@ components:
         message: { type: string }
 
     # ---- Health -----------------------------------------------------
+    RuntimeBuildInfo:
+      type: object
+      required: [package_name, version]
+      properties:
+        package_name:
+          type: string
+          description: Python distribution/package being served.
+        version:
+          type: string
+          description: Served Python package version.
+        package_path:
+          type: string
+          nullable: true
+          description: Filesystem path for the imported package tree.
+        package_file:
+          type: string
+          nullable: true
+          description: Filesystem path for the package __init__.py.
+        dist_info_path:
+          type: string
+          nullable: true
+          description: Filesystem path for the installed dist-info metadata.
+        direct_url:
+          type: string
+          nullable: true
+          description: PEP 610 direct_url source recorded by the installer.
+        direct_url_editable:
+          type: boolean
+          nullable: true
+          description: Whether direct_url metadata marks this as editable.
+        direct_url_vcs:
+          type: string
+          nullable: true
+          description: VCS name from direct_url metadata, when present.
+        direct_url_vcs_commit_id:
+          type: string
+          nullable: true
+          description: Commit id recorded in direct_url VCS metadata, when present.
+        source_checkout:
+          type: string
+          nullable: true
+          description: Local source checkout recorded by installer metadata or inferred from the running tree.
+        source_git_sha:
+          type: string
+          nullable: true
+          description: Current HEAD SHA of the source checkout, when available.
+        source_git_commit_time:
+          type: string
+          nullable: true
+          description: Current HEAD commit timestamp of the source checkout.
+        served_git_sha:
+          type: string
+          nullable: true
+          description: Git SHA of the served package when it is itself in a git checkout, or direct_url VCS commit id.
+        served_git_commit_time:
+          type: string
+          nullable: true
+          description: Commit timestamp of the served package checkout, when available.
+        package_mtime:
+          type: string
+          nullable: true
+          description: Newest mtime among served package files, as an install-time hint.
+        package_mtime_path:
+          type: string
+          nullable: true
+          description: Served package file that supplied package_mtime.
+        stale:
+          type: boolean
+          nullable: true
+          description: Best-effort health-route hint that the served copy may be stale.
+        stale_reason:
+          type: string
+          nullable: true
+          description: Reason for a true stale hint.
+
     HealthResponse:
       type: object
-      required: [status, version, schema_version, started_at, auth_mode, tailnet_trust_enabled]
+      required: [status, version, schema_version, started_at, auth_mode, tailnet_trust_enabled, build]
       properties:
         status:
           type: string
@@ -3200,6 +3285,8 @@ components:
         tailnet_trust_enabled:
           type: boolean
           description: Whether Tailscale CGNAT peers are accepted without bearer or cookie credentials.
+        build:
+          $ref: "#/components/schemas/RuntimeBuildInfo"
 
     DoctorCheck:
       type: object

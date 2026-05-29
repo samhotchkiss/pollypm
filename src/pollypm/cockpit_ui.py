@@ -8626,6 +8626,8 @@ class PollyInboxApp(App[None]):
         row = event.item
         if not isinstance(row, _InboxListItem):
             return
+        if row.row_ref not in self._visible_rows:
+            return
         self._selected_task_id = row.task_id
         self._selected_row_key = row.row_ref.key
         self._render_detail(row.task_id)

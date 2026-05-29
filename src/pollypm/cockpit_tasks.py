@@ -2181,6 +2181,8 @@ class PollyTasksApp(App[None]):
         in_review = task.work_status.value == "review"
         self.approve_button.disabled = not in_review
         self.reject_button.disabled = not in_review
+        if self._pending_review_action is not None:
+            self._morph_review_action_buttons()
         self.bulk_approve_button.disabled = len(self._selected_review_task_ids()) == 0
         self.refresh_live_button.disabled = active_session is None
         if active_session is None:
@@ -2722,10 +2724,12 @@ class PollyTasksApp(App[None]):
         if pending.decision == "approve":
             self.approve_button.label = undo_label
             self.approve_button.add_class("-undo")
+            self.approve_button.disabled = False
             self.reject_button.disabled = True
         else:
             self.reject_button.label = undo_label
             self.reject_button.add_class("-undo")
+            self.reject_button.disabled = False
             self.approve_button.disabled = True
 
     def _restore_review_action_buttons(self) -> None:
@@ -2890,7 +2894,7 @@ class PollyTasksApp(App[None]):
         # bench cursor sitting on a real task cannot approve it on a
         # single keystroke. The on-screen Approve button bypasses
         # this gate via :meth:`_fire_approve_task` (#900).
-        if self._has_search_filter():
+        if self.search_input.has_focus:
             self.action_focus_search()
             return
         if not self._selected_task_id:
@@ -2968,7 +2972,7 @@ class PollyTasksApp(App[None]):
     def action_reject_task(self) -> None:
         # #840 fix — see ``action_approve_task`` above. Button-click
         # path bypasses arming via :meth:`_fire_reject_task` (#900).
-        if self._has_search_filter():
+        if self.search_input.has_focus:
             self.action_focus_search()
             return
         if not self._selected_task_id:

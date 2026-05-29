@@ -28,10 +28,12 @@ from pollypm.audit.watchdog import (
     EVENT_HEARTBEAT_TICK,
     EVENT_STUCK_DRAFT_TERMINATED,
     RULE_CANCEL_NO_PROMOTION,
+    RULE_CANCELLATION_CHURN,
     RULE_MARKER_LEAKED,
     RULE_ORPHAN_MARKER,
     RULE_STUCK_DRAFT,
     RULE_TASK_PROGRESS_STALE,
+    RULE_TASK_REWORK_STALE,
     STUCK_DRAFT_TERMINATOR_THRESHOLD,
     TIER_2,
     Finding,
@@ -820,6 +822,66 @@ def test_cancel_with_followup_create_silenced(now: datetime) -> None:
         if f.rule == RULE_CANCEL_NO_PROMOTION
     ]
     assert findings == []
+
+
+def test_cancel_no_promotion_is_volume_aware(now: datetime) -> None:
+    """One later create suppresses one cancel, not every cancel in a burst."""
+    events: list[AuditEvent] = []
+    for idx in range(6):
+        events.append(_make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            subject=f"demo/{idx + 1}",
+            metadata={"to": "cancelled"},
+            ts=now - timedelta(minutes=20 - idx),
+        ))
+    events.append(_make_event(
+        event=EVENT_TASK_CREATED,
+        subject="demo/99",
+        ts=now - timedelta(minutes=10),
+    ))
+
+    findings = [
+        f for f in scan_events(events, now=now)
+        if f.rule == RULE_CANCEL_NO_PROMOTION
+    ]
+
+    assert len(findings) == 5
+    assert {f.subject for f in findings} == {
+        "demo/2",
+        "demo/3",
+        "demo/4",
+        "demo/5",
+        "demo/6",
+    }
+
+
+def test_cancellation_churn_fires_with_interleaved_creates(now: datetime) -> None:
+    """Create/cancel/recreate loops must not mask cancellation volume."""
+    events: list[AuditEvent] = []
+    for idx in range(5):
+        minute = 25 - (idx * 3)
+        events.append(_make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            subject=f"demo/{idx + 1}",
+            metadata={"from": "draft", "to": "cancelled"},
+            ts=now - timedelta(minutes=minute),
+        ))
+        events.append(_make_event(
+            event=EVENT_TASK_CREATED,
+            subject=f"demo/{idx + 20}",
+            ts=now - timedelta(minutes=minute - 1),
+        ))
+
+    findings = [
+        f for f in scan_events(events, now=now)
+        if f.rule == RULE_CANCELLATION_CHURN
+    ]
+
+    assert len(findings) == 1
+    assert findings[0].project == "demo"
+    assert findings[0].tier == TIER_2
+    assert findings[0].metadata["cancel_count"] == 5
+    assert findings[0].evidence["required_decision"] == "stop_cancel_recreate_loop"
 
 
 def test_format_unstick_brief_cancellation_no_promotion_is_decisive() -> None:
@@ -2797,6 +2859,62 @@ def test_stuck_draft_state_dedupes_with_event_path(now: datetime) -> None:
     matched = [f for f in findings if f.rule == RULE_STUCK_DRAFT]
     assert len(matched) == 1
     assert matched[0].metadata["detected_via"] == "state"
+
+
+def test_task_rework_stale_state_based_fires_for_old_rework(
+    now: datetime,
+) -> None:
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=16,
+        work_status="rework",
+        transitions=[
+            _FakeTransition(
+                from_state="review",
+                to_state="rework",
+                timestamp=now - timedelta(minutes=35),
+                actor="reviewer",
+                reason="tests still failing",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=35),
+        assignee="worker",
+        current_node_id="implement",
+    )
+
+    findings = scan_events([], now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_REWORK_STALE]
+
+    assert len(matched) == 1
+    assert matched[0].subject == "savethenovel/16"
+    assert matched[0].tier == TIER_2
+    assert matched[0].metadata["detected_via"] == "state"
+    assert matched[0].metadata["reason"] == "tests still failing"
+
+
+def test_task_rework_stale_event_path_silent_when_resumed(
+    now: datetime,
+) -> None:
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/16",
+            metadata={"from": "review", "to": "rework"},
+            ts=now - timedelta(minutes=35),
+        ),
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/16",
+            metadata={"from": "rework", "to": "queued"},
+            ts=now - timedelta(minutes=5),
+        ),
+    ]
+
+    findings = scan_events(events, now=now)
+
+    assert not any(f.rule == RULE_TASK_REWORK_STALE for f in findings)
 
 
 def test_task_progress_stale_state_based_fires_for_old_in_progress(

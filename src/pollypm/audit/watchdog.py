@@ -95,11 +95,13 @@ __all__ = [
     "RULE_MARKER_LEAKED",
     "RULE_STUCK_DRAFT",
     "RULE_CANCEL_NO_PROMOTION",
+    "RULE_CANCELLATION_CHURN",
     "RULE_TASK_REVIEW_STALE",
     "RULE_TASK_PROGRESS_STALE",
     "RULE_ROLE_SESSION_MISSING",
     "RULE_WORKER_SESSION_DEAD_LOOP",
     "RULE_TASK_ON_HOLD_STALE",
+    "RULE_TASK_REWORK_STALE",
     "RULE_DUPLICATE_ADVISOR_TASKS",
     "RULE_PLAN_REVIEW_MISSING",
     "RULE_PLAN_REVIEW_BYPASSED_APPROVAL",
@@ -147,6 +149,7 @@ RULE_ORPHAN_MARKER = "orphan_marker"
 RULE_MARKER_LEAKED = "marker_leaked"
 RULE_STUCK_DRAFT = "stuck_draft"
 RULE_CANCEL_NO_PROMOTION = "cancellation_no_promotion"
+RULE_CANCELLATION_CHURN = "cancellation_churn"
 # #1414 — auto-unstick rules. ``task_review_stale`` catches a task
 # parked at status=review with no transitions for a while; that's the
 # savethenovel/10 pattern (reviewer agent never spawned). The other
@@ -165,6 +168,7 @@ RULE_WORKER_SESSION_DEAD_LOOP = "worker_session_dead_loop"
 # reviewer's findings and either fixes them or, if the issue genuinely
 # requires human judgement, calls ``pm notify`` itself.
 RULE_TASK_ON_HOLD_STALE = "task_on_hold_stale"
+RULE_TASK_REWORK_STALE = "task_rework_stale"
 # #1510 — duplicate_advisor_tasks catches a pile-up of non-terminal
 # advisor-labeled tasks for the same project. The advisor.tick handler
 # is supposed to enqueue at most one ``advisor_review`` per project at
@@ -378,6 +382,11 @@ class WatchdogConfig:
     # queue the replacement. If no ``task.created`` for the same
     # project lands in that window, fire the finding.
     cancel_grace_seconds: int = 300
+    # Cancellation churn is counted independently from replacement
+    # creates. Recreate loops can be "healthy" for
+    # cancellation_no_promotion but still pathological at volume.
+    cancel_churn_window_seconds: int = 1800
+    cancel_churn_threshold: int = 5
     # #1414 — task_review_stale: a task at status=review must have its
     # most recent transition older than this before we fire. 30 min
     # mirrors the savethenovel/10 case (reviewer agent never spawned).
@@ -395,6 +404,10 @@ class WatchdogConfig:
     # parks task), not a sustained state. Anything longer than the
     # cadence-tick stride means a human is now load-bearing.
     on_hold_stale_seconds: int = 900
+    # Rework consumes worker capacity but does not spawn a fresh worker
+    # on reject. A markerless rework task older than this is escalated
+    # like other stale machine-owned states.
+    rework_stale_seconds: int = 1200
     # #1414 — worker_session_dead_loop: how many reaper events for the
     # same task within ``dead_loop_window_seconds`` count as a loop.
     dead_loop_threshold: int = 3
@@ -1034,44 +1047,125 @@ def _detect_cancellation_no_promotion(
             if to_state == "cancelled" and ts >= window_start and ts <= grace_cutoff:
                 cancellations.append((ev, ts))
 
+    for values in created_by_project.values():
+        values.sort()
+    cancellations_by_project: dict[str, list[tuple[AuditEvent, datetime]]] = {}
     for ev, ts in cancellations:
-        creates = created_by_project.get(ev.project, [])
-        # Was there *any* task.created for this project after the
-        # cancellation? Even one means Polly kept the queue moving.
-        followed = any(c > ts for c in creates)
-        if followed:
+        cancellations_by_project.setdefault(ev.project, []).append((ev, ts))
+
+    for project, project_cancellations in cancellations_by_project.items():
+        project_cancellations.sort(key=lambda item: item[1])
+        creates = created_by_project.get(project, [])
+        create_index = 0
+        for ev, ts in project_cancellations:
+            while create_index < len(creates) and creates[create_index] <= ts:
+                create_index += 1
+            if create_index < len(creates):
+                create_index += 1
+                continue
+            findings.append(Finding(
+                rule=RULE_CANCEL_NO_PROMOTION,
+                tier=TIER_2,
+                project=ev.project,
+                subject=ev.subject,
+                message=(
+                    f"Task {ev.subject} was cancelled at {ev.ts} but no "
+                    f"replacement task.created landed in the next "
+                    f"{config.cancel_grace_seconds // 60} min. The "
+                    f"planning queue may have stalled."
+                ),
+                recommendation=(
+                    f"Open the project drilldown and check Polly's "
+                    f"planning state, or run `pm chat {ev.project}` and "
+                    f"prompt 'what's next?' to nudge the queue."
+                ),
+                metadata={
+                    "cancelled_at": ev.ts,
+                    "actor": ev.actor,
+                    "from": (ev.metadata or {}).get("from"),
+                    "detected_via": "event",
+                },
+                evidence={
+                    "cancelled_task_id": ev.subject,
+                    "cancelled_at": ev.ts,
+                    "from": (ev.metadata or {}).get("from"),
+                    "actor": ev.actor,
+                    "replacement_task_created": False,
+                    "required_decision": (
+                        "queue_replacement_or_mark_project_intentionally_parked"
+                    ),
+                },
+            ))
+    return findings
+
+
+def _detect_cancellation_churn(
+    events: Sequence[AuditEvent],
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+) -> list[Finding]:
+    """Detect high cancellation volume even when recreates keep landing."""
+    threshold = max(1, int(config.cancel_churn_threshold))
+    window_seconds = max(1, int(config.cancel_churn_window_seconds))
+    cutoff = now - timedelta(seconds=window_seconds)
+    by_project: dict[str, list[tuple[datetime, AuditEvent]]] = {}
+    for ev in events:
+        if ev.event != EVENT_TASK_STATUS_CHANGED:
             continue
+        meta = ev.metadata or {}
+        if meta.get("to") != "cancelled":
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None or ts < cutoff:
+            continue
+        key = _task_subject_key(ev.subject)
+        project = ev.project or (key[0] if key is not None else "")
+        if not project:
+            continue
+        by_project.setdefault(project, []).append((ts, ev))
+
+    findings: list[Finding] = []
+    for project, hits in by_project.items():
+        if len(hits) < threshold:
+            continue
+        hits.sort(key=lambda item: item[0])
+        subjects = [ev.subject for _, ev in hits if ev.subject]
+        first_ts = hits[0][0]
+        latest_ts = hits[-1][0]
         findings.append(Finding(
-            rule=RULE_CANCEL_NO_PROMOTION,
+            rule=RULE_CANCELLATION_CHURN,
             tier=TIER_2,
-            project=ev.project,
-            subject=ev.subject,
+            project=project,
+            subject=project,
             message=(
-                f"Task {ev.subject} was cancelled at {ev.ts} but no "
-                f"replacement task.created landed in the next "
-                f"{config.cancel_grace_seconds // 60} min. The "
-                f"planning queue may have stalled."
+                f"Project {project} cancelled {len(hits)} tasks in the last "
+                f"{window_seconds // 60} min. Replacement creates do not "
+                f"clear this volume signal."
             ),
             recommendation=(
-                f"Open the project drilldown and check Polly's "
-                f"planning state, or run `pm chat {ev.project}` and "
-                f"prompt 'what's next?' to nudge the queue."
+                "Architect: inspect the cancellation loop and stop using "
+                "cancel-and-recreate as the default unstick path. Preserve "
+                "in-flight work where possible and choose reassign/resume "
+                "before discarding task state."
             ),
             metadata={
-                "cancelled_at": ev.ts,
-                "actor": ev.actor,
-                "from": (ev.metadata or {}).get("from"),
+                "cancel_count": len(hits),
+                "threshold": threshold,
+                "window_seconds": window_seconds,
+                "first_cancelled_at": first_ts.isoformat(),
+                "latest_cancelled_at": latest_ts.isoformat(),
+                "cancelled_subjects": subjects[:20],
                 "detected_via": "event",
             },
             evidence={
-                "cancelled_task_id": ev.subject,
-                "cancelled_at": ev.ts,
-                "from": (ev.metadata or {}).get("from"),
-                "actor": ev.actor,
-                "replacement_task_created": False,
-                "required_decision": (
-                    "queue_replacement_or_mark_project_intentionally_parked"
-                ),
+                "cancel_count": len(hits),
+                "threshold": threshold,
+                "window_seconds": window_seconds,
+                "cancelled_subjects": subjects[:50],
+                "first_cancelled_at": first_ts.isoformat(),
+                "latest_cancelled_at": latest_ts.isoformat(),
+                "required_decision": "stop_cancel_recreate_loop",
             },
         ))
     return findings
@@ -1454,6 +1548,111 @@ def _detect_task_on_hold_stale(
     return findings
 
 
+def _detect_task_rework_stale(
+    events: Sequence[AuditEvent],
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+    open_tasks: Sequence[Any] | None = None,
+) -> list[Finding]:
+    """Detect tasks parked in ``rework`` with no fresh claim or transition."""
+    findings: list[Finding] = []
+    seen_subjects: set[str] = set()
+    cutoff = now - timedelta(seconds=config.rework_stale_seconds)
+
+    if open_tasks:
+        for task in open_tasks:
+            status = getattr(task, "work_status", None)
+            status_value = getattr(status, "value", status)
+            if status_value != "rework":
+                continue
+            project = getattr(task, "project", "") or ""
+            task_number = getattr(task, "task_number", None)
+            if not project or task_number is None:
+                continue
+            subject = f"{project}/{task_number}"
+            entry_ts, tr_meta = _state_entry_time(task, "rework")
+            if entry_ts is None or entry_ts > cutoff:
+                continue
+            stuck_minutes = max(1, int((now - entry_ts).total_seconds() // 60))
+            seen_subjects.add(subject)
+            findings.append(Finding(
+                rule=RULE_TASK_REWORK_STALE,
+                tier=TIER_2,
+                project=project,
+                subject=subject,
+                message=(
+                    f"Task {subject} has been at status=rework for "
+                    f"~{stuck_minutes} min with no fresh claim or transition."
+                ),
+                recommendation=(
+                    f"Architect: inspect the rejected work for {subject}, "
+                    "then requeue, reassign, or resume it. Cancel only if "
+                    "the partial work should be intentionally abandoned."
+                ),
+                metadata={
+                    "rework_since": entry_ts.isoformat(),
+                    "stuck_minutes": stuck_minutes,
+                    "from": tr_meta.get("from"),
+                    "actor": tr_meta.get("actor"),
+                    "reason": tr_meta.get("reason"),
+                    "assignee": getattr(task, "assignee", None),
+                    "current_node_id": getattr(task, "current_node_id", None),
+                    "detected_via": "state",
+                },
+            ))
+
+    latest: dict[str, tuple[datetime, AuditEvent]] = {}
+    for ev in events:
+        if ev.event != EVENT_TASK_STATUS_CHANGED:
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None:
+            continue
+        prior = latest.get(ev.subject)
+        if prior is None or ts > prior[0]:
+            latest[ev.subject] = (ts, ev)
+
+    for subject, (ts, ev) in latest.items():
+        if subject in seen_subjects:
+            continue
+        meta = ev.metadata or {}
+        if meta.get("to") != "rework":
+            continue
+        if ts > cutoff:
+            continue
+        key = _task_subject_key(subject)
+        if key is None:
+            continue
+        project, _ = key
+        stuck_minutes = max(1, int((now - ts).total_seconds() // 60))
+        seen_subjects.add(subject)
+        findings.append(Finding(
+            rule=RULE_TASK_REWORK_STALE,
+            tier=TIER_2,
+            project=project,
+            subject=subject,
+            message=(
+                f"Task {subject} has been at status=rework for "
+                f"~{stuck_minutes} min with no fresh claim or transition."
+            ),
+            recommendation=(
+                f"Architect: inspect the rejected work for {subject}, "
+                "then requeue, reassign, or resume it. Cancel only if "
+                "the partial work should be intentionally abandoned."
+            ),
+            metadata={
+                "rework_since": ev.ts,
+                "stuck_minutes": stuck_minutes,
+                "from": meta.get("from"),
+                "actor": ev.actor,
+                "reason": meta.get("reason"),
+                "detected_via": "event",
+            },
+        ))
+    return findings
+
+
 def _latest_worker_heartbeat_time(
     events: Sequence[AuditEvent],
     *,
@@ -1570,8 +1769,9 @@ def _detect_task_progress_stale(
                 ),
                 recommendation=(
                     f"Architect: inspect the worker for {subject}; check "
-                    f"auth, sandbox, and worker logic, then reassign, "
-                    f"resume, or cancel the task."
+                    f"auth, sandbox, and worker logic, then reassign or "
+                    f"resume the task. Cancel only if the partial work "
+                    f"should be intentionally abandoned."
                 ),
                 metadata={
                     "in_progress_since": entry_ts.isoformat(),
@@ -1637,8 +1837,9 @@ def _detect_task_progress_stale(
             ),
             recommendation=(
                 f"Architect: inspect the worker for {subject}; check "
-                f"auth, sandbox, and worker logic, then reassign, "
-                f"resume, or cancel the task."
+                f"auth, sandbox, and worker logic, then reassign or "
+                f"resume the task. Cancel only if the partial work "
+                f"should be intentionally abandoned."
             ),
             metadata={
                 "in_progress_since": ev.ts,
@@ -1860,9 +2061,9 @@ def _detect_worker_session_dead_loop(
                 f"reaper is firing in a loop."
             ),
             recommendation=(
-                f"Inspect the task and decide whether to cancel "
-                f"(`pm task cancel {subject}`), reassign, or fix the "
-                f"underlying spawn failure."
+                "Inspect the task, fix the underlying spawn failure, "
+                "then reassign or resume it. Cancel only if the partial "
+                "work should be intentionally abandoned."
             ),
             metadata={
                 "reap_count": len(hits),
@@ -3096,10 +3297,16 @@ def scan_events(
     findings.extend(_detect_cancellation_no_promotion(
         materialised, now=now, config=config,
     ))
+    findings.extend(_detect_cancellation_churn(
+        materialised, now=now, config=config,
+    ))
     findings.extend(_detect_task_review_stale(
         materialised, now=now, config=config, open_tasks=open_tasks,
     ))
     findings.extend(_detect_task_on_hold_stale(
+        materialised, now=now, config=config, open_tasks=open_tasks,
+    ))
+    findings.extend(_detect_task_rework_stale(
         materialised, now=now, config=config, open_tasks=open_tasks,
     ))
     findings.extend(_detect_task_progress_stale(
@@ -4177,8 +4384,52 @@ def _brief_task_progress_stale(
         "evidence rather than ratifying any framing in this brief."
     )
     lines.append(
-        f"Cli levers available: `pm task cancel {subject}`, "
-        "`pm chat <project>`, `pm notify`."
+        f"Cli levers available: `pm chat <project>`, `pm notify`; "
+        f"use `pm task cancel {subject}` only after preserving or "
+        "intentionally abandoning partial work."
+    )
+    return lines
+
+
+def _brief_task_rework_stale(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``task_rework_stale``."""
+    stuck_minutes = meta.get("stuck_minutes")
+    rework_since = meta.get("rework_since")
+    from_state = meta.get("from") or "<unknown>"
+    reason = meta.get("reason") or ""
+    assignee = meta.get("assignee") or "<unknown>"
+    node = meta.get("current_node_id") or "<unknown>"
+    lines: list[str] = []
+    lines.append(
+        f"Stuck for: {stuck_minutes} minutes in rework"
+        if stuck_minutes else "Stuck for: unknown duration"
+    )
+    lines.append("Observed evidence:")
+    if rework_since:
+        lines.append(
+            f"- Task transitioned {from_state} -> rework at {rework_since}"
+        )
+    if reason:
+        lines.append(f"- Rework reason: {str(reason).splitlines()[0][:240]}")
+    lines.append(f"- Assignee: {assignee}; node: {node}")
+    lines.append(
+        "- Rework consumes worker capacity but no fresh worker session is "
+        "guaranteed after a markerless reject."
+    )
+    lines.append("")
+    lines.append(
+        "Your job: inspect the rejected work and create a concrete next "
+        "state. Prefer requeue, reassign, or resume so partial work is "
+        "preserved."
+    )
+    lines.append(
+        f"Cli levers available: `pm task queue {subject}`, "
+        f"`pm chat <project>`, `pm notify`; use `pm task cancel {subject}` "
+        "only if the partial work should be discarded."
     )
     return lines
 
@@ -4215,6 +4466,43 @@ def _brief_cancellation_no_promotion(
     lines.append(
         "Cli levers available: create and queue replacement work with "
         "`pm task create ...` then `pm task queue <replacement-task-id>`."
+    )
+    return lines
+
+
+def _brief_cancellation_churn(
+    finding: Finding,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``cancellation_churn``."""
+    cancel_count = meta.get("cancel_count") or "?"
+    threshold = meta.get("threshold") or "?"
+    window_seconds = meta.get("window_seconds") or 0
+    latest = meta.get("latest_cancelled_at") or "<unknown>"
+    subjects = meta.get("cancelled_subjects") or []
+    try:
+        window_minutes = max(1, int(window_seconds) // 60)
+    except (TypeError, ValueError):
+        window_minutes = 30
+    lines: list[str] = []
+    lines.append(
+        f"Stuck for: {cancel_count} cancellations in the last "
+        f"{window_minutes} min (threshold {threshold})"
+    )
+    lines.append("Observed evidence:")
+    lines.append(f"- Latest cancellation at {latest}")
+    if subjects:
+        preview = ", ".join(str(subject) for subject in subjects[:10])
+        lines.append(f"- Cancelled tasks: {preview}")
+    lines.append(
+        "- Replacement task.created events do not clear this volume signal; "
+        "a cancel/recreate loop can otherwise mask itself."
+    )
+    lines.append("")
+    lines.append(
+        "Your job: stop the cancellation loop and choose a preserving "
+        "state transition. Reassign or resume in-flight work before "
+        "discarding it."
     )
     return lines
 
@@ -4412,7 +4700,8 @@ def _brief_worker_session_dead_loop(
         "than ratifying any framing in this brief."
     )
     lines.append(
-        f"Cli levers available: `pm task cancel {subject}`, `pm notify`."
+        f"Cli levers available: `pm notify`; use `pm task cancel {subject}` "
+        "only after confirming the partial work should be discarded."
     )
     return lines
 
@@ -4498,8 +4787,12 @@ def format_unstick_brief(
         lines.extend(_brief_task_review_stale(finding, subject, meta))
     elif finding.rule == RULE_TASK_PROGRESS_STALE:
         lines.extend(_brief_task_progress_stale(finding, subject, meta))
+    elif finding.rule == RULE_TASK_REWORK_STALE:
+        lines.extend(_brief_task_rework_stale(finding, subject, meta))
     elif finding.rule == RULE_CANCEL_NO_PROMOTION:
         lines.extend(_brief_cancellation_no_promotion(finding, subject, meta))
+    elif finding.rule == RULE_CANCELLATION_CHURN:
+        lines.extend(_brief_cancellation_churn(finding, meta))
     elif finding.rule == RULE_ROLE_SESSION_MISSING:
         lines.extend(_brief_role_session_missing(finding, project, meta))
     elif finding.rule == RULE_PLAN_REVIEW_MISSING:

@@ -308,6 +308,30 @@ def test_auto_recovery_skips_worker_role() -> None:
     assert [d.outcome for d in decisions] == ["skipped_role"]
 
 
+def test_auto_recovery_spawns_advisor_after_threshold() -> None:
+    alert = _make_no_session_alert(
+        role="advisor",
+        session_name="advisor-bikepath",
+    )
+    store = _FakeStore(alerts=[alert])
+    services = _FakeServices(
+        msg_store=store, known_projects=(_FakeProject("bikepath"),),
+    )
+    spawn_calls: list[tuple[str, str]] = []
+
+    def fake_spawn(*, config_path: Path, project: str, role: str) -> tuple[bool, str]:
+        spawn_calls.append((role, project))
+        return True, "session=advisor_bikepath"
+
+    decisions = auto_recover_no_session_alerts(
+        services, config_path=Path("/dev/null"), spawn=fake_spawn,
+    )
+
+    assert spawn_calls == [("advisor", "bikepath")]
+    assert [d.outcome for d in decisions] == ["spawned"]
+    assert decisions[0].attempt_number == 1
+
+
 def test_auto_recovery_skips_unknown_projects() -> None:
     """Ghost projects (alert references a project not in the registry) are
     left to the existing ``_sweep_ghost_project_alerts`` cleanup."""

@@ -68,8 +68,13 @@ logger = logging.getLogger(__name__)
 # service, not by ``pm worker-start``. ``operator`` / ``heartbeat`` /
 # ``triage`` are workspace singletons managed by the supervisor's own
 # launch path; they should never appear as the subject of a
-# ``no_session`` alert in normal operation.
-_AUTO_SPAWN_ROLES: frozenset[str] = frozenset({"reviewer", "architect"})
+# ``no_session`` alert in normal operation. ``advisor`` is a
+# project-scoped role lane like ``architect``.
+_AUTO_SPAWN_ROLES: frozenset[str] = frozenset({
+    "reviewer",
+    "architect",
+    "advisor",
+})
 
 # Defaults — overridable per-call so tests can force the behaviour
 # without sleeping.

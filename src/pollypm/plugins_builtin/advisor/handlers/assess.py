@@ -18,9 +18,9 @@ ad03 wires three things:
    build_context_pack, writes it next to the advisor task's worktree,
    and returns the path + the computed pack structure.
 
-The actual session launch (``pm task claim`` + worker spawn) lives in
-the tick handler's enqueue path — ad03 just packages the context and
-exposes the output-parsing surface. ad04 wires the history-log
+The advisor tick queues the task; the recurring no-session recovery
+owns starting the advisor lane when it is missing. ad03 just packages
+the context and exposes the output-parsing surface. ad04 wires the history-log
 append; ad05 wires the inbox emission.
 """
 from __future__ import annotations

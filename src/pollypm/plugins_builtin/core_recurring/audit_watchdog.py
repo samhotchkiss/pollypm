@@ -13,7 +13,7 @@ which holds the pure detectors. The heartbeat scheduler invokes
 
 1. Emit a ``heartbeat.tick`` audit event so liveness is observable.
 2. For each known project, read the last ``window_seconds * 2`` of
-   audit events and run the four detectors.
+   audit events and run the watchdog detectors.
 3. For every finding, emit an ``audit.finding`` audit event AND
    upsert an alert keyed by ``(rule, project, subject)``.
 
@@ -39,6 +39,7 @@ from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     OPERATOR_DISPATCH_THROTTLE_SECONDS,
     Finding,
+    RULE_CANCELLATION_CHURN,
     RULE_CANCEL_NO_PROMOTION,
     RULE_DUPLICATE_ADVISOR_TASKS,
     RULE_LEGACY_DB_SHADOW,
@@ -52,6 +53,7 @@ from pollypm.audit.watchdog import (
     RULE_STUCK_DRAFT,
     RULE_TASK_ON_HOLD_STALE,
     RULE_TASK_PROGRESS_STALE,
+    RULE_TASK_REWORK_STALE,
     RULE_TASK_REVIEW_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
     TIER_3,
@@ -149,8 +151,10 @@ _DISPATCHABLE_RULES: frozenset[str] = frozenset({
     # cancel, or rewrite them.
     RULE_STUCK_DRAFT,
     RULE_CANCEL_NO_PROMOTION,
+    RULE_CANCELLATION_CHURN,
     RULE_TASK_REVIEW_STALE,
     RULE_TASK_PROGRESS_STALE,
+    RULE_TASK_REWORK_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
     # #1424 — on_hold escalation lands in the architect's pane with the
     # reviewer's rationale folded into the brief. Default first responder
@@ -235,9 +239,12 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
         "window_seconds",
         "stuck_draft_seconds",
         "cancel_grace_seconds",
+        "cancel_churn_window_seconds",
+        "cancel_churn_threshold",
         "review_stale_seconds",
         "progress_stale_seconds",
         "on_hold_stale_seconds",
+        "rework_stale_seconds",
     ):
         raw = payload.get(field_name)
         if raw is None:

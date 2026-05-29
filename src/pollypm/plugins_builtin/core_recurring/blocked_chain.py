@@ -271,10 +271,22 @@ def sweep_blocked_chains(
             work, project=project, task_number=task_number,
         )
         if not visited:
-            # Task is in BLOCKED state with no recursive blocker rows —
-            # nothing to dead-end against. Some other process (manual
-            # state edit, sync drift) put it there; not our concern.
-            counters["skipped_no_blockers"] += 1
+            counters["dead_end_detected"] += 1
+            message = (
+                f"Task {task.task_id} is blocked but has no blocker "
+                "dependency rows. Auto-unblock has no edge to observe, "
+                "so this task cannot leave BLOCKED without manual repair. "
+                "Re-plan the task, add the missing dependency, or unlink/"
+                "requeue it if the blocked state is stale."
+            )
+            if _emit_alert(
+                msg_store=msg_store,
+                state_store=state_store,
+                project=project,
+                task_number=task_number,
+                message=message,
+            ):
+                counters["alerts_raised"] += 1
             continue
         # Drop resolved blockers from the dead-end consideration. If
         # any remain in flight the chain is alive.

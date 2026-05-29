@@ -697,6 +697,14 @@ def _escalate_no_session(
                 "for a long-running session)\n"
                 f"     (or pm task claim {event.task_id} for a per-task worker)"
             )
+        elif event.actor_name == "advisor":
+            action_hint = (
+                f"Open Workers and start or recover the advisor for "
+                f"project '{event.project}'."
+            )
+            cli_hint = (
+                f"Try: pm worker-start --role advisor {event.project}"
+            )
         else:
             # #1057 — non-base roles (e.g. ``critic_simplicity``) don't
             # have a ``pm worker-start --role <X>`` path; they ship via

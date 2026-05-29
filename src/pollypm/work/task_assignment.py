@@ -155,7 +155,11 @@ _ROLE_STATIC_NAMES: dict[str, tuple[str, ...]] = {
 # worker shipping convention is underscore (``workers.py``), but the
 # resolver is tolerant of either so naming drift between operators,
 # tests, and docs doesn't break lookup.
-_PROJECT_SCOPED_ROLES: frozenset[str] = frozenset({"worker", "architect"})
+_PROJECT_SCOPED_ROLES: frozenset[str] = frozenset({
+    "worker",
+    "architect",
+    "advisor",
+})
 
 
 def role_candidate_names(
@@ -167,7 +171,7 @@ def role_candidate_names(
     """Return the ordered list of session names a role *could* map to.
 
     Callers match the first candidate that actually has a live session.
-    Project-scoped roles (``worker``, ``architect``) expand to both
+    Project-scoped roles (``worker``, ``architect``, ``advisor``) expand to both
     ``<role>-<project>`` and ``<role>_<project>`` — we accept either
     convention so drift between docs and shipping code doesn't break
     lookup. Process-wide singletons (reviewer / operator / heartbeat /

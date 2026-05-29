@@ -147,6 +147,12 @@ class TestRoleCandidates:
             "pm-reviewer",
         ]
 
+    def test_advisor_is_project_scoped(self):
+        assert role_candidate_names("advisor", "bikepath") == [
+            "advisor-bikepath",
+            "advisor_bikepath",
+        ]
+
     def test_reviewer_with_task_number_still_uses_reviewer_lane(self):
         # #1439 — a still-open per-task worker pane must not steal
         # review-node handoff pings from the long-lived reviewer lane.

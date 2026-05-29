@@ -293,6 +293,7 @@ def test_auto_claim_next_claims_worker_task_and_emits_audit(
     monkeypatch.setattr(sweep_mod, "has_acceptable_plan", lambda *_a, **_kw: True)
     project_path = tmp_path / "demo"
     (project_path / ".pollypm").mkdir(parents=True)
+    (project_path / ".git").mkdir()
     task = SimpleNamespace(
         project="demo",
         task_number=3,
@@ -334,6 +335,54 @@ def test_auto_claim_next_claims_worker_task_and_emits_audit(
     assert event.metadata["cap"] == 2
 
 
+def test_auto_claim_next_skips_when_project_path_cannot_spawn_worker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    monkeypatch.setattr(sweep_mod, "has_acceptable_plan", lambda *_a, **_kw: True)
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    task = SimpleNamespace(
+        project="demo",
+        task_number=6,
+        task_id="demo/6",
+        roles={"worker": "worker"},
+        labels=[],
+        flow_template_id="standard",
+    )
+    work = _FakeAutoClaimWork([task])
+    msg_store = _FakeMsgStore()
+    services = SimpleNamespace(
+        enforce_plan=True,
+        plan_dir="docs/plan",
+        max_concurrent_per_project=2,
+        msg_store=msg_store,
+        project_root=tmp_path,
+    )
+    project = SimpleNamespace(key="demo", path=project_path)
+    totals = {"by_outcome": {}}
+
+    _auto_claim_next(services, work, project, totals)
+
+    assert work.claimed == []
+    assert totals["by_outcome"]["auto_claim_skipped_unspawnable_project"] == 1
+    assert msg_store.alerts
+    scope, alert_type, severity, message = msg_store.alerts[0]
+    assert scope == "worker-demo"
+    assert alert_type == sweep_mod.PROJECT_PATH_UNSPAWNABLE_ALERT_TYPE
+    assert severity == "warn"
+    assert "not a git checkout" in message
+
+    events = read_events(
+        "demo",
+        project_path=project_path,
+        event="auto_claim_skipped_unspawnable_project",
+    )
+    assert len(events) == 1
+    assert events[0].subject == "demo/6"
+
+
 def test_auto_claim_next_skips_paused_task_worker(
     monkeypatch,
     tmp_path: Path,
@@ -344,6 +393,7 @@ def test_auto_claim_next_skips_paused_task_worker(
     _reset_skip_throttle_for_tests()
     project_path = tmp_path / "demo"
     (project_path / ".pollypm").mkdir(parents=True)
+    (project_path / ".git").mkdir()
     _write_pause_marker(tmp_path, ["task-demo-11"])
     task = SimpleNamespace(
         project="demo",
@@ -397,6 +447,7 @@ def test_auto_claim_next_plan_missing_emits_skip_audit_without_claiming(
     monkeypatch.setattr(sweep_mod, "has_acceptable_plan", lambda *_a, **_kw: False)
     project_path = tmp_path / "demo"
     (project_path / ".pollypm").mkdir(parents=True)
+    (project_path / ".git").mkdir()
     task = SimpleNamespace(
         project="demo",
         task_number=4,
@@ -464,6 +515,7 @@ def test_auto_claim_next_claim_failure_emits_failed_audit(
     monkeypatch.setattr(sweep_mod, "has_acceptable_plan", lambda *_a, **_kw: True)
     project_path = tmp_path / "demo"
     (project_path / ".pollypm").mkdir(parents=True)
+    (project_path / ".git").mkdir()
     task = SimpleNamespace(
         project="demo",
         task_number=5,

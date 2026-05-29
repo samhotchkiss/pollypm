@@ -77,6 +77,11 @@ from pollypm.audit.log import (
     EVENT_WORKER_HEARTBEAT,
     AuditEvent,
 )
+from pollypm.operator_holds import (
+    ARCHITECT_ACTIONABLE_TAG,
+    HUMAN_NEEDED_TAG,
+    classify_on_hold_reason,
+)
 
 
 __all__ = [
@@ -278,8 +283,8 @@ TIER_TERMINAL = "terminal"
 # the user; the dispatch path can escalate to user directly when it
 # spots this prefix. The strings are matched case-insensitively against
 # the leading characters of the on_hold transition reason.
-ON_HOLD_ARCHITECT_TAG = "architect-actionable"
-ON_HOLD_HUMAN_NEEDED_TAG = "human-needed"
+ON_HOLD_ARCHITECT_TAG = ARCHITECT_ACTIONABLE_TAG
+ON_HOLD_HUMAN_NEEDED_TAG = HUMAN_NEEDED_TAG
 
 # Throttle window for the dispatch path. We re-fire findings on every
 # tick (the audit log is forensic and operators want repeat counts),
@@ -1255,17 +1260,60 @@ def _classify_on_hold_reason(reason: str | None) -> str:
     sets as the post-mortem default — the architect can always escalate
     upward, but parking on the human is the failure mode.
     """
-    if not reason:
-        return ON_HOLD_ARCHITECT_TAG
-    head = reason.strip().lower()
-    if head.startswith(ON_HOLD_HUMAN_NEEDED_TAG.lower()):
-        return ON_HOLD_HUMAN_NEEDED_TAG
-    # ``[architect-actionable] ...`` and bare ``architect-actionable: ...``
-    # both collapse to the architect default. Anything else also defaults
-    # to architect — the reviewer just didn't tag it.
-    if head.startswith("[" + ON_HOLD_HUMAN_NEEDED_TAG.lower()):
-        return ON_HOLD_HUMAN_NEEDED_TAG
-    return ON_HOLD_ARCHITECT_TAG
+    return classify_on_hold_reason(reason)
+
+
+def _on_hold_stale_finding_copy(
+    *,
+    subject: str,
+    stuck_minutes: int,
+    routing: str,
+) -> tuple[str, str, str]:
+    if routing == ON_HOLD_HUMAN_NEEDED_TAG:
+        return (
+            TIER_3,
+            (
+                f"Ready except for you: task {subject} has been at "
+                f"status=on_hold for ~{stuck_minutes} min waiting on "
+                f"operator input."
+            ),
+            (
+                f"Operator: answer the human-needed hold for {subject}; "
+                "Polly should wait without re-escalating it to the architect."
+            ),
+        )
+    return (
+        TIER_2,
+        (
+            f"Task {subject} has been at status=on_hold for "
+            f"~{stuck_minutes} min - escalating to architect for "
+            f"first-responder unstick."
+        ),
+        (
+            f"Architect: re-read the reviewer's rationale, fix the "
+            f"issue, then `pm task queue {subject}`. Only escalate "
+            f"to user via `pm notify` if the issue genuinely needs "
+            f"human judgement."
+        ),
+    )
+
+
+def _on_hold_stale_evidence(
+    *,
+    subject: str,
+    on_hold_since: str,
+    reason: str | None,
+    routing: str,
+) -> dict[str, Any]:
+    if routing != ON_HOLD_HUMAN_NEEDED_TAG:
+        return {}
+    return {
+        "task": subject,
+        "status": "on_hold",
+        "on_hold_since": on_hold_since,
+        "reason": reason or "",
+        "routing": routing,
+    }
 
 
 def _detect_task_on_hold_stale(
@@ -1313,25 +1361,22 @@ def _detect_task_on_hold_stale(
             routing = _classify_on_hold_reason(
                 reason if isinstance(reason, str) else None,
             )
+            tier, message, recommendation = _on_hold_stale_finding_copy(
+                subject=subject,
+                stuck_minutes=stuck_minutes,
+                routing=routing,
+            )
+            on_hold_since = entry_ts.isoformat()
             seen_subjects.add(subject)
             findings.append(Finding(
                 rule=RULE_TASK_ON_HOLD_STALE,
-                tier=TIER_2,
+                tier=tier,
                 project=project,
                 subject=subject,
-                message=(
-                    f"Task {subject} has been at status=on_hold for "
-                    f"~{stuck_minutes} min — escalating to architect for "
-                    f"first-responder unstick."
-                ),
-                recommendation=(
-                    f"Architect: re-read the reviewer's rationale, fix the "
-                    f"issue, then `pm task queue {subject}`. Only escalate "
-                    f"to user via `pm notify` if the issue genuinely needs "
-                    f"human judgement."
-                ),
+                message=message,
+                recommendation=recommendation,
                 metadata={
-                    "on_hold_since": entry_ts.isoformat(),
+                    "on_hold_since": on_hold_since,
                     "stuck_minutes": stuck_minutes,
                     "from": tr_meta.get("from"),
                     "reason": reason if isinstance(reason, str) else None,
@@ -1339,6 +1384,12 @@ def _detect_task_on_hold_stale(
                     "actor": tr_meta.get("actor"),
                     "detected_via": "state",
                 },
+                evidence=_on_hold_stale_evidence(
+                    subject=subject,
+                    on_hold_since=on_hold_since,
+                    reason=reason if isinstance(reason, str) else None,
+                    routing=routing,
+                ),
             ))
 
     # Event-based fallback path (backward-compat with old fixtures).
@@ -1371,23 +1422,19 @@ def _detect_task_on_hold_stale(
         routing = _classify_on_hold_reason(
             reason if isinstance(reason, str) else None,
         )
+        tier, message, recommendation = _on_hold_stale_finding_copy(
+            subject=subject,
+            stuck_minutes=stuck_minutes,
+            routing=routing,
+        )
         seen_subjects.add(subject)
         findings.append(Finding(
             rule=RULE_TASK_ON_HOLD_STALE,
-            tier=TIER_2,
+            tier=tier,
             project=project,
             subject=subject,
-            message=(
-                f"Task {subject} has been at status=on_hold for "
-                f"~{stuck_minutes} min — escalating to architect for "
-                f"first-responder unstick."
-            ),
-            recommendation=(
-                f"Architect: re-read the reviewer's rationale, fix the "
-                f"issue, then `pm task queue {subject}`. Only escalate "
-                f"to user via `pm notify` if the issue genuinely needs "
-                f"human judgement."
-            ),
+            message=message,
+            recommendation=recommendation,
             metadata={
                 "on_hold_since": ev.ts,
                 "stuck_minutes": stuck_minutes,
@@ -1397,6 +1444,12 @@ def _detect_task_on_hold_stale(
                 "actor": ev.actor,
                 "detected_via": "event",
             },
+            evidence=_on_hold_stale_evidence(
+                subject=subject,
+                on_hold_since=ev.ts,
+                reason=reason if isinstance(reason, str) else None,
+                routing=routing,
+            ),
         ))
     return findings
 

@@ -85,6 +85,10 @@ from pollypm.cockpit_inbox_items import (
     message_row_to_inbox_entry,
     task_to_inbox_entry,
 )
+from pollypm.operator_holds import (
+    human_needed_hold_prompt,
+    is_human_needed_hold_reason,
+)
 from pollypm.cockpit_first_shipped import (  # noqa: F401  (re-exported)
     _FIRST_SHIPPED_FRAMES,
     _FirstShippedCelebrationModal,
@@ -13021,6 +13025,33 @@ def _project_hold_failure_summary(data: object) -> str:
     return ""
 
 
+def _project_human_needed_hold(data: object) -> dict | None:
+    buckets = getattr(data, "task_buckets", {}) or {}
+    for item in buckets.get("on_hold", []) or []:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("hold_reason") or "")
+        if is_human_needed_hold_reason(reason):
+            return item
+    return None
+
+
+def _human_needed_hold_banner_prompt(item: dict) -> str:
+    task_label = ""
+    num = item.get("task_number")
+    if num is not None:
+        task_label = f"task #{num}"
+    title = str(item.get("title") or "").strip()
+    if title:
+        task_label = f"{task_label}: {title}" if task_label else title
+    if not task_label:
+        task_label = "a task"
+    prompt = human_needed_hold_prompt(str(item.get("hold_reason") or ""))
+    if prompt:
+        return f"{task_label} needs your input - {prompt}"
+    return f"{task_label} needs your input"
+
+
 def _user_pending_review_count(data: object) -> int:
     """Return the number of review tasks that need a user decision.
 
@@ -15352,8 +15383,15 @@ class PollyProjectDashboardApp(App[None]):
     def _banner_on_hold(self, data: ProjectDashboardData) -> str:
         """Banner for the on-hold lead (outranks active worker)."""
         on_hold_count = int(data.task_counts.get("on_hold", 0))
-        label = "task is" if on_hold_count == 1 else "tasks are"
-        lead = f"Paused: {on_hold_count} {label} on hold"
+        human_needed = _project_human_needed_hold(data)
+        if human_needed is not None:
+            lead = (
+                "Ready except for you: "
+                + _human_needed_hold_banner_prompt(human_needed)
+            )
+        else:
+            label = "task is" if on_hold_count == 1 else "tasks are"
+            lead = f"Paused: {on_hold_count} {label} on hold"
         # Drop the redundant ``N on hold`` from the suffix — same
         # trick the action_items branch above uses for inbox/review
         # overlap. Without this, the banner read "Paused: 1 task

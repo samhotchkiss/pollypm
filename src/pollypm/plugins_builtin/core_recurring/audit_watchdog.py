@@ -54,6 +54,7 @@ from pollypm.audit.watchdog import (
     RULE_TASK_PROGRESS_STALE,
     RULE_TASK_REVIEW_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
+    TIER_3,
     WATCHDOG_ALERT_TYPE,
     WatchdogConfig,
     dispatch_dedup_hash,
@@ -69,6 +70,7 @@ from pollypm.audit.watchdog import (
     was_recently_operator_dispatched,
     watchdog_alert_session_name,
 )
+from pollypm.operator_holds import HUMAN_NEEDED_TAG
 
 
 @dataclass(slots=True, frozen=True)
@@ -1991,6 +1993,35 @@ def _operator_dedup_key(
     return f"watchdog-operator:{rule}:{project}:{safe_subject}"
 
 
+def _is_human_needed_on_hold_finding(finding: Finding) -> bool:
+    meta = finding.metadata or {}
+    return (
+        finding.rule == RULE_TASK_ON_HOLD_STALE
+        and str(meta.get("routing") or "") == HUMAN_NEEDED_TAG
+    )
+
+
+def _operator_dispatch_throttle_seconds(finding: Finding) -> int:
+    if _is_human_needed_on_hold_finding(finding):
+        # Human-needed holds should create one operator ask and then
+        # wait. Use the audit log as the durable "already asked" record.
+        return 10 * 365 * 24 * 60 * 60
+    return OPERATOR_DISPATCH_THROTTLE_SECONDS
+
+
+def _operator_dispatch_question(finding: Finding) -> str:
+    if _is_human_needed_on_hold_finding(finding):
+        subject = finding.subject or "the held task"
+        return (
+            f"{subject} is ready except for operator input. What should "
+            "Polly do next?"
+        )
+    return (
+        f"Project {finding.project} is wedged in a way the architect "
+        f"can't unstick. What structural change do you want to apply?"
+    )
+
+
 def _maybe_dispatch_to_operator(
     finding: Finding,
     *,
@@ -2015,7 +2046,7 @@ def _maybe_dispatch_to_operator(
     * ``"dispatched"`` — inbox row + audit event written.
     * ``"send_failed"`` — emit ran, inbox write raised.
     """
-    if finding.rule not in _OPERATOR_DISPATCHABLE_RULES:
+    if finding.rule not in _OPERATOR_DISPATCHABLE_RULES and finding.tier != TIER_3:
         return "skipped"
     # #2015 — throttle on the subject-independent finding-body hash so
     # the same root-cause across sibling subjects collapses to one
@@ -2027,7 +2058,7 @@ def _maybe_dispatch_to_operator(
         subject=finding.subject,
         now=now,
         project_path=project_path,
-        throttle_seconds=OPERATOR_DISPATCH_THROTTLE_SECONDS,
+        throttle_seconds=_operator_dispatch_throttle_seconds(finding),
         dedup_hash=dedup_hash,
     ):
         return "throttled"
@@ -2035,10 +2066,7 @@ def _maybe_dispatch_to_operator(
     # Build the body via the structured-evidence helper. We hand the
     # finding's evidence dict and a single decision-shaped question;
     # the helper refuses any solution-menu shape.
-    question = (
-        f"Project {finding.project} is wedged in a way the architect "
-        f"can't unstick. What structural change do you want to apply?"
-    )
+    question = _operator_dispatch_question(finding)
     try:
         body = tier_handoff_prompt(finding.evidence or {}, question)
     except Exception:  # noqa: BLE001
@@ -3409,14 +3437,28 @@ def _route_one_finding(
     # #1553 — auto-promote: if the same root_cause_hash has hit
     # tier-3 K times in 24h, route to tier-4 instead. The tracker
     # is best-effort — failures fall back to tier-3 unchanged.
-    if finding.rule in _OPERATOR_DISPATCHABLE_RULES:
-        _dispatch_operator_or_tier4(
-            finding,
-            project_path=project_path,
-            now=now,
-            config_path=config_path,
-            counters=counters,
-        )
+    if finding.rule in _OPERATOR_DISPATCHABLE_RULES or finding.tier == TIER_3:
+        if _is_human_needed_on_hold_finding(finding):
+            op_outcome = _maybe_dispatch_to_operator(
+                finding,
+                project_path=project_path,
+                now=now,
+                config_path=config_path,
+            )
+            if op_outcome == "dispatched":
+                counters["operator_dispatches_sent"] += 1
+            elif op_outcome == "throttled":
+                counters["operator_dispatches_throttled"] += 1
+            elif op_outcome == "send_failed":
+                counters["operator_dispatches_failed"] += 1
+        else:
+            _dispatch_operator_or_tier4(
+                finding,
+                project_path=project_path,
+                now=now,
+                config_path=config_path,
+                counters=counters,
+            )
         return
 
     # #1414 — eligible findings get an architect dispatch on top

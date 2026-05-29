@@ -2046,6 +2046,7 @@ def test_task_on_hold_stale_human_needed_routing(now: datetime) -> None:
     from pollypm.audit.watchdog import (
         ON_HOLD_HUMAN_NEEDED_TAG,
         RULE_TASK_ON_HOLD_STALE,
+        TIER_3,
     )
 
     events = [
@@ -2065,6 +2066,9 @@ def test_task_on_hold_stale_human_needed_routing(now: datetime) -> None:
     matched = [f for f in findings if f.rule == RULE_TASK_ON_HOLD_STALE]
     assert len(matched) == 1
     assert matched[0].metadata["routing"] == ON_HOLD_HUMAN_NEEDED_TAG
+    assert matched[0].tier == TIER_3
+    assert "Ready except for you" in matched[0].message
+    assert matched[0].evidence["reason"].startswith("[human-needed]")
 
 
 def test_format_unstick_brief_on_hold_includes_evidence_and_default() -> None:
@@ -2342,6 +2346,80 @@ def test_cadence_handler_throttles_on_hold_repeat_dispatch(
     assert second["dispatches_sent"] == 0
     assert second["dispatches_throttled"] == 1
     assert len(sent) == 1
+
+
+def test_cadence_handler_routes_human_needed_on_hold_to_operator_once(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Human-needed holds create one operator ask and never ping architect."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+
+    class FakeStatus:
+        value = "on_hold"
+
+    class FakeTransition:
+        to_state = "on_hold"
+        from_state = "review"
+        actor = "russell"
+        timestamp = now - timedelta(hours=3)
+        reason = "[human-needed] external credentials only S.E. can supply"
+
+    class FakeTask:
+        project = "savethenovel"
+        task_number = 94
+        work_status = FakeStatus()
+        transitions = [FakeTransition()]
+        updated_at = now - timedelta(hours=3)
+
+    architect_sent: list[str] = []
+    operator_sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: architect_sent.append(brief) or True,
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._create_operator_inbox_task",
+        lambda **kw: operator_sent.append((kw["subject"], kw["body"])) or "savethenovel/249",
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: [],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_open_tasks",
+        lambda key, path: [FakeTask()],
+    )
+
+    store = _RecordingStore()
+    first = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+    second = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now + timedelta(hours=2),
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert first["dispatches_sent"] == 0
+    assert first["operator_dispatches_sent"] == 1
+    assert second["operator_dispatches_sent"] == 0
+    assert second["operator_dispatches_throttled"] == 1
+    assert architect_sent == []
+    assert len(operator_sent) == 1
+    assert "Ready except for you" in operator_sent[0][0]
+    assert "external credentials" in operator_sent[0][1]
 
 
 def test_classify_on_hold_reason_defaults_to_architect() -> None:

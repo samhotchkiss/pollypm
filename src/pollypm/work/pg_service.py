@@ -100,6 +100,8 @@ _CAPACITY_CONSUMING_STATUS_VALUES = (
     WorkStatus.REWORK.value,
 )
 
+_ANY_NODE = object()
+
 
 # Per-process dedup for the ``work_db.opened`` audit row (#1808). The
 # event is a doctor / heartbeat diagnostic stamped at first open of a
@@ -1735,6 +1737,21 @@ class PgWorkService:
             conn.autocommit = False
             with conn.cursor() as cur:
                 cur.execute(
+                    "SELECT work_status FROM work_tasks "
+                    "WHERE project = %s AND task_number = %s "
+                    "FOR UPDATE",
+                    (project, task_number),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise TaskNotFoundError(f"Task '{task_id}' not found.")
+                current = _coerce_status(str(row[0]))
+                if current != WorkStatus.CANCELLED:
+                    raise InvalidTransitionError(
+                        f"Cannot reopen task in '{current.value}' state. "
+                        "Only cancelled tasks can be reopened."
+                    )
+                cur.execute(
                     "UPDATE work_node_executions SET status = %s, "
                     "completed_at = %s "
                     "WHERE task_project = %s AND task_number = %s "
@@ -1756,9 +1773,21 @@ class PgWorkService:
                     "assignee = NULL, current_node_id = NULL, "
                     "claimed_by_session = NULL, "
                     "updated_at = %s "
-                    "WHERE project = %s AND task_number = %s",
-                    (WorkStatus.QUEUED.value, now, project, task_number),
+                    "WHERE project = %s AND task_number = %s "
+                    "AND work_status = %s",
+                    (
+                        WorkStatus.QUEUED.value,
+                        now,
+                        project,
+                        task_number,
+                        WorkStatus.CANCELLED.value,
+                    ),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidTransitionError(
+                        f"Task '{task_id}' changed during reopen; "
+                        "retry the operation."
+                    )
                 cur.execute(
                     "INSERT INTO work_transitions ("
                     "task_project, task_number, from_state, to_state, "
@@ -2068,9 +2097,13 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                # Re-run the source-state validation inside the write
+                # transaction. The pre-read in callers is only for error
+                # quality; this lock is the race boundary.
                 cur.execute(
                     "SELECT work_status FROM work_tasks "
-                    "WHERE project = %s AND task_number = %s",
+                    "WHERE project = %s AND task_number = %s "
+                    "FOR UPDATE",
                     (project, task_number),
                 )
                 row = cur.fetchone()
@@ -2080,12 +2113,31 @@ class PgWorkService:
                 # Idempotency: a re-queue against an already-queued task
                 # is a no-op. The sqlite service has the same shape.
                 if current == to_state:
+                    conn.commit()
                     return self.get(task_id)
+                if current != from_state:
+                    raise InvalidTransitionError(
+                        f"Cannot transition task from '{current.value}' to "
+                        f"'{to_state.value}'; expected source state "
+                        f"'{from_state.value}'."
+                    )
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, updated_at = %s "
-                    "WHERE project = %s AND task_number = %s",
-                    (to_state.value, now, project, task_number),
+                    "WHERE project = %s AND task_number = %s "
+                    "AND work_status = %s",
+                    (
+                        to_state.value,
+                        now,
+                        project,
+                        task_number,
+                        from_state.value,
+                    ),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidTransitionError(
+                        f"Task '{task_id}' changed state during transition; "
+                        "retry the operation."
+                    )
                 cur.execute(
                     "INSERT INTO work_transitions ("
                     "task_project, task_number, from_state, to_state, "
@@ -3444,6 +3496,12 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                self._lock_task_transition_state(
+                    cur,
+                    task,
+                    expected_statuses=(from_status,),
+                    expected_node_id=task.current_node_id,
+                )
                 cur.execute(
                     "UPDATE work_node_executions SET status = %s, "
                     "work_output = %s::jsonb, completed_at = %s "
@@ -3459,6 +3517,11 @@ class PgWorkService:
                         ExecutionStatus.ACTIVE.value,
                     ),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidTransitionError(
+                        f"Task '{task_id}' no longer has an active "
+                        f"execution for node {task.current_node_id!r}."
+                    )
                 self._advance_to_node_locked(
                     cur, task, flow, node.next_node_id, actor, from_status
                 )
@@ -3621,6 +3684,12 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                self._lock_task_transition_state(
+                    cur,
+                    task,
+                    expected_statuses=(WorkStatus.REVIEW,),
+                    expected_node_id=task.current_node_id,
+                )
                 cur.execute(
                     "UPDATE work_node_executions SET status = %s, "
                     "decision = %s, decision_reason = %s, completed_at = %s "
@@ -3637,6 +3706,11 @@ class PgWorkService:
                         ExecutionStatus.ACTIVE.value,
                     ),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidTransitionError(
+                        f"Task '{task_id}' no longer has an active "
+                        f"review execution for node {task.current_node_id!r}."
+                    )
                 self._advance_to_node_locked(
                     cur, task, flow, node.next_node_id, actor, WorkStatus.REVIEW
                 )
@@ -3750,6 +3824,12 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                self._lock_task_transition_state(
+                    cur,
+                    task,
+                    expected_statuses=(WorkStatus.REVIEW,),
+                    expected_node_id=task.current_node_id,
+                )
                 cur.execute(
                     "UPDATE work_node_executions SET status = %s, "
                     "decision = %s, decision_reason = %s, completed_at = %s "
@@ -3766,11 +3846,18 @@ class PgWorkService:
                         ExecutionStatus.ACTIVE.value,
                     ),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidTransitionError(
+                        f"Task '{task_id}' no longer has an active "
+                        f"review execution for node {task.current_node_id!r}."
+                    )
                 reject_assignee = self._resolve_node_assignee(task, reject_target)
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, assignee = %s, "
                     "current_node_id = %s, updated_at = %s "
-                    "WHERE project = %s AND task_number = %s",
+                    "WHERE project = %s AND task_number = %s "
+                    "AND work_status = %s "
+                    "AND current_node_id IS NOT DISTINCT FROM %s",
                     (
                         WorkStatus.REWORK.value,
                         reject_assignee,
@@ -3778,8 +3865,15 @@ class PgWorkService:
                         now,
                         task.project,
                         task.task_number,
+                        WorkStatus.REVIEW.value,
+                        task.current_node_id,
                     ),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidTransitionError(
+                        f"Task '{task_id}' changed during rejection; "
+                        "retry the operation."
+                    )
                 visit = self._next_visit_locked(
                     cur, task.project, task.task_number, node.reject_node_id
                 )
@@ -3836,6 +3930,12 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                self._lock_task_transition_state(
+                    cur,
+                    task,
+                    expected_statuses=(old_status,),
+                    expected_node_id=task.current_node_id,
+                )
                 cur.execute(
                     "INSERT INTO work_task_dependencies "
                     "(from_project, from_task_number, to_project, "
@@ -3853,14 +3953,23 @@ class PgWorkService:
                 )
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, updated_at = %s "
-                    "WHERE project = %s AND task_number = %s",
+                    "WHERE project = %s AND task_number = %s "
+                    "AND work_status = %s "
+                    "AND current_node_id IS NOT DISTINCT FROM %s",
                     (
                         WorkStatus.BLOCKED.value,
                         now,
                         task.project,
                         task.task_number,
+                        old_status.value,
+                        task.current_node_id,
                     ),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidTransitionError(
+                        f"Task '{task_id}' changed during block; "
+                        "retry the operation."
+                    )
                 if task.current_node_id:
                     cur.execute(
                         "UPDATE work_node_executions SET status = %s "
@@ -5650,6 +5759,38 @@ class PgWorkService:
                     f"{node.agent_name}."
                 )
 
+    def _lock_task_transition_state(
+        self,
+        cur,
+        task: Task,
+        *,
+        expected_statuses: tuple[WorkStatus, ...],
+        expected_node_id: str | None | object = _ANY_NODE,
+    ) -> WorkStatus:
+        cur.execute(
+            "SELECT work_status, current_node_id FROM work_tasks "
+            "WHERE project = %s AND task_number = %s "
+            "FOR UPDATE",
+            (task.project, task.task_number),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise TaskNotFoundError(f"Task '{task.task_id}' not found.")
+        current = _coerce_status(str(row[0]))
+        current_node_id = row[1]
+        if current not in expected_statuses:
+            allowed = ", ".join(f"'{status.value}'" for status in expected_statuses)
+            raise InvalidTransitionError(
+                f"Cannot transition task in '{current.value}' state; "
+                f"expected {allowed}."
+            )
+        if expected_node_id is not _ANY_NODE and current_node_id != expected_node_id:
+            raise InvalidTransitionError(
+                f"Cannot transition task from node {current_node_id!r}; "
+                f"expected {expected_node_id!r}."
+            )
+        return current
+
     def _advance_to_node_locked(
         self,
         cur,
@@ -5672,9 +5813,23 @@ class PgWorkService:
             cur.execute(
                 "UPDATE work_tasks SET work_status = %s, "
                 "current_node_id = NULL, updated_at = %s "
-                "WHERE project = %s AND task_number = %s",
-                (WorkStatus.DONE.value, now, task.project, task.task_number),
+                "WHERE project = %s AND task_number = %s "
+                "AND work_status = %s "
+                "AND current_node_id IS NOT DISTINCT FROM %s",
+                (
+                    WorkStatus.DONE.value,
+                    now,
+                    task.project,
+                    task.task_number,
+                    from_status.value,
+                    task.current_node_id,
+                ),
             )
+            if cur.rowcount != 1:
+                raise InvalidTransitionError(
+                    f"Task '{task.task_id}' changed during flow advance; "
+                    "retry the operation."
+                )
             self._insert_transition_locked(
                 cur,
                 task.project,
@@ -5697,7 +5852,9 @@ class PgWorkService:
         cur.execute(
             "UPDATE work_tasks SET work_status = %s, assignee = %s, "
             "current_node_id = %s, updated_at = %s "
-            "WHERE project = %s AND task_number = %s",
+            "WHERE project = %s AND task_number = %s "
+            "AND work_status = %s "
+            "AND current_node_id IS NOT DISTINCT FROM %s",
             (
                 new_status.value,
                 next_assignee,
@@ -5705,8 +5862,15 @@ class PgWorkService:
                 now,
                 task.project,
                 task.task_number,
+                from_status.value,
+                task.current_node_id,
             ),
         )
+        if cur.rowcount != 1:
+            raise InvalidTransitionError(
+                f"Task '{task.task_id}' changed during flow advance; "
+                "retry the operation."
+            )
         cur.execute(
             "INSERT INTO work_node_executions "
             "(task_project, task_number, node_id, visit, status, started_at) "

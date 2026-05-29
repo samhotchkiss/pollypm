@@ -38,8 +38,8 @@ class InvariantViolationError(InvalidTransitionError):
     means the work-service refused to write a row to ``work_transitions``
     because the source/target states are known :class:`WorkStatus` values
     but the pair is not in :data:`pollypm.task_invariants.TASK_TRANSITION_TABLE`.
-    Issue #909 — invariant violations are now enforced at write time
-    rather than logged."""
+    Issue #909 — write paths that opt into the canonical table should
+    raise this instead of logging and continuing."""
 
 
 class ValidationError(WorkServiceError):

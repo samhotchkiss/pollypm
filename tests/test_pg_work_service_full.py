@@ -1538,6 +1538,24 @@ def test_mark_done_invokes_plan_review_backstop(pg_service, monkeypatch):
     assert calls == [(pg_service, task.task_id, "polly")]
 
 
+def test_simple_transition_rejects_stale_source_state(pg_service):
+    from pollypm.work.models import WorkStatus
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+
+    with pytest.raises(InvalidTransitionError):
+        pg_service._simple_transition(
+            task.task_id,
+            from_state=WorkStatus.IN_PROGRESS,
+            to_state=WorkStatus.DONE,
+            actor="race",
+        )
+
+    assert pg_service.get(task.task_id).work_status is WorkStatus.QUEUED
+
+
 def test_approve_done_invokes_plan_review_backstop(pg_service, monkeypatch):
     calls: list[tuple[object, str, str]] = []
 
@@ -1565,6 +1583,53 @@ def test_approve_done_invokes_plan_review_backstop(pg_service, monkeypatch):
     pg_service.approve(task.task_id, actor="bob")
 
     assert calls == [(pg_service, task.task_id, "bob")]
+
+
+def test_approve_rechecks_locked_status_before_advancing(
+    pg_service, monkeypatch,
+):
+    from pollypm.work.models import WorkStatus
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _drive_to_review(pg_service)
+    pg_service.node_done(
+        task.task_id,
+        actor="alice",
+        work_output={
+            "type": "code_change",
+            "summary": "implemented X",
+            "artifacts": [
+                {"kind": "commit", "description": "impl", "ref": "HEAD"}
+            ],
+        },
+    )
+    stale_review = pg_service.get(task.task_id)
+
+    with pg_service._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_tasks SET work_status = %s, updated_at = now() "
+            "WHERE project = %s AND task_number = %s",
+            (
+                WorkStatus.DONE.value,
+                stale_review.project,
+                stale_review.task_number,
+            ),
+        )
+        conn.commit()
+
+    real_get = pg_service.get
+
+    def stale_get(task_id):  # noqa: ANN001
+        if task_id == stale_review.task_id:
+            return stale_review
+        return real_get(task_id)
+
+    monkeypatch.setattr(pg_service, "get", stale_get)
+
+    with pytest.raises(InvalidTransitionError):
+        pg_service.approve(task.task_id, actor="bob")
+
+    assert real_get(task.task_id).work_status is WorkStatus.DONE
 
 
 def test_approve_from_non_review_raises(pg_service):

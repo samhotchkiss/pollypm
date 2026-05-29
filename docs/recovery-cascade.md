@@ -95,11 +95,12 @@ authority and triggered by a distinct condition.
   cancel, re-plan, change task assignments, file new tasks, escalate
   to Polly. The architect cannot reach into other projects or the
   global system.
-- **Escalates to tier 3/4 when:** the same `root_cause_hash` has
-  produced `AUTO_PROMOTE_THRESHOLD` (currently 3) tier-3 dispatches
-  inside `AUTO_PROMOTE_WINDOW_SECONDS` (currently 24h), or a tier-3
-  Polly explicitly self-promotes via `record_self_promote`. See
-  `audit/tier4.py` for the accounting.
+- **Escalates to tier 4 when:** the same `root_cause_hash` has
+  produced `AUTO_PROMOTE_THRESHOLD` (currently 3) architect/operator
+  dispatches inside `AUTO_PROMOTE_WINDOW_SECONDS` (currently 24h); the
+  next dispatch attempt routes to tier 4. Tier-3 Polly can also
+  explicitly self-promote via `record_self_promote`. See `audit/tier4.py`
+  for the accounting.
 
 ### Tier 4: Polly / operator (broader authority)
 
@@ -135,6 +136,8 @@ audit_watchdog cadence handler
     │   └─ tracker.record_tier3_dispatch (increments K-counter)
     │
     ├─ tier-3 operator dispatch  ──►  EVENT_WATCHDOG_OPERATOR_DISPATCHED
+    │   │
+    │   └─ tracker.record_tier3_dispatch (increments K-counter)
     │
     └─ tier-4 promotion          ──►  EVENT_TIER4_PROMOTED
                                       EVENT_WATCHDOG_OPERATOR_TIER4_DISPATCHED

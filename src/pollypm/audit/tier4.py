@@ -59,8 +59,9 @@ logger = logging.getLogger(__name__)
 # Tunable constants — first-pass values from the 2026-05-09 spec.
 # ---------------------------------------------------------------------------
 
-#: K — auto-promote threshold. The Kth tier-3 dispatch for the same
-#: root_cause_hash inside the window routes to tier-4 instead.
+#: K — auto-promote threshold. After K recorded tier-3 dispatches for the
+#: same root_cause_hash inside the window, the next dispatch routes to
+#: tier-4 instead.
 AUTO_PROMOTE_THRESHOLD = 3
 #: W — sliding window (in seconds) the auto-promote threshold reads from.
 AUTO_PROMOTE_WINDOW_SECONDS = 24 * 60 * 60
@@ -331,13 +332,10 @@ class Tier4PromotionTracker:
         """Return True iff the next dispatch should route to tier-4.
 
         Auto-promote fires when the trailing-window dispatch count is
-        already at or above ``auto_promote_threshold``. The convention:
-        the caller has already recorded the dispatch via
-        :meth:`record_tier3_dispatch` or hasn't yet — both shapes work
-        because we count strict ``>=`` and the caller chooses whether
-        to count this dispatch in the threshold or not. The recommended
-        flow is to call this BEFORE recording, so the Kth dispatch is
-        the one that gets promoted (not the K+1th).
+        already at or above ``auto_promote_threshold``. Dispatchers call
+        this before recording the current dispatch, so K recorded
+        dispatches promote the next dispatch (the K+1th attempt) rather
+        than rewriting the Kth dispatch after the fact.
         """
         rch = root_cause_hash(finding)
         state = self.get(rch)

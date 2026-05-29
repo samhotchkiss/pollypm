@@ -242,6 +242,47 @@ def _default_ps_runner() -> str:
 
 
 PsRunner = Callable[[], str]
+TmuxPanePidRunner = Callable[[], str]
+
+
+def _default_tmux_pane_pid_runner() -> str:
+    completed = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", "#{pane_pid}"],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed.stdout
+
+
+def _list_live_tmux_pane_pids(
+    *,
+    tmux_pane_pid_runner: TmuxPanePidRunner | None = None,
+) -> set[int] | None:
+    runner = tmux_pane_pid_runner or _default_tmux_pane_pid_runner
+    try:
+        raw = runner()
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("cockpit_pane_reaper: tmux pane pid probe failed: %s", exc)
+        return None
+    out: set[int] = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.add(int(line))
+        except ValueError:
+            continue
+    return out
 
 
 def _pid_alive(pid: int) -> bool:
@@ -347,8 +388,11 @@ def _emit_audit(
 def reap_orphan_cockpit_panes(
     *,
     ps_runner: PsRunner | None = None,
+    tmux_pane_pid_runner: TmuxPanePidRunner | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     current_uid: int | None = None,
+    min_age_s: int | None = None,
+    protect_live_tmux_panes: bool = False,
 ) -> list[ReapedCockpitPane]:
     """Sweep ``ps`` for orphan ``pollypm cockpit-pane`` processes and kill them.
 
@@ -364,14 +408,33 @@ def reap_orphan_cockpit_panes(
         current_uid: override for the ownership-guard UID (#1644).
             Defaults to :func:`os.geteuid`. Tests inject a synthetic
             uid so they can assert on the filter behaviour.
+        min_age_s: when set, skip matching processes whose observed
+            age is unknown or younger than this threshold.
+        protect_live_tmux_panes: when true, first read live tmux pane
+            PIDs and skip any cockpit-pane process that is still the
+            foreground process for a tmux pane. If the tmux probe is
+            unavailable, the sweep fails closed and reaps nothing.
 
     Returns:
         The list of :class:`ReapedCockpitPane` records for processes
         that were signalled, so the caller can log / count.
     """
     procs = _list_cockpit_pane_procs(ps_runner=ps_runner, current_uid=current_uid)
+    live_tmux_pids: set[int] | None = None
+    if protect_live_tmux_panes:
+        live_tmux_pids = _list_live_tmux_pane_pids(
+            tmux_pane_pid_runner=tmux_pane_pid_runner,
+        )
+        if live_tmux_pids is None:
+            return []
     reaped: list[ReapedCockpitPane] = []
     for proc in procs:
+        if min_age_s is not None and (
+            proc.age_s is None or proc.age_s < min_age_s
+        ):
+            continue
+        if live_tmux_pids is not None and proc.pid in live_tmux_pids:
+            continue
         signal_used = _terminate_with_grace(proc.pid, sleep_fn=sleep_fn)
         if signal_used in {"denied", "already_gone"}:
             # ``denied`` — not ours to kill (different user / privileged).

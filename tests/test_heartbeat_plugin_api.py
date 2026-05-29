@@ -1265,6 +1265,68 @@ def test_local_heartbeat_backend_clears_stale_unmanaged_window_alerts() -> None:
     assert ("heartbeat", "unmanaged_window:pollypm:e2e-sandbox") not in api.alerts
 
 
+def test_local_heartbeat_backend_reaps_persistent_unmanaged_dead_window() -> None:
+    class _Tmux:
+        def __init__(self) -> None:
+            self.killed: list[str] = []
+
+        def kill_window(self, target: str) -> None:
+            self.killed.append(target)
+
+    tmux = _Tmux()
+    api = FakeHeartbeatAPI(
+        [_context()],
+        unmanaged_windows=[
+            HeartbeatUnmanagedWindow(
+                tmux_session="pollypm",
+                window_name="worker-rogue",
+                pane_id="%9",
+                pane_command="zsh",
+                pane_dead=True,
+                pane_path="/workspace/sandbox",
+            )
+        ],
+    )
+    api.supervisor.session_service = SimpleNamespace(tmux=tmux)
+
+    LocalHeartbeatBackend().run(api)
+
+    assert tmux.killed == []
+
+    LocalHeartbeatBackend().run(api)
+
+    assert tmux.killed == ["%9"]
+    assert ("heartbeat", "unmanaged_window:pollypm:worker-rogue") not in api.alerts
+    assert any(
+        event_type == "unmanaged_window_reaped"
+        for _scope, event_type, _message in api.events
+    )
+
+
+def test_local_heartbeat_backend_runs_session_table_repair_on_cadence(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    LocalHeartbeatBackend._last_session_repair_at_by_root.clear()
+
+    api = FakeHeartbeatAPI([_context()])
+    api.supervisor.config = SimpleNamespace(
+        project=SimpleNamespace(root_dir=tmp_path, base_dir=tmp_path / ".pollypm"),
+        sessions={},
+        projects={},
+    )
+    api.supervisor.repair_sessions_table = lambda: calls.append("repair") or 2
+
+    LocalHeartbeatBackend().run(api)
+    LocalHeartbeatBackend().run(api)
+
+    assert calls == ["repair"]
+    assert any(
+        event_type == "session_table_repair"
+        for _scope, event_type, _message in api.events
+    )
+
+
 def test_local_heartbeat_backend_marks_stopped_pane_stuck() -> None:
     api = FakeHeartbeatAPI([
         _context(

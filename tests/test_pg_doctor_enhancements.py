@@ -258,10 +258,40 @@ def test_session_drift_warn(
     monkeypatch.setattr(
         doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-rogue"),
     )
+    monkeypatch.setattr(doctor, "_planned_session_window_names", lambda: set())
     result = doctor.check_sessions_table_vs_tmux()
     assert not result.passed
     assert result.severity == "warning"
     assert "worker-rogue" in result.status
+    assert result.fixable is False
+    assert result.fix_fn is None
+    assert result.data["orphan_drift"] == ["worker-rogue"]
+
+
+def test_session_drift_plan_window_stays_fixable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    db = _make_state_db(tmp_path / "state.db")
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db)
+    monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
+    monkeypatch.setattr(
+        doctor,
+        "_tool_path",
+        lambda name: "/usr/bin/tmux" if name == "tmux" else None,
+    )
+    monkeypatch.setattr(
+        doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-pollypm"),
+    )
+    monkeypatch.setattr(
+        doctor, "_planned_session_window_names", lambda: {"worker-pollypm"},
+    )
+
+    result = doctor.check_sessions_table_vs_tmux()
+
+    assert not result.passed
+    assert result.fixable is True
+    assert result.fix_fn is not None
+    assert result.data["repairable_drift"] == ["worker-pollypm"]
 
 
 def test_session_drift_skip_without_tmux(monkeypatch: pytest.MonkeyPatch) -> None:

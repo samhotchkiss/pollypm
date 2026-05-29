@@ -4155,6 +4155,14 @@ def check_sessions_table_vs_tmux() -> CheckResult:
     }
     drift = sorted(pollypm_windows - db_windows)
     if drift:
+        plan_windows = _planned_session_window_names()
+        if plan_windows is None:
+            repairable_drift = drift
+            orphan_drift: list[str] = []
+        else:
+            repairable_drift = [window for window in drift if window in plan_windows]
+            orphan_drift = [window for window in drift if window not in plan_windows]
+
         def _fix() -> tuple[bool, str]:
             try:
                 from pollypm.config import DEFAULT_CONFIG_PATH
@@ -4170,6 +4178,24 @@ def check_sessions_table_vs_tmux() -> CheckResult:
                 return (False, f"repair failed: {exc}")
 
         window_word = "window" if len(drift) == 1 else "windows"
+        if repairable_drift:
+            fix = (
+                "Re-run the supervisor session repair —\n"
+                "  pm doctor --fix   # invokes repair_sessions_table()\n"
+                "Or restart the cockpit:  pm up\n"
+                "Recheck: pm doctor"
+            )
+            fixable = True
+            fix_fn = _fix
+        else:
+            fix = (
+                "This drift window is absent from the active launch plan, "
+                "so repair_sessions_table() cannot safely back-fill it. "
+                "Remove the tmux window if it is stale, or restore the "
+                "matching session config and re-run pm doctor."
+            )
+            fixable = False
+            fix_fn = None
         return _fail(
             f"{len(drift)} tmux {window_word} without a sessions row: "
             f"{', '.join(drift[:5])}",
@@ -4179,17 +4205,14 @@ def check_sessions_table_vs_tmux() -> CheckResult:
                 "here means assignment routing will silently miss those "
                 "windows."
             ),
-            fix=(
-                "Re-run the supervisor session repair —\n"
-                "  pm doctor --fix   # invokes repair_sessions_table()\n"
-                "Or restart the cockpit:  pm up\n"
-                "Recheck: pm doctor"
-            ),
+            fix=fix,
             severity="warning",
-            fixable=True,
-            fix_fn=_fix,
+            fixable=fixable,
+            fix_fn=fix_fn,
             data={
                 "drift": drift,
+                "repairable_drift": repairable_drift,
+                "orphan_drift": orphan_drift,
                 "tmux_count": len(tmux_windows),
                 "db_count": len(db_windows),
             },
@@ -4199,6 +4222,20 @@ def check_sessions_table_vs_tmux() -> CheckResult:
         f"sessions table aligned with tmux ({len(db_windows)} {row_word})",
         data={"tmux_count": len(tmux_windows), "db_count": len(db_windows)},
     )
+
+
+def _planned_session_window_names() -> set[str] | None:
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH
+    except Exception:  # noqa: BLE001
+        return None
+    if not DEFAULT_CONFIG_PATH.exists():
+        return None
+    try:
+        supervisor = PollyPMService(DEFAULT_CONFIG_PATH).load_supervisor()
+        return {launch.window_name for launch in supervisor.plan_launches()}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def check_persona_swap_defense_wired() -> CheckResult:

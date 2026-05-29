@@ -794,6 +794,26 @@ class Supervisor:
         except Exception:  # noqa: BLE001
             _log.debug("Supervisor.start(): pm-usage-* sweep failed", exc_info=True)
 
+        try:
+            from pollypm.cockpit_pane_reaper import reap_orphan_cockpit_panes
+
+            reaped_panes = reap_orphan_cockpit_panes(
+                min_age_s=300,
+                protect_live_tmux_panes=True,
+            )
+            if reaped_panes:
+                pane_word = "pane" if len(reaped_panes) == 1 else "panes"
+                _log.info(
+                    "Supervisor.start(): reaped %d orphan cockpit %s",
+                    len(reaped_panes),
+                    pane_word,
+                )
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "Supervisor.start(): cockpit-pane reap failed",
+                exc_info=True,
+            )
+
     def stop(self) -> None:
         """Gracefully release Supervisor-owned resources.
 

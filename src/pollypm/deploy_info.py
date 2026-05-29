@@ -25,6 +25,7 @@ from urllib.parse import unquote, urlparse
 
 PACKAGE_NAME = "pollypm"
 PACKAGE_IMPORT_NAME = "pollypm"
+BUILD_INFO_FILENAME = "_build_info.json"
 _GIT_TIMEOUT_SECONDS = 1.0
 _STALE_CLOCK_SKEW_SECONDS = 60
 _EXCLUDED_DIRS = frozenset({"__pycache__", ".git", ".mypy_cache", ".pytest_cache"})
@@ -269,6 +270,23 @@ def _latest_package_mtime(root: Path | None) -> tuple[str | None, str | None]:
     return (_iso_from_mtime(latest[0]), str(latest[1]))
 
 
+def _embedded_build_info(package_path: Path | None) -> dict[str, str]:
+    if package_path is None:
+        return {}
+    path = package_path / BUILD_INFO_FILENAME
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        key: value
+        for key, value in parsed.items()
+        if isinstance(key, str) and isinstance(value, str) and value
+    }
+
+
 def _infer_stale(info: RuntimeBuildInfo) -> tuple[bool | None, str | None]:
     source_sha = info.source_git_sha
     served_sha = info.served_git_sha
@@ -310,10 +328,15 @@ def runtime_build_info(
     ) = _direct_url_fields(direct_url)
 
     served_git_root = _git_root(package_path)
+    embedded_build_info = _embedded_build_info(package_path)
     served_git_sha = _git_head(served_git_root) if served_git_root else None
     served_git_commit_time = (
         _git_head_time(served_git_root) if served_git_root else None
     )
+    if served_git_sha is None:
+        served_git_sha = embedded_build_info.get("git_sha")
+    if served_git_commit_time is None:
+        served_git_commit_time = embedded_build_info.get("git_commit_time")
     if served_git_sha is None and direct_url_vcs_commit_id:
         served_git_sha = direct_url_vcs_commit_id
 

@@ -1435,6 +1435,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         from pollypm.heartbeats.stall_classifier import (
             StallContext,
             classify_stall,
+            recently_nudged_from_message_store,
         )
         from pollypm.idle_placeholders import (
             pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
@@ -1442,10 +1443,16 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         )
 
         _pane_text = context.pane_text or ""
+        output_advanced = bool((context.transcript_delta or "").strip())
         stall_ctx = StallContext(
             role=context.role or "",
             session_name=context.session_name,
             has_pending_work=self._has_pending_work(api, context),
+            recently_nudged=recently_nudged_from_message_store(
+                getattr(getattr(api, "supervisor", None), "msg_store", None),
+                context.session_name,
+            ),
+            turn_in_flight=output_advanced,
             pane_is_idle_placeholder=_pane_is_idle_placeholder(_pane_text),
             awaiting_operator_question=_pane_ends_with_unanswered_question(_pane_text),
         )
@@ -1829,7 +1836,13 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     break
         return repeated
 
-    def _nudge_stalled_worker(self, api, context: HeartbeatSessionContext) -> None:
+    def _nudge_stalled_worker(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        *,
+        message: str | None = None,
+    ) -> None:
         """Send a targeted nudge to a stalled WORKER. Never targets the operator."""
         if context.role != "worker":
             return
@@ -1952,12 +1965,13 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             )
         # Context-aware nudge for the worker
         snippet = (context.pane_text or "").strip().splitlines()[-1][:80] if context.pane_text else ""
-        if "permission" in snippet.lower() or "approve" in snippet.lower():
-            message = "You appear stuck on a permissions prompt. Accept or work around it."
-        elif "error" in snippet.lower() or "failed" in snippet.lower():
-            message = "You hit an error. Read it carefully, fix the root cause, and continue."
-        else:
-            message = "State the remaining task in one sentence, execute the next step, and report."
+        if message is None:
+            if "permission" in snippet.lower() or "approve" in snippet.lower():
+                message = "You appear stuck on a permissions prompt. Accept or work around it."
+            elif "error" in snippet.lower() or "failed" in snippet.lower():
+                message = "You hit an error. Read it carefully, fix the root cause, and continue."
+            else:
+                message = "State the remaining task in one sentence, execute the next step, and report."
         self._send_worker_message(api, context, message, owner="heartbeat")
         try:
             from pollypm.events.summaries import (
@@ -2019,28 +2033,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         # Worker asking for permission → push forward
         proceed_signals = ["if you want", "shall i", "should i", "want me to", "i can do"]
         if any(sig in lowered for sig in proceed_signals):
-            self._send_worker_message(
+            self._nudge_stalled_worker(
                 api,
                 context,
-                "Yes, proceed. Do the next step you outlined.",
-                owner="heartbeat",
-            )
-            from pollypm.events.summaries import (
-                activity_summary,
-            )
-
-            api.supervisor.msg_store.append_event(
-                scope=context.session_name,
-                sender=context.session_name,
-                subject="heuristic_triage",
-                payload={
-                    "message": activity_summary(
-                        summary="Pushed forward: proceed signal detected",
-                        severity="routine",
-                        verb="triaged",
-                        subject=context.session_name,
-                    ),
-                },
+                message="Yes, proceed. Do the next step you outlined.",
             )
             return
 

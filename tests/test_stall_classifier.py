@@ -14,7 +14,11 @@ Regression targets tonight's reports:
 
 from __future__ import annotations
 
-from pollypm.heartbeats.stall_classifier import StallContext, classify_stall
+from pollypm.heartbeats.stall_classifier import (
+    StallContext,
+    classify_stall,
+    has_pending_work_for_session,
+)
 
 
 def _ctx(**kwargs) -> StallContext:
@@ -79,6 +83,15 @@ def test_worker_with_pending_work_and_no_user_gate_is_unrecoverable_stall() -> N
         classify_stall(_ctx(role="worker", has_pending_work=True, awaiting_user_action=False))
         == "unrecoverable_stall"
     )
+
+
+def test_has_pending_work_unresolved_session_fails_idle() -> None:
+    """Config-resolution misses mean there is no scoped queue to inspect."""
+    class _Config:
+        sessions = {}
+        projects = {}
+
+    assert has_pending_work_for_session(_Config(), "missing") is False
 
 
 def test_unknown_role_defaults_to_legitimate_idle() -> None:

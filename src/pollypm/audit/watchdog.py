@@ -36,9 +36,8 @@ Detection rules (each returns a list of :class:`Finding`):
    surface to the user via the empty-state affordance from #1340.)
 4. ``cancellation_no_promotion`` — ``task.status_changed`` to
    ``cancelled`` with no ``task.created`` for the same project in the
-   following ``cancel_grace_seconds`` window. Indicates a planning
-   stall after a self-cancel (savethenovel/1's class — a worker
-   self-cancels but Polly never queues a follow-up).
+   following ``cancel_grace_seconds`` window. Indicates observable
+   replacement work was not created after a self-cancel.
 5. ``task_progress_stale`` — a live task currently at ``in_progress``
    whose worker has produced no transition / heartbeat / task-context
    activity for longer than ``progress_stale_seconds``. Catches the
@@ -4154,15 +4153,12 @@ def _brief_cancellation_no_promotion(
     lines.append("")
     lines.append(
         "Your job: decide whether this cancellation ended the project "
-        "intentionally or left replacement work unqueued. Do not reply "
-        "with analysis alone; make the queue state explicit."
+        "or left replacement work unqueued. Do not reply with analysis "
+        "alone; make the queue state explicit."
     )
     lines.append(
-        f"Cli levers available: create and queue replacement work with "
-        f"`pm task create ...` then `pm task queue <replacement-task-id>`, "
-        f"or intentionally park the abandoned thread with "
-        f"`pm task context {subject} \"parked intentionally: <why>\"` "
-        f"plus cancel/hold for any remaining scoped task."
+        "Cli levers available: create and queue replacement work with "
+        "`pm task create ...` then `pm task queue <replacement-task-id>`."
     )
     return lines
 

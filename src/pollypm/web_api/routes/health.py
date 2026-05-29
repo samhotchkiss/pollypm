@@ -13,6 +13,7 @@ from functools import cache
 from fastapi import APIRouter, Request
 
 from pollypm.audit.log import SCHEMA_VERSION
+from pollypm.deploy_info import cached_runtime_build_info
 from pollypm.web_api.models import HealthResponse
 
 router = APIRouter(tags=["Health"])
@@ -59,4 +60,5 @@ async def get_health(request: Request) -> HealthResponse:
             "tailnet_trust" if tailnet_trust_enabled else "bearer_only"
         ),
         tailnet_trust_enabled=tailnet_trust_enabled,
+        build=cached_runtime_build_info().as_dict(),
     )

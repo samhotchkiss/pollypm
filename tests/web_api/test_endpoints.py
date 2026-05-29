@@ -25,6 +25,9 @@ def test_health_returns_status_ok(client) -> None:
     body = response.json()
     assert body["status"] == "ok"
     assert isinstance(body["schema_version"], int)
+    assert body["build"]["package_name"] == "pollypm"
+    assert "package_path" in body["build"]
+    assert "source_git_sha" in body["build"]
 
 
 def test_health_handler_stays_off_sync_threadpool(monkeypatch) -> None:

@@ -208,6 +208,10 @@ def test_extracted_doctor_modules_reexport_public_checks() -> None:
     assert plugins.check_builtin_plugin_manifests is doctor.check_builtin_plugin_manifests
     assert filesystem.check_disk_space is doctor.check_disk_space
     assert rendering.render_json is doctor.render_json
+    assert (
+        install_state.check_deploy_source_staleness
+        is doctor.check_deploy_source_staleness
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -251,6 +255,54 @@ def test_check_installed_version_matches(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(doctor, "_read_pyproject_version", lambda: installed)
     result = doctor.check_installed_version_matches_pyproject()
     assert result.passed
+
+
+def test_check_deploy_source_staleness_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pollypm import deploy_info
+
+    def _stale() -> deploy_info.DeployStaleness:
+        return deploy_info.DeployStaleness(
+            "stale",
+            "served package differs from the recorded source checkout",
+            "The installed package does not match source.",
+            {
+                "source_checkout": "/tmp/pollypm",
+                "package_path": "/tmp/tool/pollypm",
+                "source_digest": "aaa",
+                "package_digest": "bbb",
+            },
+        )
+
+    monkeypatch.setattr(deploy_info, "assess_deploy_staleness", _stale)
+
+    result = doctor.check_deploy_source_staleness()
+
+    assert not result.passed
+    assert result.severity == "warning"
+    assert "stale" in result.status or "differs" in result.status
+    assert "uv cache clean pollypm" in result.fix
+    assert "uv tool install --force --from /tmp/pollypm pollypm" in result.fix
+
+
+def test_check_deploy_source_staleness_skips_when_uncomparable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm import deploy_info
+
+    def _unknown() -> deploy_info.DeployStaleness:
+        return deploy_info.DeployStaleness(
+            "unknown",
+            "no local source checkout recorded for this install",
+            "No local checkout.",
+            {},
+        )
+
+    monkeypatch.setattr(deploy_info, "assess_deploy_staleness", _unknown)
+
+    result = doctor.check_deploy_source_staleness()
+
+    assert result.passed
+    assert result.skipped
 
 
 def test_check_config_file_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

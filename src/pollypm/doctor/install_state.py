@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+
 import pollypm.doctor as doctor
 
 
@@ -71,6 +73,46 @@ def check_installed_version_matches_pyproject() -> doctor.CheckResult:
             auto_fix=doctor._reinstall_editable_auto_fix("Reinstall the editable PollyPM package"),
         )
     return doctor._ok(f"pollypm {installed} matches pyproject", data={"version": installed})
+
+
+def check_deploy_source_staleness() -> doctor.CheckResult:
+    """Warn when a uv-tool copy is stale relative to its recorded checkout."""
+    try:
+        from pollypm.deploy_info import assess_deploy_staleness
+    except Exception as exc:  # noqa: BLE001
+        return doctor._skip(f"deploy-staleness check skipped (import failed: {exc})")
+
+    try:
+        status = assess_deploy_staleness()
+    except Exception as exc:  # noqa: BLE001
+        return doctor._skip(f"deploy-staleness check skipped ({exc})")
+
+    if status.state == "unknown":
+        return doctor._skip(status.status)
+    if status.state == "ok":
+        return doctor._ok(status.status, data=status.data)
+
+    source = status.data.get("source_checkout")
+    install_cmd = "uv tool install --force pollypm"
+    if isinstance(source, str) and source:
+        install_cmd = f"uv tool install --force --from {shlex.quote(source)} pollypm"
+    return doctor._fail(
+        status.status,
+        why=(
+            f"{status.reason} This can make a restarted `pm serve` keep "
+            "running old code even after the source checkout has advanced."
+        ),
+        fix=(
+            "Reinstall the uv tool from the current source checkout, then "
+            "restart any running pm serve process —\n"
+            "  uv cache clean pollypm\n"
+            f"  {install_cmd}\n"
+            "  pm serve stop && pm serve start   # launchd-managed server\n"
+            "Recheck: pm doctor"
+        ),
+        severity="warning",
+        data=status.data,
+    )
 
 
 def check_config_file() -> doctor.CheckResult:

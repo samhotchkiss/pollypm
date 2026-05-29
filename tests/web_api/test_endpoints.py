@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -81,6 +81,28 @@ def test_list_projects_tracked_filter(api_config, client, auth_headers) -> None:
     assert response.status_code == 200
     keys = [item["key"] for item in response.json()["items"]]
     assert keys == ["myproj"]
+
+
+def test_project_metrics_normalize_last_activity_at(api_config) -> None:
+    from pollypm.web_api import service as api_service
+
+    project = api_config.projects["myproj"]
+    local_activity = datetime(
+        2026, 5, 29, 7, 59, 10, tzinfo=timezone(timedelta(hours=-6))
+    )
+
+    row = api_service._project_to_api_from_metrics(
+        api_config,
+        "myproj",
+        project,
+        counts={},
+        pending_plan_review=False,
+        open_inbox_count=0,
+        last_activity_at=local_activity,
+    )
+
+    assert row.last_activity_at == datetime(2026, 5, 29, 13, 59, 10, tzinfo=UTC)
+    assert row.last_activity_at.tzinfo is UTC
 
 
 def test_list_projects_search_sort_and_activity(

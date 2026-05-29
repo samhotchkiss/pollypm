@@ -1044,7 +1044,7 @@ def _project_to_api_from_metrics(
         task_counts=counts,
         open_inbox_count=open_inbox_count,
         pending_plan_review=pending_plan_review,
-        last_activity_at=last_activity_at,
+        last_activity_at=_as_aware_datetime(last_activity_at),
     )
 
 
@@ -3706,7 +3706,7 @@ def _task_to_summary(task, *, project_paused: bool | None = None) -> APITaskSumm
         state_entered_at=timing["state_entered_at"],
         dwell_seconds=timing["dwell_seconds"],
         age_seconds=timing["age_seconds"],
-        updated_at=getattr(task, "updated_at", None),
+        updated_at=_as_aware_datetime(getattr(task, "updated_at", None)),
         project_paused=project_paused,
     )
 

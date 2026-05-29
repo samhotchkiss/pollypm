@@ -1284,6 +1284,63 @@ test.describe("surfaces", () => {
     await expect(page.locator("#activity-feed")).toContainText("watchdog.warning");
   });
 
+  test("activity panel keeps feed when stats are partial", async ({ page }) => {
+    await stubEmptyProjects(page);
+    await stubEmptySessions(page);
+    await stubEmptyTasks(page);
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(0)),
+      }),
+    );
+    await page.route("**/api/v1/audit/stats**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          total: 1,
+          by_event: { "task.created": 1 },
+          by_severity: { ok: 1 },
+          since: "2026-05-21T00:00:00Z",
+          _truncated_by_deadline: true,
+          _lines_scanned: 42,
+        }),
+      }),
+    );
+    await page.route("**/api/v1/audit/grep**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          events: [
+            {
+              schema: 1,
+              ts: "2026-05-23T00:00:00Z",
+              project: "demo",
+              event: "task.created",
+              subject: "demo/9",
+              actor: "polly",
+              status: "ok",
+              metadata: {},
+            },
+          ],
+          next_cursor: null,
+        }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    await expect(page.locator("#activity-feed")).toContainText("task.created");
+    await expect(page.locator("#activity-summary")).toContainText(
+      "stats partial after scanning 42 lines",
+    );
+    await expect(page.locator("#activity-feed")).not.toContainText(
+      "activity unavailable",
+    );
+  });
+
   test("audit panel expands and queries current surface scope", async ({ page }) => {
     await page.route("**/api/v1/chat/*/messages*", (route) =>
       route.fulfill({

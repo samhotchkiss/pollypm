@@ -670,6 +670,52 @@ def test_stats_default_deadline_matches_ui_budget(
     assert captured == {"deadline_s": 2.5}
 
 
+def test_audit_stats_reuses_short_lived_cache(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated activity stats calls should not re-walk unchanged logs."""
+    from pollypm.audit.query import AuditStatsAggregate
+    from pollypm.web_api.routes import audit as audit_routes
+
+    audit_routes._STATS_CACHE.clear()
+    calls = {"count": 0}
+
+    def fake_aggregate_recent_stats(**kwargs):
+        calls["count"] += 1
+        return AuditStatsAggregate(
+            total=3,
+            by_event={"task.done": 3},
+            by_severity={"ok": 3},
+            lines_scanned=9,
+        )
+
+    monkeypatch.setattr(
+        audit_routes,
+        "aggregate_recent_stats",
+        fake_aggregate_recent_stats,
+    )
+    params = {"project": "myproj", "since": "24h"}
+    first = client.get(
+        "/api/v1/audit/stats",
+        params=params,
+        headers=auth_headers,
+    )
+    second = client.get(
+        "/api/v1/audit/stats",
+        params=params,
+        headers=auth_headers,
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["total"] == 3
+    assert second.json()["total"] == 3
+    assert calls == {"count": 1}
+
+
 # ---------------------------------------------------------------------------
 # Round-2 guardrails (Codex review on PR #2062): ReDoS, malformed rows,
 # unbounded stats. See module docstring in

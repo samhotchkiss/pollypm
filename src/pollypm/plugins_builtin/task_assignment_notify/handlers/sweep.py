@@ -116,8 +116,10 @@ _AUTO_CLAIM_EVENT_SKIPPED_PLAN_MISSING = "auto_claim_skipped_plan_missing"
 _AUTO_CLAIM_EVENT_FAILED = "auto_claim_failed"
 _AUTO_CLAIM_EVENT_CIRCUIT_BREAKER = "auto_claim_circuit_breaker"
 _AUTO_CLAIM_EVENT_SKIPPED_PAUSED = "auto_claim_skipped_paused"
+_AUTO_CLAIM_EVENT_SKIPPED_UNSPAWNABLE = "auto_claim_skipped_unspawnable_project"
 TMUX_WINDOW_PROBE_UNAVAILABLE_ALERT_TYPE = "tmux_window_probe_unavailable"
 TMUX_WINDOW_PROBE_UNAVAILABLE_THRESHOLD = 3
+PROJECT_PATH_UNSPAWNABLE_ALERT_TYPE = "project_path_unspawnable"
 
 # Work statuses the sweeper cares about — those where a machine actor is
 # the expected next mover. ``in_progress`` / ``rework`` are gated on an
@@ -1438,6 +1440,76 @@ def _pause_store(services: Any) -> Any | None:
     )
 
 
+def _worker_project_session_name(project_key: str) -> str:
+    candidates = role_candidate_names("worker", project_key)
+    return candidates[0] if candidates else f"worker-{project_key}"
+
+
+def _project_path_spawnability(project_path: Path) -> tuple[bool, str]:
+    try:
+        if not project_path.exists():
+            return False, f"project path does not exist: {project_path}"
+        if not (project_path / ".git").exists():
+            return False, f"project path is not a git checkout: {project_path}"
+    except OSError as exc:
+        return False, f"project path cannot be inspected: {exc}"
+    return True, ""
+
+
+def _emit_project_path_unspawnable_alert(
+    services: Any,
+    *,
+    project_key: str,
+    task_id: str,
+    project_path: Path,
+    reason: str,
+) -> None:
+    store = _pause_store(services)
+    if store is None:
+        return
+    scope = _worker_project_session_name(project_key)
+    message = (
+        f"Auto-claim skipped task {task_id} because the registered "
+        f"project path cannot host a per-task worker: {reason}. "
+        "Fix the project registration or clone/restore the git checkout, "
+        "then rerun the sweep or claim the task manually."
+    )
+    try:
+        store.upsert_alert(
+            scope,
+            PROJECT_PATH_UNSPAWNABLE_ALERT_TYPE,
+            "warn",
+            message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_auto_claim: upsert_alert(%s) failed for %s",
+            PROJECT_PATH_UNSPAWNABLE_ALERT_TYPE,
+            scope,
+            exc_info=True,
+        )
+
+
+def _clear_project_path_unspawnable_alert(
+    services: Any,
+    *,
+    project_key: str,
+) -> None:
+    store = _pause_store(services)
+    if store is None:
+        return
+    scope = _worker_project_session_name(project_key)
+    try:
+        store.clear_alert(scope, PROJECT_PATH_UNSPAWNABLE_ALERT_TYPE)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_auto_claim: clear_alert(%s) failed for %s",
+            PROJECT_PATH_UNSPAWNABLE_ALERT_TYPE,
+            scope,
+            exc_info=True,
+        )
+
+
 def _skip_if_task_worker_paused(
     services: Any,
     *,
@@ -2260,6 +2332,41 @@ def _auto_claim_next(
             },
         )
         return
+
+    project_path_obj = Path(project_path)
+    spawnable, unspawnable_reason = _project_path_spawnability(project_path_obj)
+    if not spawnable:
+        totals["by_outcome"][_AUTO_CLAIM_EVENT_SKIPPED_UNSPAWNABLE] = (
+            totals["by_outcome"].get(
+                _AUTO_CLAIM_EVENT_SKIPPED_UNSPAWNABLE,
+                0,
+            )
+            + 1
+        )
+        _emit_project_path_unspawnable_alert(
+            services,
+            project_key=project_key,
+            task_id=task_id,
+            project_path=project_path_obj,
+            reason=unspawnable_reason,
+        )
+        _emit_auto_claim_audit(
+            services,
+            project=project,
+            task=target,
+            outcome=_AUTO_CLAIM_EVENT_SKIPPED_UNSPAWNABLE,
+            status="warn",
+            metadata={
+                "reason": unspawnable_reason,
+                "active_workers_before": len(active),
+                "cap": cap,
+                "project_path": str(project_path_obj),
+            },
+        )
+        return
+    _clear_project_path_unspawnable_alert(
+        services, project_key=project_key,
+    )
 
     # Gate: plan must be approved before we can claim for the project.
     # Run this after finding a real queued candidate so a closed gate

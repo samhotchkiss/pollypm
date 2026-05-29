@@ -118,6 +118,11 @@ class _StubTask:
     assignee: str | None = None
     updated_at: datetime | None = None
     created_at: datetime | None = None
+    created_by: str | None = None
+    title: str | None = None
+    description: str | None = None
+    labels: tuple[str, ...] = ()
+    kind: str | None = None
 
     @property
     def work_status(self) -> _StubStatus:
@@ -569,6 +574,42 @@ def test_queue_without_motion_fires_when_no_recent_activity(
     assert f.evidence["queued_subjects"] == ["demo/4"]
     # The probe captures threshold info for downstream prompts.
     assert f.evidence["threshold_seconds"] == 600
+
+
+def test_queue_without_motion_silent_when_operator_draft_already_exists(
+    now: datetime,
+) -> None:
+    cfg = WatchdogConfig(queue_motion_threshold_seconds=600)
+    queued = _StubTask(
+        project="demo",
+        task_number=4,
+        work_status_str="queued",
+        executions=[],
+        updated_at=now - timedelta(hours=2),
+    )
+    existing_operator_draft = _StubTask(
+        project="demo",
+        task_number=99,
+        work_status_str="draft",
+        executions=[],
+        created_by="audit_watchdog",
+        title=(
+            "Project demo has 1 queued task(s) but no claim / execution / "
+            "status-change activity for the entire scan window."
+        ),
+        labels=("notify", "watchdog", "notify_message:123"),
+        kind="watchdog_operator_dispatch",
+    )
+
+    findings = scan_events(
+        [],
+        now=now,
+        config=cfg,
+        open_tasks=[queued, existing_operator_draft],
+        project="demo",
+    )
+
+    assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
 
 
 def test_queue_without_motion_silent_for_pollypm_meta_project(

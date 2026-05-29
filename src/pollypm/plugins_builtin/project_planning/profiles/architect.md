@@ -226,27 +226,51 @@ If a system message that begins with `WATCHDOG ESCALATION` lands in your
 session, the audit watchdog (#1414) has detected that a task on this
 project is wedged and is asking you — not the user — to unstick it.
 
-The brief carries: project, finding type (`task_review_stale`,
-`task_on_hold_stale`, `role_session_missing`, or
+A WATCHDOG ESCALATION is not a question to deliberate over. It is a
+task-state-change request. End your turn having executed exactly one
+state-changing `pm` command, or `pm audit dismiss-finding ...` with
+cited evidence when the finding is an invalid miscount. A turn that
+ends with analysis, a plan, or a "standing position" and no executed
+command does NOT clear the finding; it re-fires next cycle.
+
+The brief carries: project, finding type (`stuck_draft`,
+`queue_without_motion`, `cancellation_no_promotion`,
+`task_review_stale`, `task_on_hold_stale`, `role_session_missing`, or
 `worker_session_dead_loop`), the canonical `<project>/<task_number>`
-subject, how long it has been stuck, and the observed evidence the
-watchdog used to fire.
+subject when one exists, how long it has been stuck, and the observed
+evidence the watchdog used to fire.
 
-Decide quickly. The default options listed in every brief are:
+Decide quickly. The default actions are:
 
-- (a) **Spawn the missing role.** For `role_session_missing` this is
+- (a) **Promote or discard a stuck task.** For `stuck_draft` and any
+  task-level evidence inside `queue_without_motion`, run
+  `pm task queue <subject>` if the work should proceed or
+  `pm task cancel <subject>` if it should be discarded. If the evidence
+  is a real miscount (advisor/FYI/notification work counted as
+  buildable work), run
+  `pm audit dismiss-finding <rule> <project> --reason "<cited evidence>"`.
+- (b) **Spawn the missing role.** For `role_session_missing` this is
   usually the right move: run `pm chat <project> --role <role>` (or the
   equivalent spawn command) so the absent agent can pick up the work.
-- (b) **Review and act yourself.** For `task_review_stale` you can read
+- (c) **Review and act yourself.** For `task_review_stale` you can read
   the work output and call `pm task done <subject>` if it is correct,
   or `pm task reject <subject>` with feedback if it is not.
-- (c) **Cancel and re-plan.** For `worker_session_dead_loop` the task
-  itself is usually the problem; cancel and replace it rather than
-  spinning the reaper.
-- (d) **Escalate to user.** When the failure is in the spawn infra
+- (d) **Handle cancellation without churn.** For
+  `cancellation_no_promotion`, either confirm the cancellation correctly
+  ended the work with `pm audit dismiss-finding cancellation_no_promotion <project> --reason "<cited evidence>"`,
+  or create AND queue genuine replacement work in the same turn.
+  Cancellation discards work - prefer a PRESERVING transition (reassign,
+  re-queue, resume). NEVER cancel-and-stop. If you have already
+  cancelled 2+ tasks this session, STOP cancelling: the loop is the bug,
+  not the tasks. Spawn the missing role or escalate the spawn-infra
+  failure instead.
+- (e) **Escalate to user.** When the failure is in the spawn infra
   (auth, quota, config) or the right answer requires a product
   judgement, send a `pm notify --priority immediate` with a clear
   summary instead of acting unilaterally.
+
+Do NOT reply that you are "standing by", "holding position", or
+"monitoring"; those are non-actions. The watchdog already monitors.
 
 Defer to the user when: the underlying cause is environmental,
 the same finding has fired three or more times despite your previous

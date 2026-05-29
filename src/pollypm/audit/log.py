@@ -150,6 +150,7 @@ EVENT_WATCHDOG_ESCALATION_DISPATCHED = "watchdog.escalation_dispatched"
 # task creation succeeded) so forensic reads can correlate with the
 # inbox row directly.
 EVENT_WATCHDOG_OPERATOR_DISPATCHED = "watchdog.operator_dispatched"
+EVENT_AUDIT_FINDING_DISMISSED = "audit.finding_dismissed"
 # #1546 — fires when the operator-dispatch leg attempted an inbox
 # write but the write raised. Carries the same ``finding_type`` /
 # ``subject`` metadata as ``EVENT_WATCHDOG_OPERATOR_DISPATCHED`` so
@@ -901,6 +902,42 @@ def audit_record_agent_refusal(
     )
 
 
+def audit_record_finding_dismissed(
+    *,
+    rule: str,
+    project: str,
+    reason: str,
+    actor: str = "agent",
+    source: str = "watchdog",
+    project_path: Path | str | None = None,
+) -> None:
+    """Record an agent judgment that a watchdog finding is a false positive."""
+    clean_rule = str(rule or "").strip()
+    clean_project = str(project or "").strip()
+    clean_reason = str(reason or "").strip()
+    clean_actor = str(actor or "").strip() or "agent"
+    clean_source = str(source or "").strip() or "watchdog"
+    metadata = {
+        "rule": clean_rule,
+        "reason": clean_reason,
+        "source": clean_source,
+        "scope": "project",
+        "summary": (
+            f"Dismissed {clean_rule} for project {clean_project}: "
+            f"{clean_reason[:160]}"
+        ),
+    }
+    emit(
+        event=EVENT_AUDIT_FINDING_DISMISSED,
+        project=clean_project,
+        subject=clean_rule,
+        actor=clean_actor,
+        status="ok",
+        metadata=metadata,
+        project_path=project_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reader
 # ---------------------------------------------------------------------------
@@ -1243,6 +1280,7 @@ __all__ = [
     "EVENT_WORKER_SESSION_REAPED",
     "EVENT_WATCHDOG_ESCALATION_DISPATCHED",
     "EVENT_WATCHDOG_OPERATOR_DISPATCHED",
+    "EVENT_AUDIT_FINDING_DISMISSED",
     "EVENT_WATCHDOG_TIER3_DISPATCH_FAILED",
     "EVENT_WATCHDOG_WORKER_LANE_SPAWNED",
     "EVENT_WATCHDOG_WORKER_LANE_FAILED",
@@ -1272,6 +1310,7 @@ __all__ = [
     "AGENT_REFUSAL_REASONS",
     "AuditEvent",
     "audit_record_agent_refusal",
+    "audit_record_finding_dismissed",
     "central_log_path",
     "emit",
     "project_log_path",

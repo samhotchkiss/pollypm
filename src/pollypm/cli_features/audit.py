@@ -41,9 +41,11 @@ from pollypm.audit.query import (
 from pollypm.audit.log import (
     AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM,
     AGENT_REFUSAL_REASONS,
+    EVENT_AUDIT_FINDING_DISMISSED,
     EVENT_AGENT_INJECTION_FLAGGED,
     EVENT_AGENT_REFUSAL,
     audit_record_agent_refusal,
+    audit_record_finding_dismissed,
 )
 from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH
@@ -182,12 +184,12 @@ def _validate_agent_refusal_reason(value: str) -> str:
     return reason
 
 
-def _resolve_agent_refusal_project_path(
+def _resolve_project_path(
     *,
     project: str,
     config_path: Path,
 ) -> Path | None:
-    """Best-effort project-root lookup for the refusal audit command."""
+    """Best-effort project-root lookup for audit writer commands."""
     if not project or project == "_workspace":
         return None
     try:
@@ -200,6 +202,13 @@ def _resolve_agent_refusal_project_path(
     if known is None:
         return None
     return known.path
+
+
+def _validate_nonempty_token(value: str, *, field: str) -> str:
+    clean = str(value or "").strip()
+    if not clean:
+        raise typer.BadParameter(f"{field} must not be empty")
+    return clean
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +260,7 @@ def audit_agent_refusal(
     ),
 ) -> None:
     clean_reason = _validate_agent_refusal_reason(reason)
-    project_path = _resolve_agent_refusal_project_path(
+    project_path = _resolve_project_path(
         project=project,
         config_path=config_path,
     )
@@ -267,6 +276,67 @@ def audit_agent_refusal(
         "recorded "
         f"{EVENT_AGENT_INJECTION_FLAGGED} and {EVENT_AGENT_REFUSAL} "
         f"for {project or '_workspace'}"
+    )
+
+
+@audit_app.command(
+    "dismiss-finding",
+    help=(
+        "Record that a watchdog finding is an invalid project-scoped "
+        "miscount. The watchdog treats the resulting audit.finding_dismissed "
+        "event as a terminal resolution for that rule/project pair."
+    ),
+)
+def audit_dismiss_finding(
+    rule: str = typer.Argument(
+        ...,
+        help="Watchdog finding rule to dismiss, such as stuck_draft.",
+    ),
+    project: str = typer.Argument(
+        ...,
+        help="Project key whose finding should be suppressed.",
+    ),
+    reason: str = typer.Option(
+        ...,
+        "--reason",
+        help="Cited evidence for why the finding is invalid/non-actionable.",
+    ),
+    actor: str = typer.Option(
+        "agent",
+        "--actor",
+        help="Agent/session label recording the dismissal.",
+    ),
+    source: str = typer.Option(
+        "watchdog",
+        "--source",
+        help="Short source label such as watchdog or operator.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH,
+        "--config",
+        help="PollyPM config path.",
+    ),
+) -> None:
+    clean_rule = _validate_nonempty_token(rule, field="rule")
+    clean_project = _validate_nonempty_token(project, field="project")
+    clean_reason = _validate_nonempty_token(reason, field="--reason")
+    clean_actor = str(actor or "").strip() or "agent"
+    clean_source = str(source or "").strip() or "watchdog"
+    project_path = _resolve_project_path(
+        project=clean_project,
+        config_path=config_path,
+    )
+    audit_record_finding_dismissed(
+        rule=clean_rule,
+        project=clean_project,
+        reason=clean_reason,
+        actor=clean_actor,
+        source=clean_source,
+        project_path=project_path,
+    )
+    typer.echo(
+        f"recorded {EVENT_AUDIT_FINDING_DISMISSED} "
+        f"for {clean_project}/{clean_rule}"
     )
 
 

@@ -844,7 +844,7 @@ def test_format_unstick_brief_cancellation_no_promotion_is_decisive() -> None:
     assert "in_progress -> cancelled" in brief
     assert "No later task.created" in brief
     assert "queue replacement work" in brief
-    assert "intentionally park" in brief
+    assert "intentionally park" not in brief
     assert "Do not reply with analysis alone" in brief
 
 
@@ -1701,7 +1701,7 @@ def test_cadence_handler_dispatches_cancellation_no_promotion(
     assert target == "pollypm-storage-closet:architect-savethenovel"
     assert RULE_CANCEL_NO_PROMOTION in brief
     assert "queue replacement work" in brief
-    assert "intentionally park" in brief
+    assert "intentionally park" not in brief
 
     rows = [
         json.loads(line)

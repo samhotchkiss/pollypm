@@ -122,6 +122,153 @@ def test_supervisor_alert_helper_updates_and_nudges(monkeypatch, tmp_path: Path)
         "pollypm.heartbeats.stall_classifier.has_pending_work_for_session",
         lambda config, session_name: True,
     )
+    monkeypatch.setattr(
+        "pollypm.heartbeats.stall_classifier.recently_nudged_from_message_store",
+        lambda msg_store, session_name: False,
+    )
+    monkeypatch.setattr(_supervisor_alerts, "_build_task_nudge", lambda *_args: None)
+
+    alerts = _supervisor_alerts._update_alerts(
+        supervisor,
+        launch,
+        window,
+        pane_text="Still stalled",
+        previous_log_bytes=200,
+        previous_snapshot_hash="same-hash",
+        current_log_bytes=200,
+        current_snapshot_hash="same-hash",
+    )
+
+    assert "suspected_loop" in alerts
+    assert sent == [("worker", Supervisor._STALL_NUDGE_MESSAGE, False)]
+
+
+def test_supervisor_alert_helper_recent_nudge_is_transient(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+    window = TmuxWindow(
+        session=supervisor.storage_closet_session_name(),
+        index=1,
+        name="worker-pollypm",
+        active=False,
+        pane_id="%42",
+        pane_current_command="codex",
+        pane_current_path=str(tmp_path),
+        pane_dead=False,
+    )
+
+    for index in range(4):
+        supervisor.store.record_heartbeat(
+            session_name="worker",
+            tmux_window=window.name,
+            pane_id=window.pane_id,
+            pane_command=window.pane_current_command,
+            pane_dead=False,
+            log_bytes=100 + index,
+            snapshot_path=str(tmp_path / f"snapshot-{index}.txt"),
+            snapshot_hash="same-hash",
+        )
+    supervisor.store.record_heartbeat(
+        session_name="worker",
+        tmux_window=window.name,
+        pane_id=window.pane_id,
+        pane_command=window.pane_current_command,
+        pane_dead=False,
+        log_bytes=200,
+        snapshot_path=str(tmp_path / "snapshot-current.txt"),
+        snapshot_hash="same-hash",
+    )
+    supervisor.msg_store.append_event(
+        scope="worker",
+        sender="worker",
+        subject="nudge",
+        payload={"snapshot_hash": "same-hash"},
+    )
+
+    sent: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        supervisor,
+        "send_input",
+        lambda session_name, text, owner="pollypm", force=False, press_enter=True: sent.append(
+            (session_name, text, force)
+        ),
+    )
+    monkeypatch.setattr(
+        "pollypm.heartbeats.stall_classifier.has_pending_work_for_session",
+        lambda config, session_name: True,
+    )
+
+    alerts = _supervisor_alerts._update_alerts(
+        supervisor,
+        launch,
+        window,
+        pane_text="Still stalled",
+        previous_log_bytes=200,
+        previous_snapshot_hash="same-hash",
+        current_log_bytes=200,
+        current_snapshot_hash="same-hash",
+    )
+
+    assert "suspected_loop" not in alerts
+    assert sent == []
+
+
+def test_supervisor_alert_helper_log_growth_is_transient(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+    window = TmuxWindow(
+        session=supervisor.storage_closet_session_name(),
+        index=1,
+        name="worker-pollypm",
+        active=False,
+        pane_id="%42",
+        pane_current_command="codex",
+        pane_current_path=str(tmp_path),
+        pane_dead=False,
+    )
+
+    for index in range(4):
+        supervisor.store.record_heartbeat(
+            session_name="worker",
+            tmux_window=window.name,
+            pane_id=window.pane_id,
+            pane_command=window.pane_current_command,
+            pane_dead=False,
+            log_bytes=100 + index,
+            snapshot_path=str(tmp_path / f"snapshot-{index}.txt"),
+            snapshot_hash="same-hash",
+        )
+    supervisor.store.record_heartbeat(
+        session_name="worker",
+        tmux_window=window.name,
+        pane_id=window.pane_id,
+        pane_command=window.pane_current_command,
+        pane_dead=False,
+        log_bytes=200,
+        snapshot_path=str(tmp_path / "snapshot-current.txt"),
+        snapshot_hash="same-hash",
+    )
+
+    sent: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        supervisor,
+        "send_input",
+        lambda session_name, text, owner="pollypm", force=False, press_enter=True: sent.append(
+            (session_name, text, force)
+        ),
+    )
+    monkeypatch.setattr(
+        "pollypm.heartbeats.stall_classifier.has_pending_work_for_session",
+        lambda config, session_name: True,
+    )
 
     alerts = _supervisor_alerts._update_alerts(
         supervisor,
@@ -134,8 +281,8 @@ def test_supervisor_alert_helper_updates_and_nudges(monkeypatch, tmp_path: Path)
         current_snapshot_hash="same-hash",
     )
 
-    assert "suspected_loop" in alerts
-    assert sent == [("worker", Supervisor._STALL_NUDGE_MESSAGE, False)]
+    assert "suspected_loop" not in alerts
+    assert sent == []
 
 
 def test_supervisor_wrapper_delegates_alert_helper(monkeypatch, tmp_path: Path) -> None:

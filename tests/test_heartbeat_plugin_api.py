@@ -1322,6 +1322,64 @@ def test_worker_nudge_skips_repeat_for_same_snapshot_episode(monkeypatch) -> Non
     assert len(nudge_events) == 1
 
 
+def test_same_snapshot_recent_nudge_classifies_transient(monkeypatch) -> None:
+    backend = LocalHeartbeatBackend()
+    api = FakeHeartbeatAPI(
+        [],
+        hashes={"worker_demo": ["hash-1"] * 3},
+    )
+    context = _context(
+        session_name="worker_demo",
+        transcript_delta="",
+        pane_text="Still stalled",
+        previous_snapshot_hash="hash-1",
+        snapshot_hash="hash-1",
+    )
+    monkeypatch.setattr(backend, "_has_pending_work", lambda *_args: True)
+    api.supervisor.msg_store.append_event(
+        scope=context.session_name,
+        sender=context.session_name,
+        subject="nudge",
+        payload={"snapshot_hash": "hash-1"},
+    )
+
+    alerts = backend._handle_same_snapshot_stall(
+        api,
+        context,
+        mechanical_only=False,
+    )
+
+    assert alerts == []
+    assert api.alerts == {}
+    assert api.messages == []
+
+
+def test_same_snapshot_transcript_delta_classifies_transient(monkeypatch) -> None:
+    backend = LocalHeartbeatBackend()
+    api = FakeHeartbeatAPI(
+        [],
+        hashes={"worker_demo": ["hash-1"] * 3},
+    )
+    context = _context(
+        session_name="worker_demo",
+        transcript_delta="Still applying edits.",
+        pane_text="Still stalled",
+        previous_snapshot_hash="hash-1",
+        snapshot_hash="hash-1",
+    )
+    monkeypatch.setattr(backend, "_has_pending_work", lambda *_args: True)
+
+    alerts = backend._handle_same_snapshot_stall(
+        api,
+        context,
+        mechanical_only=False,
+    )
+
+    assert alerts == []
+    assert api.alerts == {}
+    assert api.messages == []
+
+
 def test_worker_nudge_escalates_when_same_episode_keeps_repeating(monkeypatch) -> None:
     backend = LocalHeartbeatBackend()
     api = FakeHeartbeatAPI(
@@ -1358,6 +1416,44 @@ def test_worker_nudge_escalates_when_same_episode_keeps_repeating(monkeypatch) -
     ]
     assert len(escalations) == 1
     assert escalations[0]["payload"]["snapshot_hash"] == "hash-1"
+
+
+def test_triage_proceed_signal_uses_nudge_ladder(monkeypatch) -> None:
+    backend = LocalHeartbeatBackend()
+    api = FakeHeartbeatAPI(
+        [],
+        hashes={"worker_demo": ["hash-1"] * 8},
+    )
+    context = _context(
+        session_name="worker_demo",
+        transcript_delta="",
+        pane_text="I can implement the next step if you want.",
+        previous_snapshot_hash="hash-1",
+        snapshot_hash="hash-1",
+    )
+    monkeypatch.setattr(backend, "_has_pending_work", lambda *_args: True)
+    api.supervisor.msg_store.append_event(
+        scope=context.session_name,
+        sender=context.session_name,
+        subject="nudge",
+        payload={"snapshot_hash": "hash-1"},
+        created_at=datetime.now(timezone.utc) - timedelta(seconds=601),
+    )
+
+    backend._triage_stalled_worker(api, context)
+
+    assert api.messages == []
+    assert ("worker_demo", "stuck_session") in api.alerts
+    escalations = [
+        event
+        for event in api.supervisor.msg_store.query_messages(
+            type="event",
+            scope=context.session_name,
+            limit=20,
+        )
+        if event.get("subject") == "nudge_escalated"
+    ]
+    assert len(escalations) == 1
 
 
 # ---------------------------------------------------------------------------

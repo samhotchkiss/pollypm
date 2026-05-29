@@ -213,6 +213,7 @@ def _update_alerts_snapshot_stall(
     pane_text: str,
     previous_snapshot_hash: str | None,
     current_snapshot_hash: str,
+    turn_in_flight: bool,
     active_alerts: list[str],
 ) -> None:
     """Handle the snapshot-hash-based stall detection branch."""
@@ -231,6 +232,7 @@ def _update_alerts_snapshot_stall(
         StallContext,
         classify_stall,
         has_pending_work_for_session,
+        recently_nudged_from_message_store,
     )
     from pollypm.idle_placeholders import (
         pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
@@ -245,6 +247,11 @@ def _update_alerts_snapshot_stall(
             has_pending_work=has_pending_work_for_session(
                 supervisor.config, session_name,
             ),
+            recently_nudged=recently_nudged_from_message_store(
+                supervisor.msg_store,
+                session_name,
+            ),
+            turn_in_flight=turn_in_flight,
             pane_is_idle_placeholder=_pane_is_idle_placeholder(
                 _pane_text_for_classify,
             ),
@@ -384,6 +391,10 @@ def _update_alerts(
         pane_text=pane_text,
         previous_snapshot_hash=previous_snapshot_hash,
         current_snapshot_hash=current_snapshot_hash,
+        turn_in_flight=(
+            previous_log_bytes is not None
+            and current_log_bytes > previous_log_bytes
+        ),
         active_alerts=active_alerts,
     )
 

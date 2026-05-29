@@ -35,6 +35,7 @@ a false-positive stall alert is user trust damage that persists.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 
 
@@ -196,6 +197,56 @@ _WORKER_ACTIONABLE_STATUSES: frozenset[str] = frozenset(
 )
 
 
+def recently_nudged_from_message_store(
+    msg_store,
+    session_name: str,
+    *,
+    within_seconds: int = 120,
+) -> bool:
+    """Return whether the session recently received recovery input.
+
+    This is the classifier's reachable false-positive guard for workers
+    that have just been nudged or sent input. We intentionally do not
+    populate ``turn_in_flight`` here: there is no established reliable
+    cross-boundary signal for an active model turn, while ``nudge`` and
+    ``send_input`` are durable message-store events emitted by the
+    existing recovery/send paths.
+    """
+    if not msg_store or not session_name:
+        return False
+    query_messages = getattr(msg_store, "query_messages", None)
+    if not callable(query_messages):
+        return False
+
+    try:
+        recent = query_messages(type="event", scope=session_name, limit=200)
+    except Exception:  # noqa: BLE001
+        return False
+
+    now = datetime.now(UTC)
+    for event in recent:
+        if event.get("subject") not in {"nudge", "send_input"}:
+            continue
+        created_at = event.get("created_at")
+        if created_at is None:
+            continue
+        stamp = (
+            created_at.isoformat()
+            if hasattr(created_at, "isoformat")
+            else str(created_at)
+        )
+        try:
+            parsed = datetime.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        age = (now - parsed).total_seconds()
+        if 0 <= age <= within_seconds:
+            return True
+    return False
+
+
 def has_pending_work_for_session(config, session_name: str) -> bool:
     """Best-effort check for queued/actionable work on a session's project.
 
@@ -206,9 +257,11 @@ def has_pending_work_for_session(config, session_name: str) -> bool:
     heartbeat-backend sweep and the supervisor-boundary sweep) share a
     single definition of "is there work".
 
-    Returns ``True`` when in doubt — a false "yes" only means we run
-    the same-snapshot check that next heartbeat; a false "no" would
-    silence a real stall.
+    Returns ``False`` when the session/project/path cannot be resolved:
+    without a project, there is no scoped queue to inspect. Once the
+    project is resolved, backend read failures are swallowed and treated
+    as no actionable work from that backend. Only unexpected outer
+    failures return ``True`` as the conservative fail-closed direction.
     """
     try:
         sessions = getattr(config, "sessions", None) or {}
@@ -265,4 +318,5 @@ __all__ = [
     "StallClass",
     "classify_stall",
     "has_pending_work_for_session",
+    "recently_nudged_from_message_store",
 ]

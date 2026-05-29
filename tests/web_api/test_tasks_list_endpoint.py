@@ -217,7 +217,7 @@ def test_list_all_tasks_uses_list_rows_without_per_item_refetch(
         current_node_id=None,
         plan_version=1,
         created_at=now - timedelta(hours=1),
-        updated_at=now,
+        updated_at=now.astimezone(timezone(timedelta(hours=-6))),
         transitions=[
             SimpleNamespace(to_state="queued", timestamp=now - timedelta(minutes=5))
         ],
@@ -244,6 +244,8 @@ def test_list_all_tasks_uses_list_rows_without_per_item_refetch(
 
     assert [item.task_id for item in items] == ["myproj/1"]
     assert items[0].state_entered_at == now - timedelta(minutes=5)
+    assert items[0].updated_at == now
+    assert items[0].updated_at.tzinfo is timezone.utc
     assert items[0].project_paused is False
     assert next_cursor is None
     assert warnings == []
@@ -574,6 +576,17 @@ def test_list_tasks_limit_capped(
     assert response.status_code == 422
     body = response.json()
     assert body["error"]["code"] == "validation_error"
+
+
+def test_list_tasks_rejects_offset_pagination(client, auth_headers) -> None:
+    response = client.get(
+        "/api/v1/tasks?limit=5&offset=50", headers=auth_headers
+    )
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "cursor" in body["error"]["hint"]
 
 
 def test_list_tasks_unknown_project_returns_empty(

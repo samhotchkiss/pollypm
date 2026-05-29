@@ -125,7 +125,19 @@ def list_tasks_endpoint(
     ] = False,
     limit: Annotated[int, Query(ge=1, le=200, description="Page size (capped at 200).")] = 50,
     cursor: Annotated[str | None, Query(description="Opaque cursor from next_cursor.")] = None,
+    offset: Annotated[
+        str | None,
+        Query(description="Unsupported legacy pagination parameter. Use cursor."),
+    ] = None,
 ) -> TaskListResponse:
+    if offset is not None:
+        raise APIError(
+            status_code=400,
+            code="invalid_request",
+            message="`offset` pagination is not supported on this endpoint.",
+            hint="Use cursor-based pagination via `cursor` and `next_cursor`.",
+        )
+
     since_dt: datetime | None = None
     if since is not None:
         try:

@@ -116,6 +116,7 @@ The current event families are:
 | `account.failover.blocked` | supervisor hard recovery when no viable failover account exists | `session`, `failure_type`, `from`, `reason` |
 | `account.failover.failed` | supervisor hard recovery when every failover candidate fails launch | `session`, `failure_type`, `from`, `reason`, `last_error` |
 | `audit.finding` | audit watchdog findings | `rule`, `message`, `recommendation`, plus rule-specific data |
+| `audit.finding_dismissed` | `pm audit dismiss-finding` false-positive resolution | `rule`, `reason`, `source`, `scope` |
 | `agent.injection.flagged` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |
 | `agent.refusal` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |
 | `worker.session_reaped` | worker marker reaper | `window_name`, `marker_path`, `reason` |
@@ -149,22 +150,29 @@ an alert keyed by `(rule, project, subject)`.
 |---|---|---|---|
 | `orphan_marker` | `marker.created` without matching `marker.released` and without a terminal task transition. | `window_seconds=1800` | Inspect the worker pane; resume it or transition/cancel the task so cleanup can release the marker. |
 | `marker_leaked` | Any `marker.leaked` event in the window. | `window_seconds=1800` | Investigate identity/persona guard failures and session-name collisions. |
-| `stuck_draft` | A draft task that has not moved to queued, in progress, review, blocked, rework, or a terminal state. | `stuck_draft_seconds=300` | Queue the task with `pm task queue <project/N>` or cancel it if it is stale. |
-| `cancellation_no_promotion` | A task was cancelled and no later `task.created` event appeared for the same project within the grace window. | `cancel_grace_seconds=300` | Routed to the architect self-heal tier to queue replacement work or make the parked state intentional. |
+| `stuck_draft` | A draft task that has not moved to queued, in progress, review, blocked, rework, or a terminal state. | `stuck_draft_seconds=300` | Queue the task with `pm task queue <project/N>`, cancel it if it is stale, or dismiss the rule/project pair with cited evidence if the finding is a miscount. |
+| `cancellation_no_promotion` | A task was cancelled and no later `task.created` event appeared for the same project within the grace window. | `cancel_grace_seconds=300` | Routed to the architect self-heal tier to either record that the cancellation correctly ended the work or create and queue genuine replacement work. |
+| `cancellation_churn` | Multiple cancellations in one project even when replacement creates keep landing. | `cancel_churn_threshold=2` within `cancel_churn_window_seconds=1800` | Stop the cancel/recreate loop. Prefer preserving transitions such as reassign, re-queue, or resume before discarding more work. |
 | `task_review_stale` | A task has stayed at `status=review` too long. | `review_stale_seconds=1800` | Spawn a reviewer or complete/reject the task manually. |
 | `task_on_hold_stale` | A task has stayed at `status=on_hold` too long. | `on_hold_stale_seconds=900` | Let the architect reassess. Use an on-hold reason starting with `human-needed` only when a real human decision is required. |
 | `role_session_missing` | A queued, in-progress, or review task needs a role window that is absent from the storage closet. | No time threshold; depends on live task state and tmux windows. | Spawn the expected role session or reassign the task. |
 | `worker_session_dead_loop` | Repeated `worker.session_reaped` events for the same task. | `dead_loop_threshold=3` within `dead_loop_window_seconds=600` | Inspect the task and underlying spawn failure; cancel, reassign, or fix the project issue. |
+| `queue_without_motion` | A project has queued tasks but no recent claim, execution, or status-change activity. | `queue_motion_threshold_seconds=1800` | Inspect the queued subjects and create a real state transition; dismiss only when the queued rows are not buildable work. |
 
 Several auto-unstick rules can dispatch a structured brief to the project's
 architect. Dispatch is throttled for 30 minutes by reading prior
 `watchdog.escalation_dispatched` events from the audit log itself.
 
-There is no ignore-list or permanent silence knob. To silence a false positive,
-make the state true again: release/reap the marker, queue or cancel the draft,
-create the intended replacement task, spawn the missing role session, or add a
-correct transition. For threshold-only false positives in tests or custom
-sweeps, pass a `WatchdogConfig` or handler payload with longer thresholds.
+When a finding is a real false positive rather than stale state, record the
+terminal judgment with `pm audit dismiss-finding <rule> <project> --reason
+"<cited evidence>"`. The command emits `audit.finding_dismissed`, and the
+watchdog suppresses later findings for that `(rule, project)` pair while the
+dismissal remains in the retained audit tail. Use it only for miscounts with
+evidence; otherwise make the state true again: release/reap the marker, queue
+or cancel the draft, create the intended replacement task, spawn the missing
+role session, or add a correct transition. For threshold-only false positives
+in tests or custom sweeps, pass a `WatchdogConfig` or handler payload with
+longer thresholds.
 
 ## Morning Briefing Signal Gate
 
@@ -222,6 +230,12 @@ Use `--reason bad-auth-marker` when a marker is present but does not match the
 session's contract. The command emits both `agent.injection.flagged` and
 `agent.refusal` with compact JSON metadata. It intentionally does not accept
 the raw message body; do not include the auth marker or token in audit metadata.
+
+Record a watchdog false-positive dismissal with cited evidence:
+
+```bash
+pm audit dismiss-finding stuck_draft <project> --reason "flagged rows are advisor/FYI notifications, not buildable work"
+```
 
 Read through the Python API:
 

@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from pollypm.audit.log import (
+    EVENT_AUDIT_FINDING_DISMISSED,
     EVENT_MARKER_CREATED,
     EVENT_MARKER_LEAKED,
     EVENT_MARKER_RELEASED,
@@ -89,6 +90,7 @@ __all__ = [
     "WatchdogConfig",
     "EVENT_HEARTBEAT_TICK",
     "EVENT_AUDIT_FINDING",
+    "EVENT_AUDIT_FINDING_DISMISSED",
     "EVENT_STUCK_DRAFT_TERMINATED",
     "STUCK_DRAFT_TERMINATOR_THRESHOLD",
     "RULE_ORPHAN_MARKER",
@@ -386,7 +388,7 @@ class WatchdogConfig:
     # creates. Recreate loops can be "healthy" for
     # cancellation_no_promotion but still pathological at volume.
     cancel_churn_window_seconds: int = 1800
-    cancel_churn_threshold: int = 5
+    cancel_churn_threshold: int = 2
     # #1414 — task_review_stale: a task at status=review must have its
     # most recent transition older than this before we fire. 30 min
     # mirrors the savethenovel/10 case (reviewer agent never spawned).
@@ -3271,6 +3273,7 @@ def scan_events(
     if now.tzinfo is None:
         raise ValueError("scan_events requires a timezone-aware ``now``")
     materialised = list(events)
+    dismissed_scopes = _dismissed_finding_scopes(materialised)
     findings: list[Finding] = []
     findings.extend(_detect_orphan_markers(
         materialised, now=now, config=config,
@@ -3284,7 +3287,10 @@ def scan_events(
         config=config,
         open_tasks=open_tasks,
     )
-    findings.extend(stuck_draft_result.findings)
+    findings.extend(_filter_dismissed_findings(
+        stuck_draft_result.findings,
+        dismissed_scopes=dismissed_scopes,
+    ))
     # #2349 (round 3) — surface terminator breadcrumbs to the cadence
     # handler via the optional side-channel. Pure callers (synthetic
     # event tests) leave the kwarg as None and get no breadcrumbs +
@@ -3292,7 +3298,9 @@ def scan_events(
     # via the in-memory ``terminated_subjects`` guard.
     if stuck_draft_terminator_breadcrumbs is not None:
         stuck_draft_terminator_breadcrumbs.extend(
-            stuck_draft_result.terminator_breadcrumbs,
+            breadcrumb
+            for breadcrumb in stuck_draft_result.terminator_breadcrumbs
+            if (RULE_STUCK_DRAFT, breadcrumb.project) not in dismissed_scopes
         )
     findings.extend(_detect_cancellation_no_promotion(
         materialised, now=now, config=config,
@@ -3389,7 +3397,10 @@ def scan_events(
             events=materialised,
         )
         findings.extend(_run_safety_net_probes(ctx))
-    return findings
+    return _filter_dismissed_findings(
+        findings,
+        dismissed_scopes=dismissed_scopes,
+    )
 
 
 def _audit_event_merge_key(ev: AuditEvent) -> tuple[str, str, str, str, str, str, str]:
@@ -3467,6 +3478,63 @@ def _merge_central_stuck_draft_signals(
 
     merged.sort(key=lambda ev: ev.ts)
     return merged
+
+
+def _dismissed_finding_scopes(
+    events: Sequence[AuditEvent],
+) -> set[tuple[str, str]]:
+    scopes: set[tuple[str, str]] = set()
+    for ev in events:
+        if ev.event != EVENT_AUDIT_FINDING_DISMISSED:
+            continue
+        meta = ev.metadata or {}
+        rule = str(meta.get("rule") or ev.subject or "").strip()
+        project = str(ev.project or meta.get("project") or "").strip()
+        if rule and project:
+            scopes.add((rule, project))
+    return scopes
+
+
+def _filter_dismissed_findings(
+    findings: Sequence[Finding],
+    *,
+    dismissed_scopes: set[tuple[str, str]],
+) -> list[Finding]:
+    if not dismissed_scopes:
+        return list(findings)
+    return [
+        finding
+        for finding in findings
+        if (finding.rule, finding.project) not in dismissed_scopes
+    ]
+
+
+def _read_durable_finding_dismissals(
+    *,
+    project: str,
+    project_path: Path | str | None,
+) -> set[tuple[str, str]]:
+    """Read recent dismissal rows from project and central audit tails."""
+    from pollypm.audit.log import read_events
+
+    events: list[AuditEvent] = []
+    source_paths: list[Path | str | None] = [project_path]
+    if project_path is not None:
+        source_paths.append(None)
+    for source_path in source_paths:
+        try:
+            events.extend(read_events(
+                project,
+                event=EVENT_AUDIT_FINDING_DISMISSED,
+                limit=200,
+                project_path=source_path,
+            ))
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: finding dismissal read failed",
+                exc_info=True,
+            )
+    return _dismissed_finding_scopes(events)
 
 
 def scan_project(
@@ -3556,6 +3624,22 @@ def scan_project(
         worker_cap_back_pressure=worker_cap_back_pressure,
         stuck_draft_terminator_breadcrumbs=pending_terminators,
     )
+    if findings or pending_terminators:
+        durable_dismissals = _read_durable_finding_dismissals(
+            project=project,
+            project_path=project_path,
+        )
+        if durable_dismissals:
+            findings = _filter_dismissed_findings(
+                findings,
+                dismissed_scopes=durable_dismissals,
+            )
+            pending_terminators = [
+                breadcrumb
+                for breadcrumb in pending_terminators
+                if (RULE_STUCK_DRAFT, breadcrumb.project)
+                not in durable_dismissals
+            ]
     for breadcrumb in pending_terminators:
         _emit_stuck_draft_terminator(
             project=breadcrumb.project,
@@ -4459,14 +4543,19 @@ def _brief_cancellation_no_promotion(
     )
     lines.append("")
     lines.append(
-        "Your job: decide whether this cancellation ended the project "
-        "or left replacement work unqueued. Do not reply with analysis "
-        "alone; make the queue state explicit."
+        "Your job: choose one terminal outcome and execute it. If this "
+        "cancellation correctly ended the work and no replacement is "
+        "warranted, record that as a dismissed false positive. If "
+        "replacement work is genuinely needed, create and queue it."
     )
     lines.append(
-        "Cli levers available: create and queue replacement work with "
-        "`pm task create ...` then `pm task queue <replacement-task-id>`."
+        "Cli levers available: "
+        f"`pm audit dismiss-finding {RULE_CANCEL_NO_PROMOTION} "
+        f"{finding.project} --reason \"<cited evidence>\"`; or create "
+        "and queue replacement work with `pm task create ...` then "
+        "`pm task queue <replacement-task-id>`."
     )
+    lines.append("Do not reply with analysis alone; make the state explicit.")
     return lines
 
 
@@ -4739,11 +4828,18 @@ def _brief_fallback(finding: Finding) -> list[str]:
         f"  pm task cancel {subject}    "
         "(if the task should be discarded)"
     )
+    lines.append(
+        f"  pm audit dismiss-finding {finding.rule} "
+        f"{finding.project or '<project>'} --reason \"<cited evidence>\""
+    )
     lines.append("")
     lines.append(
+        "Take exactly one action: queue, cancel, OR dismiss-finding "
+        "with cited evidence if the finding is a miscount (for example "
+        "advisor/FYI/notification tasks counted as buildable work). "
         "Reply only AFTER executing the command. Do not reply with "
-        "analysis alone — the watchdog is checking for the task-state "
-        "change, not your reasoning."
+        "analysis alone — the watchdog is checking for a resolving "
+        "state change, not your reasoning."
     )
     return lines
 

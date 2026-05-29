@@ -657,3 +657,94 @@ def test_audit_agent_refusal_cli_rejects_unknown_reason(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "invalid --reason" in result.output
+
+
+def test_audit_dismiss_finding_cli_emits_project_scoped_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    from pollypm.audit.log import EVENT_AUDIT_FINDING_DISMISSED
+    from pollypm.models import KnownProject
+
+    audit_home = tmp_path / "audit-home"
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    project_root = tmp_path / "demo"
+    (project_root / ".pollypm").mkdir(parents=True)
+    config_path = _make_config(
+        tmp_path,
+        projects={
+            "demo": KnownProject(
+                key="demo",
+                name="Demo",
+                path=project_root,
+                tracked=True,
+            ),
+        },
+    )
+
+    from pollypm.cli import app as root_app
+    runner = CliRunner()
+    result = runner.invoke(
+        root_app,
+        [
+            "audit",
+            "dismiss-finding",
+            "stuck_draft",
+            "demo",
+            "--reason",
+            "demo/2 is an advisor FYI row, not buildable work",
+            "--actor",
+            "architect-demo",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "audit.finding_dismissed" in result.output
+
+    central = audit_home / "demo.jsonl"
+    per_project = project_root / ".pollypm" / "audit.jsonl"
+    for path in (central, per_project):
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert [record["event"] for record in records] == [
+            EVENT_AUDIT_FINDING_DISMISSED,
+        ]
+        row = records[0]
+        assert row["project"] == "demo"
+        assert row["subject"] == "stuck_draft"
+        assert row["actor"] == "architect-demo"
+        assert row["metadata"]["rule"] == "stuck_draft"
+        assert row["metadata"]["scope"] == "project"
+        assert "advisor FYI" in row["metadata"]["reason"]
+
+
+def test_audit_dismiss_finding_cli_requires_reason(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    config_path = _make_config(tmp_path)
+
+    from pollypm.cli import app as root_app
+    runner = CliRunner()
+    result = runner.invoke(
+        root_app,
+        [
+            "audit",
+            "dismiss-finding",
+            "stuck_draft",
+            "demo",
+            "--reason",
+            "   ",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--reason must not be empty" in result.output

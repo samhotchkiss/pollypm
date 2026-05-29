@@ -24,9 +24,11 @@ from pollypm.audit.log import (
     central_log_path,
 )
 from pollypm.audit.watchdog import (
+    EVENT_AUDIT_FINDING_DISMISSED,
     EVENT_AUDIT_FINDING,
     EVENT_HEARTBEAT_TICK,
     EVENT_STUCK_DRAFT_TERMINATED,
+    RULE_QUEUE_WITHOUT_MOTION,
     RULE_CANCEL_NO_PROMOTION,
     RULE_CANCELLATION_CHURN,
     RULE_MARKER_LEAKED,
@@ -884,6 +886,31 @@ def test_cancellation_churn_fires_with_interleaved_creates(now: datetime) -> Non
     assert findings[0].evidence["required_decision"] == "stop_cancel_recreate_loop"
 
 
+def test_cancellation_churn_fires_after_two_cancels(now: datetime) -> None:
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            subject="demo/1",
+            metadata={"from": "draft", "to": "cancelled"},
+            ts=now - timedelta(minutes=12),
+        ),
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            subject="demo/2",
+            metadata={"from": "draft", "to": "cancelled"},
+            ts=now - timedelta(minutes=4),
+        ),
+    ]
+
+    findings = [
+        f for f in scan_events(events, now=now)
+        if f.rule == RULE_CANCELLATION_CHURN
+    ]
+
+    assert len(findings) == 1
+    assert findings[0].metadata["threshold"] == 2
+
+
 def test_format_unstick_brief_cancellation_no_promotion_is_decisive() -> None:
     from pollypm.audit.watchdog import format_unstick_brief
 
@@ -905,7 +932,8 @@ def test_format_unstick_brief_cancellation_no_promotion_is_decisive() -> None:
     assert "Finding: cancellation_no_promotion" in brief
     assert "in_progress -> cancelled" in brief
     assert "No later task.created" in brief
-    assert "queue replacement work" in brief
+    assert "pm audit dismiss-finding cancellation_no_promotion demo" in brief
+    assert "pm task create" in brief
     assert "intentionally park" not in brief
     assert "Do not reply with analysis alone" in brief
 
@@ -1447,6 +1475,7 @@ def test_format_unstick_brief_fallback_is_imperative() -> None:
     assert "execute" in brief
     assert "pm task queue pollypm/29" in brief
     assert "pm task cancel pollypm/29" in brief
+    assert "pm audit dismiss-finding stuck_draft pollypm" in brief
     assert "Reply only AFTER" in brief
 
     # Old advisory phrasings must be gone — they were the failure mode.
@@ -2859,6 +2888,79 @@ def test_stuck_draft_state_dedupes_with_event_path(now: datetime) -> None:
     matched = [f for f in findings if f.rule == RULE_STUCK_DRAFT]
     assert len(matched) == 1
     assert matched[0].metadata["detected_via"] == "state"
+
+
+def test_finding_dismissal_suppresses_stuck_draft_and_terminator(
+    now: datetime,
+) -> None:
+    task = _StatefulTask(
+        project="demo",
+        task_number=2,
+        work_status="draft",
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(hours=2),
+    )
+    events = [
+        _make_event(
+            event=EVENT_AUDIT_FINDING_DISMISSED,
+            project="demo",
+            subject=RULE_STUCK_DRAFT,
+            metadata={
+                "rule": RULE_STUCK_DRAFT,
+                "reason": "demo/2 is a queued FYI notification, not work",
+            },
+            ts=now - timedelta(minutes=1),
+        ),
+        *[
+            _make_event(
+                event=EVENT_AUDIT_FINDING,
+                project="demo",
+                subject="demo/2",
+                metadata={"rule": RULE_STUCK_DRAFT},
+                ts=now - timedelta(minutes=30 - index),
+            )
+            for index in range(STUCK_DRAFT_TERMINATOR_THRESHOLD)
+        ],
+    ]
+    breadcrumbs = []
+
+    findings = scan_events(
+        events,
+        now=now,
+        open_tasks=[task],
+        stuck_draft_terminator_breadcrumbs=breadcrumbs,
+    )
+
+    assert not any(f.rule == RULE_STUCK_DRAFT for f in findings)
+    assert breadcrumbs == []
+
+
+def test_finding_dismissal_suppresses_queue_without_motion(
+    now: datetime,
+) -> None:
+    task = _StatefulTask(
+        project="demo",
+        task_number=3,
+        work_status="queued",
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(hours=2),
+    )
+    events = [
+        _make_event(
+            event=EVENT_AUDIT_FINDING_DISMISSED,
+            project="demo",
+            subject=RULE_QUEUE_WITHOUT_MOTION,
+            metadata={
+                "rule": RULE_QUEUE_WITHOUT_MOTION,
+                "reason": "queue contains notification-only rows",
+            },
+            ts=now - timedelta(minutes=1),
+        ),
+    ]
+
+    findings = scan_events(events, now=now, open_tasks=[task], project="demo")
+
+    assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
 
 
 def test_task_rework_stale_state_based_fires_for_old_rework(

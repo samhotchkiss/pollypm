@@ -100,6 +100,24 @@ def _resolve_notify_store():
 _TASK_ID_FULL_PATTERN = re.compile(r"^([A-Za-z0-9_.-]+)/(\d+)$")
 
 
+def _reject_task_id_for_lease_command(command_name: str, session_name: str) -> None:
+    if "/" not in session_name:
+        return
+    if command_name == "claim":
+        message = (
+            f"Did you mean 'pm task claim {session_name}'? "
+            "'pm claim' sets a tmux session lease, not a work task."
+        )
+    else:
+        message = (
+            f"Did you mean a work-task command for {session_name}? "
+            f"'pm {command_name}' clears a tmux session lease, not a work task. "
+            "See 'pm task --help'."
+        )
+    typer.echo(message, err=True)
+    raise typer.Exit(code=2)
+
+
 def _resolve_send_target_name(name: str) -> str:
     """Translate ``<project>/<N>`` to ``task-<project>-<N>``; pass through otherwise.
 
@@ -614,6 +632,7 @@ def claim(
         DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
     ),
 ) -> None:
+    _reject_task_id_for_lease_command("claim", session_name)
     supervisor = helpers._load_supervisor(config_path)
     helpers._require_pollypm_session(supervisor)
     supervisor.claim_lease(session_name, owner, note)
@@ -627,6 +646,7 @@ def release(
         DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
     ),
 ) -> None:
+    _reject_task_id_for_lease_command("release", session_name)
     supervisor = helpers._load_supervisor(config_path)
     helpers._require_pollypm_session(supervisor)
     supervisor.release_lease(session_name)

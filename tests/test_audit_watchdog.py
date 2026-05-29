@@ -1701,7 +1701,7 @@ def test_cadence_handler_dispatches_cancellation_no_promotion(
     assert target == "pollypm-storage-closet:architect-savethenovel"
     assert RULE_CANCEL_NO_PROMOTION in brief
     assert "queue replacement work" in brief
-    assert "intentionally park" in brief
+    assert "intentionally park" not in brief
 
     rows = [
         json.loads(line)

@@ -115,6 +115,9 @@ _AUTO_CLAIM_EVENT_SPAWNED = "auto_claim_spawned"
 _AUTO_CLAIM_EVENT_SKIPPED_PLAN_MISSING = "auto_claim_skipped_plan_missing"
 _AUTO_CLAIM_EVENT_FAILED = "auto_claim_failed"
 _AUTO_CLAIM_EVENT_CIRCUIT_BREAKER = "auto_claim_circuit_breaker"
+_AUTO_CLAIM_EVENT_SKIPPED_PAUSED = "auto_claim_skipped_paused"
+TMUX_WINDOW_PROBE_UNAVAILABLE_ALERT_TYPE = "tmux_window_probe_unavailable"
+TMUX_WINDOW_PROBE_UNAVAILABLE_THRESHOLD = 3
 
 # Work statuses the sweeper cares about — those where a machine actor is
 # the expected next mover. ``in_progress`` / ``rework`` are gated on an
@@ -140,6 +143,9 @@ _ACTIVE_WORKER_STATUSES = (
 # only re-ping when they've gone idle (supervisor restart, Claude
 # relaunched with no context, etc.).
 _IDLE_GATED_STATUSES = frozenset(_ACTIVE_WORKER_STATUSES)
+
+_TMUX_WINDOW_PROBE_UNAVAILABLE_COUNTS: dict[tuple[str, int], int] = {}
+_TMUX_WINDOW_PROBE_UNAVAILABLE_ALERTED: set[tuple[str, int]] = set()
 
 
 def _build_event_for_task(work_service: Any, task: Any) -> TaskAssignmentEvent | None:
@@ -1416,9 +1422,134 @@ def _max_concurrent_for_project(services: Any, project: Any) -> int:
     return max(1, int(getattr(services, "max_concurrent_per_project", 2)))
 
 
+def _task_worker_session_name(project_key: str, task_number: int) -> str:
+    """Return the canonical per-task worker session/window candidate."""
+    candidates = role_candidate_names(
+        "worker", project_key, task_number=task_number,
+    )
+    if candidates:
+        return candidates[0]
+    return f"task-{project_key}-{task_number}"
+
+
+def _pause_store(services: Any) -> Any | None:
+    return getattr(services, "msg_store", None) or getattr(
+        services, "state_store", None,
+    )
+
+
+def _skip_if_task_worker_paused(
+    services: Any,
+    *,
+    project_key: str,
+    task_number: int,
+    task_id: str,
+    loop: str,
+    reason: str,
+) -> bool:
+    """Return True when the task's per-task worker is paused."""
+    config = getattr(services, "config", None)
+    if config is None:
+        return False
+    session_name = _task_worker_session_name(project_key, task_number)
+    try:
+        from pollypm.session_paused import skip_if_paused
+
+        return skip_if_paused(
+            config,
+            session_name,
+            store=_pause_store(services),
+            loop=loop,
+            reason=f"task_id={task_id} {reason}".strip(),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "task_auto_claim: pause-marker check failed for %s; "
+            "skipping recovery action",
+            task_id,
+            exc_info=True,
+        )
+        return True
+
+
+def _tmux_probe_key(project_key: str, task_number: int) -> tuple[str, int]:
+    return (project_key, int(task_number))
+
+
+def _reset_tmux_window_probe_unavailable(
+    services: Any,
+    *,
+    project_key: str,
+    task_number: int,
+) -> None:
+    key = _tmux_probe_key(project_key, task_number)
+    _TMUX_WINDOW_PROBE_UNAVAILABLE_COUNTS.pop(key, None)
+    _TMUX_WINDOW_PROBE_UNAVAILABLE_ALERTED.discard(key)
+    store = _pause_store(services)
+    if store is None:
+        return
+    try:
+        store.clear_alert(
+            _task_worker_session_name(project_key, task_number),
+            TMUX_WINDOW_PROBE_UNAVAILABLE_ALERT_TYPE,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_auto_claim: clear_alert(%s) failed for %s/%s",
+            TMUX_WINDOW_PROBE_UNAVAILABLE_ALERT_TYPE,
+            project_key,
+            task_number,
+            exc_info=True,
+        )
+
+
+def _record_tmux_window_probe_unavailable(
+    services: Any,
+    *,
+    project_key: str,
+    task_number: int,
+    detail: str,
+) -> None:
+    """Defer stale-claim recovery while tmux liveness is unobservable."""
+    key = _tmux_probe_key(project_key, task_number)
+    count = _TMUX_WINDOW_PROBE_UNAVAILABLE_COUNTS.get(key, 0) + 1
+    _TMUX_WINDOW_PROBE_UNAVAILABLE_COUNTS[key] = count
+    if count < TMUX_WINDOW_PROBE_UNAVAILABLE_THRESHOLD:
+        return
+    if key in _TMUX_WINDOW_PROBE_UNAVAILABLE_ALERTED:
+        return
+    store = _pause_store(services)
+    if store is None:
+        return
+    task_id = f"{project_key}/{int(task_number)}"
+    session_name = _task_worker_session_name(project_key, task_number)
+    message = (
+        f"Cannot verify whether task {task_id}'s worker session is alive "
+        "because tmux is unavailable. Stale-claim recovery is deferring "
+        "instead of releasing the claim. Check tmux health and retry; "
+        f"latest probe error: {detail}"
+    )
+    try:
+        store.upsert_alert(
+            session_name,
+            TMUX_WINDOW_PROBE_UNAVAILABLE_ALERT_TYPE,
+            "warn",
+            message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_auto_claim: upsert_alert(%s) failed for %s",
+            TMUX_WINDOW_PROBE_UNAVAILABLE_ALERT_TYPE,
+            session_name,
+            exc_info=True,
+        )
+        return
+    _TMUX_WINDOW_PROBE_UNAVAILABLE_ALERTED.add(key)
+
+
 def _tmux_window_alive_for_task(
     services: Any, project_key: str, task_number: int,
-) -> bool:
+) -> bool | None:
     """Check whether the per-task tmux window for a claim is still alive.
 
     Window-naming contract: per-task workers land in a window whose
@@ -1428,36 +1559,129 @@ def _tmux_window_alive_for_task(
     ``task-web_app-7`` was previously accepted as proof that ``app/7``
     was alive because ``"app" in "task-web_app-7"`` is true (#807).
 
-    Any error returns True so we don't incorrectly reap a live worker
-    on a transient query failure.
+    Returns ``True`` when the exact live window exists, ``False`` when
+    tmux reliably reports the storage-closet session or target window is
+    absent, and ``None`` when tmux liveness is unavailable. The caller
+    must defer recovery on ``None`` so a tmux outage does not release a
+    live claim.
     """
     from pollypm.work.session_manager import task_window_name
 
     session_service = getattr(services, "session_service", None)
     if session_service is None:
-        return True
+        _record_tmux_window_probe_unavailable(
+            services,
+            project_key=project_key,
+            task_number=task_number,
+            detail="session service unavailable",
+        )
+        return None
     expected_name = task_window_name(project_key, task_number)
     try:
         tmux = getattr(session_service, "tmux", None)
         if tmux is None:
-            return True
+            _record_tmux_window_probe_unavailable(
+                services,
+                project_key=project_key,
+                task_number=task_number,
+                detail="tmux client unavailable",
+            )
+            return None
         target_session = getattr(session_service, "storage_closet_session_name", None)
         if callable(target_session):
             session_name = target_session()
         else:
             session_name = "pollypm-storage-closet"
-        windows = tmux.list_windows(session_name)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "task_assignment sweep: tmux window probe failed for %s/%s "
-            "— defaulting to alive",
+            "task_assignment sweep: tmux target resolution failed for %s/%s",
             project_key, task_number, exc_info=True,
         )
-        return True
+        _record_tmux_window_probe_unavailable(
+            services,
+            project_key=project_key,
+            task_number=task_number,
+            detail=str(exc),
+        )
+        return None
+
+    has_session_strict = getattr(tmux, "has_session_strict", None)
+    if callable(has_session_strict):
+        try:
+            if not bool(has_session_strict(session_name)):
+                _reset_tmux_window_probe_unavailable(
+                    services,
+                    project_key=project_key,
+                    task_number=task_number,
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "task_assignment sweep: strict tmux session probe failed "
+                "for %s while checking %s/%s",
+                session_name, project_key, task_number, exc_info=True,
+            )
+            _record_tmux_window_probe_unavailable(
+                services,
+                project_key=project_key,
+                task_number=task_number,
+                detail=str(exc),
+            )
+            return None
+    else:
+        has_session = getattr(tmux, "has_session", None)
+        if callable(has_session):
+            try:
+                if not bool(has_session(session_name)):
+                    _reset_tmux_window_probe_unavailable(
+                        services,
+                        project_key=project_key,
+                        task_number=task_number,
+                    )
+                    return False
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "task_assignment sweep: tmux session probe failed for "
+                    "%s while checking %s/%s",
+                    session_name, project_key, task_number, exc_info=True,
+                )
+                _record_tmux_window_probe_unavailable(
+                    services,
+                    project_key=project_key,
+                    task_number=task_number,
+                    detail=str(exc),
+                )
+                return None
+
+    try:
+        windows = tmux.list_windows(session_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "task_assignment sweep: tmux window probe failed for %s/%s "
+            "— stale-claim recovery deferred",
+            project_key, task_number, exc_info=True,
+        )
+        _record_tmux_window_probe_unavailable(
+            services,
+            project_key=project_key,
+            task_number=task_number,
+            detail=str(exc),
+        )
+        return None
     for window in windows or []:
         name = getattr(window, "name", "") or ""
         if name == expected_name and not getattr(window, "pane_dead", False):
+            _reset_tmux_window_probe_unavailable(
+                services,
+                project_key=project_key,
+                task_number=task_number,
+            )
             return True
+    _reset_tmux_window_probe_unavailable(
+        services,
+        project_key=project_key,
+        task_number=task_number,
+    )
     return False
 
 
@@ -1773,10 +1997,31 @@ def _recover_dead_claims(
         task_number = getattr(task, "task_number", None)
         if task_number is None:
             continue
-        if _tmux_window_alive_for_task(services, project_key, task_number):
+        task_id = getattr(task, "task_id", f"{project_key}/{task_number}")
+        try:
+            task_number_int = int(task_number)
+        except (TypeError, ValueError):
+            continue
+        if _skip_if_task_worker_paused(
+            services,
+            project_key=project_key,
+            task_number=task_number_int,
+            task_id=task_id,
+            loop="task_assignment.sweep.recover_dead_claims",
+            reason="stale-claim recovery",
+        ):
+            by_outcome[_AUTO_CLAIM_EVENT_SKIPPED_PAUSED] = (
+                by_outcome.get(_AUTO_CLAIM_EVENT_SKIPPED_PAUSED, 0) + 1
+            )
+            continue
+        alive = _tmux_window_alive_for_task(
+            services, project_key, task_number_int,
+        )
+        if alive is None:
+            continue
+        if alive:
             continue
         # Window is gone — release the claim back to queued.
-        task_id = getattr(task, "task_id", f"{project_key}/{task_number}")
 
         # #1012 / #1014 (Bug A) — circuit breaker. Refuse to release the
         # claim once either tripwire fires:
@@ -1966,6 +2211,50 @@ def _auto_claim_next(
             status="error",
             metadata={
                 "reason": "missing_task_id",
+                "active_workers_before": len(active),
+                "cap": cap,
+            },
+        )
+        return
+    task_number = getattr(target, "task_number", None)
+    try:
+        task_number_int = int(task_number)
+    except (TypeError, ValueError):
+        totals["by_outcome"][_AUTO_CLAIM_EVENT_FAILED] = (
+            totals["by_outcome"].get(_AUTO_CLAIM_EVENT_FAILED, 0) + 1
+        )
+        _emit_auto_claim_audit(
+            services,
+            project=project,
+            task=target,
+            outcome=_AUTO_CLAIM_EVENT_FAILED,
+            status="error",
+            metadata={
+                "reason": "missing_task_number",
+                "active_workers_before": len(active),
+                "cap": cap,
+            },
+        )
+        return
+    if _skip_if_task_worker_paused(
+        services,
+        project_key=project_key,
+        task_number=task_number_int,
+        task_id=task_id,
+        loop="task_assignment.sweep.auto_claim_next",
+        reason="auto-claim spawn",
+    ):
+        totals["by_outcome"][_AUTO_CLAIM_EVENT_SKIPPED_PAUSED] = (
+            totals["by_outcome"].get(_AUTO_CLAIM_EVENT_SKIPPED_PAUSED, 0) + 1
+        )
+        _emit_auto_claim_audit(
+            services,
+            project=project,
+            task=target,
+            outcome=_AUTO_CLAIM_EVENT_SKIPPED_PAUSED,
+            status="ok",
+            metadata={
+                "reason": "worker session paused",
                 "active_workers_before": len(active),
                 "cap": cap,
             },

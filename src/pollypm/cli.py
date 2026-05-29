@@ -391,6 +391,50 @@ def _load_supervisor(config_path: Path):
     return PollyPMService(config_path).load_supervisor()
 
 
+def _is_postgres_launch_error(exc: BaseException) -> bool:
+    pg_error_types: list[type[BaseException]] = []
+    try:
+        import psycopg
+
+        pg_error_types.append(psycopg.OperationalError)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import psycopg_pool
+
+        for name in ("PoolTimeout", "PoolClosed"):
+            cls = getattr(psycopg_pool, name, None)
+            if isinstance(cls, type):
+                pg_error_types.append(cls)
+    except Exception:  # noqa: BLE001
+        pass
+    if pg_error_types and isinstance(exc, tuple(pg_error_types)):
+        return True
+
+    class_names = {cls.__name__.lower() for cls in type(exc).mro()}
+    text = str(exc).lower()
+    pg_terms = (
+        "postgres",
+        "postgresql",
+        "psycopg",
+        "pg_pool",
+        "connection refused",
+        "could not connect",
+        "pool timeout",
+        "pool closed",
+    )
+    return "operationalerror" in class_names and any(term in text for term in pg_terms)
+
+
+def _exit_with_postgres_launch_hint(exc: BaseException) -> None:
+    typer.echo(
+        "PollyPM needs Postgres. Run: pm bootstrap-pg --yes\n"
+        f"Postgres launch check failed: {exc}",
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
 def _enforce_migration_gate(config_path: Path) -> None:
     """Refuse-start guard: bail out if the workspace state.db is behind (#717).
 
@@ -956,7 +1000,12 @@ def up(
         onboard(config_path=config_path, force=False)
         return
     _enforce_migration_gate(config_path)
-    supervisor = _load_supervisor(config_path)
+    try:
+        supervisor = _load_supervisor(config_path)
+    except Exception as exc:  # noqa: BLE001
+        if _is_postgres_launch_error(exc):
+            _exit_with_postgres_launch_hint(exc)
+        raise
 
     # #884 / #905 — consult the launch state machine BEFORE any
     # startup side effects (CoreRail boot, ensure_layout, transcript

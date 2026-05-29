@@ -544,11 +544,11 @@ def validate_transition(
     """Return a violation when ``from_status -> to_status`` is
     forbidden, or ``None`` when it is allowed.
 
-    Used by the work service to refuse invalid transitions at
-    write time. The audit cites #806 — recovery deleted execution
-    history because the transition the recovery applied was not
-    in the canonical table; running the validator at write time
-    would have rejected it."""
+    Intended for write paths that can enforce the canonical table
+    without changing an established operational transition. The audit
+    cites #806 — recovery deleted execution history because the
+    transition the recovery applied was not in the canonical table;
+    callers that opt in can reject that shape before writing."""
     if is_transition_allowed(from_status, to_status):
         return None
     return InvariantViolation(

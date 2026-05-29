@@ -24,8 +24,10 @@ from pollypm.cli_shortcuts import shortcut_rows
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, write_config
 from pollypm.doctor import (
     AutoFixPlan,
+    CheckResult,
     check_claude_cli,
     check_codex_cli,
+    check_pg_connection_for_config,
     check_tmux,
     run_auto_fix,
 )
@@ -57,6 +59,18 @@ ONBOARDING_STAGES = (
     ("controller", "Choose controller"),
     ("projects", "Add projects"),
     ("tour", "Launch PollyPM"),
+)
+FIRST_REQUEST_EXAMPLE = (
+    "Build a markdown-to-HTML CLI tool in the `my-app` project. Single "
+    "`md2html` entrypoint that reads a `.md` file and writes a `.html` "
+    "file. Include one Playwright E2E test that renders a sample file "
+    "and checks the output HTML in a headless browser."
+)
+POSTGRES_BOOTSTRAP_FIX = AutoFixPlan(
+    description="Set up Postgres for PollyPM",
+    command=["pm", "bootstrap-pg", "--yes"],
+    requires_sudo=False,
+    platforms=["macos", "linux"],
 )
 
 
@@ -142,6 +156,21 @@ def onboarding_progress_lines(step: str) -> list[str]:
     lines.append("")
     lines.append("[dim]Mouse is enabled. Click buttons, choices, and project selections directly.[/dim]")
     return lines
+
+
+def first_move_copy(seeded_demo_task_id: str | None) -> str:
+    intro = "Start by giving Polly a small, concrete request:"
+    if seeded_demo_task_id:
+        intro = (
+            f"A demo task is already waiting: {seeded_demo_task_id}. "
+            "Open it in the rail, or type the request below to Polly to watch her dispatch a worker."
+        )
+    return (
+        f"[#a8b8c4]{intro}[/]\n\n"
+        f"[bold #e0e8ef]{FIRST_REQUEST_EXAMPLE}[/]\n\n"
+        "[#a8b8c4]Click Polly's pane or press Enter on the Polly rail row, "
+        "type your request, then press Enter.[/]"
+    )
 
 
 @dataclass(slots=True)
@@ -514,6 +543,7 @@ class OnboardingApp(App[OnboardingResult | None]):
         self.scan_frame_index = 0
         self.launch_button: Button | None = None
         self._pending_demo_repo_path: Path | None = None
+        self.postgres_check_result: CheckResult | None = None
 
     def _blocking_auto_fixes(self) -> list[BlockingAutoFix]:
         fixes: list[BlockingAutoFix] = []
@@ -528,6 +558,16 @@ class OnboardingApp(App[OnboardingResult | None]):
                         plan=result.auto_fix,
                     )
                 )
+        pg_result = self._postgres_check()
+        if not pg_result.passed and not pg_result.skipped:
+            fixes.append(
+                BlockingAutoFix(
+                    button_id="fix-postgres",
+                    label="Set up Postgres",
+                    summary=pg_result.status,
+                    plan=POSTGRES_BOOTSTRAP_FIX,
+                )
+            )
         if installed_provider_statuses(self.state.statuses):
             return fixes
         for provider, check, label in (
@@ -609,6 +649,12 @@ class OnboardingApp(App[OnboardingResult | None]):
             table.add_row(item.label, status)
         tmux_status = "[green]✓[/green]" if self._tmux_ready() else "[red]✗[/red]"
         table.add_row("tmux", tmux_status)
+        pg_result = self._postgres_check()
+        if pg_result.skipped:
+            pg_status = "[dim]—[/dim]"
+        else:
+            pg_status = "[green]✓[/green]" if pg_result.passed else "[red]✗[/red]"
+        table.add_row("Postgres", pg_status)
         return Panel(table, title="Machine", border_style="#253140")
 
     def _account_summary_panel(self) -> Panel:
@@ -630,6 +676,32 @@ class OnboardingApp(App[OnboardingResult | None]):
 
     def _tmux_ready(self) -> bool:
         return shutil.which("tmux") is not None
+
+    def _postgres_check(self) -> CheckResult:
+        if self.postgres_check_result is not None:
+            return self.postgres_check_result
+        config = None
+        if self.config_path.exists():
+            try:
+                config = load_config(self.config_path)
+            except Exception as exc:  # noqa: BLE001
+                self.postgres_check_result = CheckResult(
+                    passed=False,
+                    status=f"config parse failed before pg check: {exc}",
+                    why="PollyPM needs a readable config before it can choose the storage backend.",
+                    fix="Fix the config file, then re-run onboarding.",
+                    data={"error": str(exc)},
+                )
+                return self.postgres_check_result
+        self.postgres_check_result = check_pg_connection_for_config(
+            config,
+            connect_timeout=2,
+        )
+        return self.postgres_check_result
+
+    def _postgres_ready(self) -> bool:
+        result = self._postgres_check()
+        return result.passed or result.skipped
 
     def _set_message(self, message: str = "") -> None:
         self.message_widget.update(message)
@@ -675,6 +747,27 @@ class OnboardingApp(App[OnboardingResult | None]):
                 blockers.mount(actions)
                 for item in auto_fixes:
                     if item.button_id == "fix-tmux":
+                        actions.mount(Button(item.label, id=item.button_id, variant="warning"))
+            return
+
+        if not self._postgres_ready():
+            pg_result = self._postgres_check()
+            blockers = Vertical(classes="section")
+            stage.mount(blockers)
+            blockers.mount(
+                Panel(
+                    "[red]Postgres is required before PollyPM can continue.[/red]\n"
+                    f"{pg_result.status}\n\n"
+                    "Set it up here, then keep going without restarting onboarding.",
+                    title="Postgres Required",
+                    border_style="red",
+                )
+            )
+            if auto_fixes:
+                actions = Horizontal(classes="button-row")
+                blockers.mount(actions)
+                for item in auto_fixes:
+                    if item.button_id == "fix-postgres":
                         actions.mount(Button(item.label, id=item.button_id, variant="warning"))
             return
 
@@ -894,6 +987,11 @@ class OnboardingApp(App[OnboardingResult | None]):
         layout_table.add_row("Heartbeat", "Runs quietly in the background monitoring all sessions for drift or stalls.")
         layout_section.mount(Static(Group(layout_table)))
 
+        first_move_section = Vertical(classes="section")
+        stage.mount(first_move_section)
+        first_move_section.mount(Static("Your first move", classes="section-title"))
+        first_move_section.mount(Static(first_move_copy(self.state.seeded_demo_task_id)))
+
         # ── Key controls
         keys_section = Vertical(classes="section")
         stage.mount(keys_section)
@@ -994,6 +1092,7 @@ class OnboardingApp(App[OnboardingResult | None]):
             except Exception as exc:  # noqa: BLE001
                 detail = str(exc)
             self.state.statuses = _available_clis()
+            self.postgres_check_result = None
             self.refresh(repaint=True, layout=True)
             self._render_current_step()
             self._set_message(detail)

@@ -1,21 +1,34 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
+from pollypm.doctor import CheckResult
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.onboarding import CliAvailability, ConnectedAccount
 from pollypm.projects import make_project_key
 from pollypm.onboarding_tui import (
     BlockingAutoFix,
+    FIRST_REQUEST_EXAMPLE,
     ONBOARDING_STAGES,
     OnboardingApp,
     OnboardingResult,
     default_controller_account,
+    first_move_copy,
     installed_provider_statuses,
     merge_selected_projects,
     onboarding_progress_lines,
     onboarding_step_header,
     run_onboarding_app,
 )
+
+
+@pytest.fixture(autouse=True)
+def _postgres_ready(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui.check_pg_connection_for_config",
+        lambda *_args, **_kwargs: CheckResult(passed=True, status="pg ok"),
+    )
 
 
 def test_installed_provider_statuses_filters_missing_clis() -> None:
@@ -142,6 +155,24 @@ def test_blocking_auto_fixes_exposes_tmux_fix(monkeypatch, tmp_path: Path) -> No
     assert fixes[0].label == "Install tmux"
 
 
+def test_blocking_auto_fixes_exposes_postgres_bootstrap(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    app.state.statuses = [
+        CliAvailability(provider=ProviderKind.CLAUDE, label="Claude CLI", binary="claude", installed=True)
+    ]
+    app.postgres_check_result = CheckResult(
+        passed=False,
+        status="pg not reachable at postgresql://localhost:5432/pollypm",
+    )
+    monkeypatch.setattr(app, "_tmux_ready", lambda: True)
+
+    fixes = app._blocking_auto_fixes()
+
+    pg_fix = next(item for item in fixes if item.button_id == "fix-postgres")
+    assert pg_fix.label == "Set up Postgres"
+    assert pg_fix.plan.command == ["pm", "bootstrap-pg", "--yes"]
+
+
 def test_run_machine_fix_refreshes_statuses(monkeypatch, tmp_path: Path) -> None:
     app = OnboardingApp(tmp_path / "pollypm.toml")
     messages: list[str] = []
@@ -191,6 +222,22 @@ def test_run_machine_fix_refreshes_statuses(monkeypatch, tmp_path: Path) -> None
     assert renders == ["rendered"]
     assert messages[-1] == "Install tmux completed."
     assert app.state.statuses[0].installed is True
+    assert app.postgres_check_result is None
+
+
+def test_first_move_copy_shows_example_and_mechanics() -> None:
+    copy = first_move_copy(None)
+
+    assert FIRST_REQUEST_EXAMPLE in copy
+    assert "Click Polly's pane or press Enter on the Polly rail row" in copy
+    assert "type your request, then press Enter" in copy
+
+
+def test_first_move_copy_names_seeded_demo_task() -> None:
+    copy = first_move_copy("demo/1")
+
+    assert "A demo task is already waiting: demo/1" in copy
+    assert "watch her dispatch a worker" in copy
 
 
 def test_codex_login_mode_routes_remote_to_headless(monkeypatch, tmp_path: Path) -> None:
@@ -387,7 +434,7 @@ def test_projects_step_can_offer_demo_repo_fallback(monkeypatch, tmp_path: Path)
             lambda _config_path: demo_path,
         )
         monkeypatch.setattr(
-            "pollypm.onboarding.seed_demo_project_task",
+            "pollypm.onboarding_tui.seed_demo_project_task",
             lambda project_path, *, project_key: "demo/1",
         )
 
@@ -428,7 +475,7 @@ def test_demo_task_choice_keeps_seeded_task(monkeypatch, tmp_path: Path) -> None
 
     seeded: list[tuple[Path, str]] = []
     monkeypatch.setattr(
-        "pollypm.onboarding.seed_demo_project_task",
+        "pollypm.onboarding_tui.seed_demo_project_task",
         lambda project_path, *, project_key: seeded.append((project_path, project_key)) or "demo/1",
     )
     rendered: list[str] = []
@@ -455,7 +502,7 @@ def test_demo_task_choice_can_forget_seeded_task(monkeypatch, tmp_path: Path) ->
     app.state.seeded_demo_task_id = "demo/1"
 
     monkeypatch.setattr(
-        "pollypm.onboarding.seed_demo_project_task",
+        "pollypm.onboarding_tui.seed_demo_project_task",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not seed")),
     )
     rendered: list[str] = []

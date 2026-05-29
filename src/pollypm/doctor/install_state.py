@@ -328,37 +328,32 @@ def _parse_pg_server_version(raw: object) -> tuple[int, int] | None:
     return (n // 10000, n % 10000)
 
 
-def check_pg_connection() -> doctor.CheckResult:
-    """Probe the configured Postgres backend (issue #1737, Slice A).
+def check_pg_connection_for_config(
+    config,
+    *,
+    connect_timeout: int | None = None,
+) -> doctor.CheckResult:
+    """Probe a Postgres config using the doctor pg-connection contract.
 
     Runs:
 
-    1. ``SELECT 1`` via the read-only pool (catches "pg not reachable").
+    1. ``SELECT 1`` via the read-only pool, or a bounded direct psycopg
+       connection when ``connect_timeout`` is provided.
     2. ``SHOW server_version_num`` (verifies pg ≥ configured minimum).
     3. ``SELECT 1 FROM pg_extension WHERE extname='vector'`` (verifies
        pgvector is installed — required for embeddings + recall).
 
-    Skipped benignly when ``[storage] backend != "postgres"`` so a
-    sqlite-backed install isn't pestered. Failures emit the standard
-    three-question doctor message with an actionable fix command.
+    ``config=None`` means "first-run default": Postgres is required and
+    the DSN resolves from env/defaults. That is how onboarding can check
+    the backend before it has written the first config file.
     """
-    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return doctor._skip("pg-connection skipped (no config)")
-    try:
-        config = load_config(DEFAULT_CONFIG_PATH)
-    except Exception as exc:  # noqa: BLE001
-        return doctor._skip(f"pg-connection skipped (config parse: {exc})")
-
-    backend = config.storage.backend
-    if backend != "postgres":
+    if config is not None and config.storage.backend != "postgres":
         return doctor._skip(
-            f"pg-connection skipped (backend={backend!r})"
+            f"pg-connection skipped (backend={config.storage.backend!r})"
         )
 
     try:
-        from pollypm.storage.pg_pool import get_ro_pool, resolve_dsn
+        from pollypm.storage.pg_pool import resolve_dsn
     except Exception as exc:  # noqa: BLE001
         return doctor._fail(
             "pg pool module unavailable",
@@ -378,8 +373,14 @@ def check_pg_connection() -> doctor.CheckResult:
 
     dsn = resolve_dsn(config)
 
+    pool = None
     try:
-        pool = get_ro_pool(config)
+        if connect_timeout is None:
+            from pollypm.storage.pg_pool import get_ro_pool
+
+            pool = get_ro_pool(config)
+        else:
+            import psycopg
     except Exception as exc:  # noqa: BLE001
         return doctor._fail(
             f"pg not reachable at {dsn}",
@@ -399,11 +400,20 @@ def check_pg_connection() -> doctor.CheckResult:
             data={"dsn": dsn, "error": str(exc)},
         )
 
+    min_version_raw = "16.0"
+    if config is not None:
+        min_version_raw = config.storage.pg.min_version or "16.0"
+
     server_version: tuple[int, int] | None = None
     vector_installed = False
     select_ok = False
     try:
-        with pool.connection() as conn, conn.cursor() as cur:
+        conn_cm = (
+            pool.connection()
+            if pool is not None
+            else psycopg.connect(dsn, connect_timeout=connect_timeout)
+        )
+        with conn_cm as conn, conn.cursor() as cur:
             cur.execute("SELECT 1")
             row = cur.fetchone()
             select_ok = bool(row and int(row[0]) == 1)
@@ -443,7 +453,6 @@ def check_pg_connection() -> doctor.CheckResult:
     # Parse the configured minimum version (default "16.0"). Tolerant
     # of "16", "16.0", "16.2.3"; falls back to (16, 0) on a malformed
     # string so a typo can't trivially pass the gate.
-    min_version_raw = config.storage.pg.min_version or "16.0"
     parts = [p for p in min_version_raw.split(".") if p.isdigit()]
     if parts:
         min_major = int(parts[0])
@@ -518,6 +527,26 @@ def check_pg_connection() -> doctor.CheckResult:
             "vector_installed": True,
         },
     )
+
+
+def check_pg_connection() -> doctor.CheckResult:
+    """Probe the configured Postgres backend (issue #1737, Slice A).
+
+    Skipped benignly when no config exists or ``[storage] backend !=
+    "postgres"`` so non-first-run doctor invocations are not pestered.
+    Failures emit the standard three-question doctor message with an
+    actionable fix command.
+    """
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        return doctor._skip("pg-connection skipped (no config)")
+    try:
+        config = load_config(DEFAULT_CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001
+        return doctor._skip(f"pg-connection skipped (config parse: {exc})")
+
+    return check_pg_connection_for_config(config)
 
 
 # Default freshness threshold for the pg backup probe (issue #1737,

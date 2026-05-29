@@ -136,6 +136,20 @@ def test_auto_merge_refused_routes_to_retry_action() -> None:
     assert any("--retry" in step for step in action.cli_steps)
 
 
+def test_human_needed_hold_routes_to_operator_input_action() -> None:
+    proxy = _proxy(
+        status="on_hold",
+        reason="[human-needed] external credentials only S.E. can supply",
+    )
+
+    action = recovery_action_for(proxy)
+
+    assert action is not None
+    assert "operator input" in action.title
+    assert "external credentials only S.E. can supply" in action.detail
+    assert action.cli_steps[-1] == "pm task resume demo/1"
+
+
 def test_blocked_dep_routes_to_unblock_dep_first() -> None:
     proxy = _proxy(
         status="blocked",

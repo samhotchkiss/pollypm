@@ -23,6 +23,7 @@ from pollypm.rejection_feedback import (
     feedback_target_task_id,
     is_rejection_feedback_task,
 )
+from pollypm.operator_holds import is_human_needed_hold_reason
 from pollypm.work.inbox_view import inbox_tasks
 from pollypm.work.inbox_plan_reviews import (
     PLAN_APPROVAL_NODE_ID,
@@ -204,6 +205,21 @@ def _is_orphaned_project(project: str, *, known_projects: set[str]) -> bool:
     return project not in known_projects
 
 
+def _hold_reason_for_entry(item: InboxEntry) -> str:
+    for attr in ("hold_reason", "reason"):
+        value = getattr(item, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    transitions = getattr(item, "transitions", None) or []
+    for transition in reversed(list(transitions)):
+        if getattr(transition, "to_state", "") != "on_hold":
+            continue
+        reason = getattr(transition, "reason", None)
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+    return ""
+
+
 def _triage_for_entry(
     item: InboxEntry,
     *,
@@ -237,6 +253,13 @@ def _triage_for_entry(
         return "info", 2, "digest"
     if _OPS_ANOMALY_SUBJECT_RE.search(title_lower):
         return "info", 2, "operations alert"
+    if getattr(item, "source", None) == "task":
+        status_obj = getattr(item, "work_status", None)
+        status = str(getattr(status_obj, "value", status_obj) or "").lower()
+        if status == "on_hold" and is_human_needed_hold_reason(
+            _hold_reason_for_entry(item),
+        ):
+            return "action", 0, "ready except for you"
     matches = [
         rule
         for rule in _TRIAGE_PATTERN_REGISTRY

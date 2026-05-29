@@ -39,6 +39,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from pollypm.operator_holds import (
+    human_needed_hold_prompt,
+    is_human_needed_hold_reason,
+)
+
 
 @dataclass(frozen=True)
 class RecoveryAction:
@@ -322,6 +327,27 @@ def _action_permission_prompt(reason: str, task_label: str) -> RecoveryAction | 
     )
 
 
+def _action_human_needed(reason: str, task_label: str) -> RecoveryAction | None:
+    if not is_human_needed_hold_reason(reason):
+        return None
+    prompt = human_needed_hold_prompt(reason)
+    detail = (
+        f"Operator input needed: {prompt}."
+        if prompt
+        else "Operator input needed before Polly can continue."
+    )
+    return RecoveryAction(
+        title=f"Recovery action for {task_label} - operator input",
+        detail=detail,
+        cli_steps=[
+            f"pm task get {task_label}",
+            "# provide the requested input, credentials, or decision",
+            f"pm task resume {task_label}",
+        ],
+        keybinding="R",
+    )
+
+
 def _action_generic(task_label: str, status: str) -> RecoveryAction:
     """Fall-through affordance.
 
@@ -357,6 +383,7 @@ _DISPATCH = (
     _action_auto_merge,
     _action_blocked_dep,
     _action_permission_prompt,
+    _action_human_needed,
     _action_operator_decision,
 )
 

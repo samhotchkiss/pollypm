@@ -22,6 +22,21 @@ from pollypm.recovery.base import (
     SessionSignals,
 )
 from pollypm.recovery.default import DefaultRecoveryPolicy
+from pollypm.role_contract import (
+    ROLE_REGISTRY as _ROLE_REGISTRY,
+    build_remediation_message as _build_canonical_remediation,
+)
+from pollypm.signal_routing import (
+    RoutingDecision as _RoutingDecision,
+    SignalActionability as _SignalActionability,
+    SignalAudience as _SignalAudience,
+    SignalEnvelope as _SignalEnvelope,
+    SignalSeverity as _SignalSeverity,
+    compute_dedupe_key as _compute_dedupe_key,
+    envelope_for_alert as _envelope_for_alert,
+    register_routed_emitter as _register_routed_emitter,
+    route_signal as _route_signal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -271,31 +286,6 @@ _DEFAULT_POLICY = DefaultRecoveryPolicy()
 
 def _classify_session_health(signals: SessionSignals) -> SessionHealth:
     return _DEFAULT_POLICY.classify(signals)
-
-
-# #897 — persona-drift remediation now derives from the canonical
-# role contract (#885) instead of maintaining its own role tables.
-# The legacy module-level dicts below are kept as *derived views*
-# of the canonical registry so any consumer that still imports them
-# (and the legacy-table reconciliation test) keeps working without
-# pinning a stale architect.md path or persona name.
-
-from pollypm.role_contract import (
-    ROLE_REGISTRY as _ROLE_REGISTRY,
-    build_remediation_message as _build_canonical_remediation,
-    canonical_role as _canonical_role,
-)
-from pollypm.signal_routing import (
-    RoutingDecision as _RoutingDecision,
-    SignalActionability as _SignalActionability,
-    SignalAudience as _SignalAudience,
-    SignalEnvelope as _SignalEnvelope,
-    SignalSeverity as _SignalSeverity,
-    compute_dedupe_key as _compute_dedupe_key,
-    envelope_for_alert as _envelope_for_alert,
-    register_routed_emitter as _register_routed_emitter,
-    route_signal as _route_signal,
-)
 
 
 # #894 — register the heartbeat as an emitter that routes through
@@ -1241,15 +1231,17 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 pass  # API may not have supervisor (e.g., tests)
             prev_attempts = runtime.recovery_attempts if runtime else 0
             if prev_attempts >= self._CRASH_LOOP_ATTEMPT_THRESHOLD:
+                crash_reason = (
+                    f"{context.session_name} crashed and respawned "
+                    f"{prev_attempts} times"
+                )
                 _emit_routed_alert(
                     api,
                     session_name=context.session_name,
                     alert_type="crash_loop",
                     severity="error",
                     message=(
-                        f"{context.session_name} crashed and "
-                        f"respawned {prev_attempts} times — "
-                        "escalating to operator."
+                        f"{crash_reason} — escalating to operator."
                     ),
                     subject=f"{context.session_name} crash loop",
                     suggested_action=(
@@ -1258,6 +1250,36 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                         "respawning again."
                     ),
                 )
+                try:
+                    from pollypm.events.summaries import activity_summary
+
+                    msg_store = getattr(api.supervisor, "msg_store", None)
+                    append_event = getattr(msg_store, "append_event", None)
+                    if callable(append_event):
+                        append_event(
+                            scope=context.session_name,
+                            sender=context.session_name,
+                            subject="crash_loop_escalated",
+                            payload={
+                                "message": activity_summary(
+                                    summary=(
+                                        f"Raised crash_loop alert: {crash_reason}"
+                                    ),
+                                    severity="critical",
+                                    verb="escalated",
+                                    subject=context.session_name,
+                                ),
+                                "reason": crash_reason,
+                                "role": context.role,
+                                "alert_type": "crash_loop",
+                            },
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "heartbeat: crash_loop escalation event failed for %s",
+                        context.session_name,
+                        exc_info=True,
+                    )
                 alerts.append("crash_loop")
             else:
                 self._set_session_status(
@@ -1871,6 +1893,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                         subject=context.session_name,
                     ),
                     "reason": reason,
+                    "role": context.role,
+                    "alert_type": "stuck_session",
                 },
             )
         except Exception:  # noqa: BLE001

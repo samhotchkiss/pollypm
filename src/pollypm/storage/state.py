@@ -355,11 +355,11 @@ CREATE TABLE IF NOT EXISTS architect_resume_tokens (
     last_active_at TEXT NOT NULL
 );
 
--- #1546 — workspace_state: small key-value store for cascade flags that
--- live above the per-project layer. Today the only writer is the
--- product_state plumbing (the "broken" sentinel that refuses new task
--- queueing); future heartbeat-cascade flags can park here without
--- fanning out yet another table.
+    -- #1546 — workspace_state: small key-value store for cascade flags that
+    -- live above the per-project layer. Today the only writer is the
+    -- product_state plumbing (the "broken" sentinel surfaced by doctor and
+    -- terminal cascade handoff); future heartbeat-cascade flags can park
+    -- here without fanning out yet another table.
 CREATE TABLE IF NOT EXISTS workspace_state (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,
@@ -771,8 +771,8 @@ class StateStore:
         (16, "Collapse duplicate open alerts + partial unique index (#1044)", []),
         # --- Migration 17 ----------------------------------------------
         # #1546 — workspace_state key/value table for cascade-level flags
-        # (today: the product_state ``broken`` sentinel that gates new
-        # task queueing). The table is also declared in SCHEMA with
+        # (today: the product_state ``broken`` sentinel surfaced by doctor
+        # and terminal cascade handoff). The table is also declared in SCHEMA with
         # ``CREATE TABLE IF NOT EXISTS`` so fresh DBs get it on first
         # open; this migration row makes upgraded DBs that opened
         # read-only against pre-#1546 schema also pick it up the next

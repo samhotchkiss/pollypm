@@ -42,7 +42,6 @@ from pollypm.audit.tier4 import (
     SELF_PROMOTE_COOLDOWN_SECONDS,
     TIER4_BUDGET_SECONDS,
     Tier4PromotionTracker,
-    Tier4State,
     root_cause_hash,
 )
 from pollypm.audit.watchdog import (
@@ -50,7 +49,6 @@ from pollypm.audit.watchdog import (
     RULE_QUEUE_WITHOUT_MOTION,
     RULE_TASK_PROGRESS_STALE,
     TIER_2,
-    TIER_3,
 )
 
 
@@ -205,6 +203,25 @@ def test_should_auto_promote_true_at_threshold(
     assert tracker.should_auto_promote(finding, now=now + timedelta(minutes=10)) is True
 
 
+def test_should_auto_promote_first_true_on_k_plus_one_attempt(
+    tracker: Tier4PromotionTracker, now: datetime,
+) -> None:
+    """Dispatchers check before recording, so the K+1th attempt promotes."""
+    finding = _finding()
+    for i in range(AUTO_PROMOTE_THRESHOLD):
+        assert tracker.should_auto_promote(
+            finding, now=now + timedelta(minutes=i),
+        ) is False
+        tracker.record_tier3_dispatch(
+            finding, now=now + timedelta(minutes=i),
+        )
+
+    assert tracker.should_auto_promote(
+        finding,
+        now=now + timedelta(minutes=AUTO_PROMOTE_THRESHOLD),
+    ) is True
+
+
 def test_should_auto_promote_false_outside_window(
     tracker: Tier4PromotionTracker, now: datetime,
 ) -> None:
@@ -355,7 +372,7 @@ def test_clear_flips_active_to_zero(
     assert state is not None
     assert state.tier4_active is False
     # Idempotent.
-    cleared2 = tracker.clear(rch, now=now + timedelta(minutes=30))
+    tracker.clear(rch, now=now + timedelta(minutes=30))
     # The row is updated again but tier4_active was already 0 — UPDATE
     # rowcount is still 1 (we touched the row). Either result is fine
     # for idempotence; we assert the state stays cleared.
@@ -451,6 +468,105 @@ def test_auto_promote_routes_fourth_dispatch_to_tier4(
     assert state is not None
     assert state.tier4_active is True
     assert state.promotion_path == PROMOTION_PATH_WATCHDOG
+
+
+class _StubAlertStore:
+    def __init__(self) -> None:
+        self.alerts: list[tuple[str, str, str, str]] = []
+
+    def upsert_alert(
+        self,
+        session_name: str,
+        alert_type: str,
+        severity: str,
+        message: str,
+    ) -> None:
+        self.alerts.append((session_name, alert_type, severity, message))
+
+
+def test_architect_dispatch_records_tier4_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    finding = _finding(
+        rule=RULE_TASK_PROGRESS_STALE,
+        project="demo",
+        subject="demo/7",
+    )
+    monkeypatch.setattr(
+        cadence,
+        "_maybe_dispatch_to_architect",
+        lambda *_args, **_kwargs: "dispatched",
+    )
+    counters = cadence._scan_one_project_counters()
+
+    cadence._route_one_finding(
+        finding,
+        project_key="demo",
+        project_path=None,
+        msg_store=_StubAlertStore(),
+        state_store=None,
+        storage_closet_name="polly-storage",
+        config_path=None,
+        now=now,
+        counters=counters,
+    )
+
+    tracker = Tier4PromotionTracker(db_path)
+    state = tracker.get(root_cause_hash(finding))
+    assert state is not None
+    assert len(state.dispatch_history) == 1
+    assert counters["dispatches_sent"] == 1
+
+
+def test_architect_dispatch_promotes_to_tier4_after_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    finding = _finding(
+        rule=RULE_TASK_PROGRESS_STALE,
+        project="demo",
+        subject="demo/7",
+    )
+    architect_calls: list[datetime] = []
+    tier4_calls: list[dict[str, Any]] = []
+
+    def _stub_architect(*_args: Any, **kwargs: Any) -> str:
+        architect_calls.append(kwargs["now"])
+        return "dispatched"
+
+    def _stub_tier4(*_args: Any, **kwargs: Any) -> str:
+        tier4_calls.append(kwargs)
+        return "dispatched"
+
+    monkeypatch.setattr(cadence, "_maybe_dispatch_to_architect", _stub_architect)
+    monkeypatch.setattr(cadence, "_dispatch_to_operator_tier4", _stub_tier4)
+    counters = cadence._scan_one_project_counters()
+    store = _StubAlertStore()
+
+    for i in range(AUTO_PROMOTE_THRESHOLD + 1):
+        cadence._route_one_finding(
+            finding,
+            project_key="demo",
+            project_path=None,
+            msg_store=store,
+            state_store=None,
+            storage_closet_name="polly-storage",
+            config_path=None,
+            now=now + timedelta(minutes=i),
+            counters=counters,
+        )
+
+    assert len(architect_calls) == AUTO_PROMOTE_THRESHOLD
+    assert len(tier4_calls) == 1
+    assert tier4_calls[0]["promotion_path"] == PROMOTION_PATH_WATCHDOG
+    assert counters["tier4_dispatches_sent"] == 1
 
 
 def test_auto_promote_throttled_when_tier4_already_active(
@@ -718,6 +834,21 @@ class _StubServices:
             pass
 
 
+class _StubServicesNoMessageStore:
+    def __init__(self, db_path: Path) -> None:
+        from pollypm.storage.state import StateStore
+        self.state_store = StateStore(db_path)
+        self.msg_store = None
+        self.known_projects = ()
+        self.storage_closet_name = "polly-storage"
+
+    def close(self) -> None:
+        try:
+            self.state_store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def test_budget_exhaustion_routes_to_terminal_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
 ) -> None:
@@ -726,6 +857,12 @@ def test_budget_exhaustion_routes_to_terminal_path(
 
     db_path = tmp_path / "state.db"
     _patch_workspace_db(monkeypatch, db_path)
+    pushed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        cadence,
+        "_send_tier4_global_action_push",
+        lambda *, title, body: pushed.append((title, body)) or True,
+    )
 
     # Promote a finding → fast-forward past the budget.
     tracker = Tier4PromotionTracker(db_path)
@@ -771,10 +908,50 @@ def test_budget_exhaustion_routes_to_terminal_path(
     assert "Tier-4" in body
     assert "Forensics:" in body
     assert "tier4-terminal" in msgs[0]["labels"]
+    assert msgs[0]["state"] == "open"
+    assert pushed and pushed[0][0] == "PollyPM tier-4 cascade exhausted"
     # Tracker row is now demoted (active=0).
     state = tracker.get(rch)
     assert state is not None
     assert state.tier4_active is False
+
+
+def test_budget_exhaustion_retries_when_terminal_handoff_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    pushed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        cadence,
+        "_send_tier4_global_action_push",
+        lambda *, title, body: pushed.append((title, body)) or True,
+    )
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="demo", subject="demo")
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    rch = root_cause_hash(finding)
+
+    services = _StubServicesNoMessageStore(db_path)
+    try:
+        counters = cadence._sweep_tier4_budget_and_demotion(
+            services=services,
+            now=now + timedelta(seconds=TIER4_BUDGET_SECONDS + 600),
+        )
+    finally:
+        services.close()
+
+    assert counters["tier4_terminal_handoff_failed"] == 1
+    assert counters["tier4_budget_exhausted"] == 0
+    assert pushed and pushed[0][0] == "PollyPM tier-4 cascade exhausted"
+    state = tracker.get(rch)
+    assert state is not None
+    assert state.tier4_active is True
+    assert state.terminal_handoff_at is None
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +979,11 @@ def test_sweep_threads_project_path_to_per_project_audit(
 
     db_path = tmp_path / "state.db"
     _patch_workspace_db(monkeypatch, db_path)
+    monkeypatch.setattr(
+        cadence,
+        "_send_tier4_global_action_push",
+        lambda *, title, body: True,
+    )
 
     project_root = tmp_path / "demo-project"
     (project_root / ".pollypm").mkdir(parents=True)
@@ -863,6 +1045,11 @@ def test_clear_tier4_for_finding_emits_demoted(
 
     db_path = tmp_path / "state.db"
     _patch_workspace_db(monkeypatch, db_path)
+    monkeypatch.setattr(
+        cadence,
+        "_send_tier4_global_action_push",
+        lambda *, title, body: True,
+    )
     tracker = Tier4PromotionTracker(db_path)
     finding = _finding(project="demo")
     tracker.record_promotion(

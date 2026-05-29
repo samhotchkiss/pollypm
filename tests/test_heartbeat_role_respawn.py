@@ -46,17 +46,19 @@ class _RoleCrashFakeAPI:
         self.alerts_raised: list[dict] = []
         self.cleared_alerts: list[tuple[str, str]] = []
         self.cursor_updates: list[dict] = []
+        self.appended_events: list[dict] = []
         self.checkpoints: list[tuple[str, list[str]]] = []
         runtime = SimpleNamespace(
             recovery_attempts=recovery_attempts,
             status="healthy",
         )
         self.supervisor = SimpleNamespace(
+            get_session_runtime=lambda _name: runtime,
             store=SimpleNamespace(
                 get_session_runtime=lambda _name: runtime,
             ),
             config=SimpleNamespace(sessions={}, projects={}),
-            msg_store=None,
+            msg_store=SimpleNamespace(append_event=self.append_event),
         )
 
     # _process_session protocol ---------------------------------------
@@ -77,6 +79,9 @@ class _RoleCrashFakeAPI:
 
     def record_event(self, *_args, **_kwargs) -> None:
         pass
+
+    def append_event(self, **kwargs) -> None:
+        self.appended_events.append(kwargs)
 
     def raise_alert(
         self,
@@ -276,6 +281,9 @@ def test_crash_loop_threshold_escalates_instead_of_respawning() -> None:
         a.get("alert_type") == "crash_loop"
         for a in api.alerts_raised
     )
+    assert api.appended_events
+    assert api.appended_events[-1]["subject"] == "crash_loop_escalated"
+    assert api.appended_events[-1]["payload"]["role"] == "architect"
 
 
 def test_alive_role_pane_does_not_trigger_role_crashed_recovery() -> None:

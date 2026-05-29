@@ -2890,10 +2890,11 @@ def _route_tier4_to_terminal(
 ) -> bool:
     """Route a tier-4 row past its budget to the terminal path.
 
-    Sets ``product_state=broken`` (idempotent) and creates an urgent
-    inbox handoff via :func:`build_urgent_human_handoff`. Returns True
-    iff the urgent handoff was successfully written; the caller still
-    flips ``tier4_active=0`` regardless because the budget is up.
+    Sets ``product_state=broken`` (idempotent), creates an urgent inbox
+    handoff via :func:`build_urgent_human_handoff`, and fires a best-effort
+    desktop notification. Returns True iff the durable urgent handoff was
+    successfully written; callers must not mark the terminal gate until this
+    returns True because the handoff is the user-visible recovery surface.
 
     Mock-able via the ``services`` argument: the StateStore + the inbox
     sink both come from there so tests can pass a stub.
@@ -2954,9 +2955,17 @@ def _route_tier4_to_terminal(
             "tier4: set_product_state_broken raised", exc_info=True,
         )
 
+    push_title = "PollyPM tier-4 cascade exhausted"
+    push_body = (
+        f"{handoff.subject}\n"
+        f"{hypothesis}\n"
+        f"Forensics: {handoff.forensics_path}"
+    )
+
     # Drop the urgent inbox row via the same plumbing the tier-3 leg uses.
     msg_store = getattr(services, "msg_store", None)
     if msg_store is None:
+        _send_tier4_global_action_push(title=push_title, body=push_body)
         return False
     try:
         message_id = msg_store.enqueue_message(
@@ -2975,14 +2984,19 @@ def _route_tier4_to_terminal(
                 "tier": "terminal",
                 "forensics_path": handoff.forensics_path,
             },
-            state="closed",
+            state="open",
             kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
         )
-        return bool(message_id)
+        if not message_id:
+            _send_tier4_global_action_push(title=push_title, body=push_body)
+            return False
+        _send_tier4_global_action_push(title=push_title, body=push_body)
+        return True
     except Exception:  # noqa: BLE001
         logger.warning(
             "tier4: urgent handoff enqueue raised", exc_info=True,
         )
+        _send_tier4_global_action_push(title=push_title, body=push_body)
         return False
 
 
@@ -3005,7 +3019,8 @@ def _sweep_tier4_budget_and_demotion(
       product-broken — defeating the recovery (#1554 HIGH-1).
     * If ``now - tier4_entered_at`` >= budget → fire the terminal path:
       emit ``audit.tier4_budget_exhausted``, route to product-broken +
-      urgent inbox via :func:`_route_tier4_to_terminal`, then demote.
+      urgent inbox via :func:`_route_tier4_to_terminal`, then demote only
+      after the urgent handoff lands.
     * Otherwise leave the row alone — let the next tick check again.
 
     Resolved-finding demotion runs BEFORE the budget check so a row
@@ -3019,6 +3034,7 @@ def _sweep_tier4_budget_and_demotion(
     counters: dict[str, int] = {
         "tier4_budget_exhausted": 0,
         "tier4_demoted_cleared": 0,
+        "tier4_terminal_handoff_failed": 0,
     }
     tracker = _build_tier4_tracker()
     if tracker is None:
@@ -3076,9 +3092,12 @@ def _sweep_tier4_budget_and_demotion(
                     ),
                     project_path=project_path,
                 )
-                _route_tier4_to_terminal(
+                handoff_written = _route_tier4_to_terminal(
                     state=state, services=services, now=now,
                 )
+                if not handoff_written:
+                    counters["tier4_terminal_handoff_failed"] += 1
+                    continue
                 # #1997 — stamp the persistent terminal-handoff gate
                 # BEFORE clearing tier4_active. Without this, the
                 # ``tracker.clear`` below flips tier4_active to 0 and
@@ -3329,6 +3348,7 @@ def _scan_one_project_counters() -> dict[str, int]:
         "tier4_dispatches_failed": 0,
         "tier4_demoted_cleared": 0,
         "tier4_budget_exhausted": 0,
+        "tier4_terminal_handoff_failed": 0,
     }
 
 
@@ -3422,6 +3442,9 @@ def _route_one_finding(
     # #1414 — eligible findings get an architect dispatch on top
     # of the alert. Throttle window is owned by the audit log so
     # repeat dispatches are deduped across cadence-process restarts.
+    # #2434 — architect-dispatched rules also feed the tier-4
+    # promotion tracker. Otherwise tier-2 can re-brief indefinitely
+    # without ever reaching the broader-authority rung.
     # #1424 — for ``task_on_hold_stale`` we enrich the finding with
     # the reviewer's recent execution rows + inbox messages so the
     # architect's brief carries the rejection rationale, not just
@@ -3432,6 +3455,35 @@ def _route_one_finding(
         project_path=project_path,
         msg_store=msg_store,
     )
+    tracker = _build_tier4_tracker()
+    promoted = False
+    if tracker is not None:
+        try:
+            if tracker.should_auto_promote(dispatch_finding, now=now):
+                outcome = _dispatch_to_operator_tier4(
+                    dispatch_finding,
+                    project_path=project_path,
+                    now=now,
+                    promotion_path="watchdog",
+                    tracker=tracker,
+                    config_path=config_path,
+                )
+                if outcome == "dispatched":
+                    counters["tier4_dispatches_sent"] += 1
+                    promoted = True
+                elif outcome == "throttled":
+                    counters["tier4_dispatches_throttled"] += 1
+                    promoted = True
+                elif outcome == "send_failed":
+                    counters["tier4_dispatches_failed"] += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "tier4: architect auto-promote check raised for %s/%s",
+                dispatch_finding.rule, dispatch_finding.project, exc_info=True,
+            )
+    if promoted:
+        return
+
     outcome = _maybe_dispatch_to_architect(
         dispatch_finding,
         project_path=project_path,
@@ -3441,6 +3493,14 @@ def _route_one_finding(
     )
     if outcome == "dispatched":
         counters["dispatches_sent"] += 1
+        if tracker is not None:
+            try:
+                tracker.record_tier3_dispatch(dispatch_finding, now=now)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "tier4: record_tier3_dispatch raised",
+                    exc_info=True,
+                )
     elif outcome == "throttled":
         counters["dispatches_throttled"] += 1
     elif outcome == "send_failed":
@@ -3697,6 +3757,7 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "tier4_dispatches_failed": 0,
         "tier4_demoted_cleared": 0,
         "tier4_budget_exhausted": 0,
+        "tier4_terminal_handoff_failed": 0,
     }
 
     try:

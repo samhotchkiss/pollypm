@@ -178,9 +178,9 @@ def clear_product_state(store: Any) -> bool:
 def is_product_broken(store: Any) -> ProductState | None:
     """Return the ProductState iff the workspace is in the broken state.
 
-    Convenience wrapper used by the create-task gate. Returns
-    ``None`` (the falsy sentinel) when the workspace is healthy so
-    the gate can short-circuit with ``if state := is_product_broken(store):``.
+    Convenience wrapper for readers and future queueing gates. Returns
+    ``None`` (the falsy sentinel) when the workspace is healthy so callers
+    can short-circuit with ``if state := is_product_broken(store):``.
     """
     state = get_product_state(store)
     if state is None:
@@ -191,7 +191,7 @@ def is_product_broken(store: Any) -> ProductState | None:
 
 
 class ProductBrokenError(RuntimeError):
-    """Raised by the create-task gate when the workspace is broken.
+    """Error type for callers that gate new work while the workspace is broken.
 
     Carries the ``ProductState`` so callers can render the reason +
     forensics path back to the operator.

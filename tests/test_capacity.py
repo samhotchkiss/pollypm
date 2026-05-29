@@ -376,6 +376,56 @@ class TestEvaluateProactiveControllerFailover:
         assert decision.selected_account == "codex_main"
         assert decision.candidates_evaluated == 2
 
+    def test_selects_healthy_unknown_usage_candidate_as_last_resort(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        store = _store(tmp_path)
+        _usage(store, "claude_main", 90)
+        _usage(store, "claude_backup", 90)
+        store.upsert_account_usage(
+            account_name="codex_main",
+            provider="codex",
+            plan="pro",
+            health="healthy",
+            usage_summary="usage unavailable",
+            raw_text="",
+            used_pct=None,
+            remaining_pct=None,
+        )
+
+        decision = evaluate_proactive_controller_failover(
+            config,
+            store,
+            current_account="claude_main",
+        )
+
+        assert decision.action == "switch"
+        assert decision.selected_account == "codex_main"
+
+    def test_skips_unknown_state_unknown_usage_candidate(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        store = _store(tmp_path)
+        _usage(store, "claude_main", 90)
+        _usage(store, "claude_backup", 90)
+        store.upsert_account_usage(
+            account_name="codex_main",
+            provider="codex",
+            plan="pro",
+            health="unknown",
+            usage_summary="usage unavailable",
+            raw_text="",
+            used_pct=None,
+            remaining_pct=None,
+        )
+
+        decision = evaluate_proactive_controller_failover(
+            config,
+            store,
+            current_account="claude_main",
+        )
+
+        assert decision.action == "alert"
+        assert decision.selected_account is None
+
 
 # ---------------------------------------------------------------------------
 # Failover selection
@@ -405,7 +455,7 @@ class TestSelectFailoverAccount:
         decision = select_failover_account(config, store, "claude_main")
         assert not decision.should_failover
 
-    def test_selects_same_provider_non_controller(self, tmp_path: Path) -> None:
+    def test_selects_highest_headroom_candidate(self, tmp_path: Path) -> None:
         config = _config(tmp_path)
         store = _store(tmp_path)
         # Mark claude_main as exhausted
@@ -436,8 +486,8 @@ class TestSelectFailoverAccount:
 
         decision = select_failover_account(config, store, "claude_main")
         assert decision.should_failover
-        # Should prefer claude_backup (same provider, non-controller)
-        assert decision.selected_account == "claude_backup"
+        assert decision.selected_account == "codex_main"
+        assert decision.candidate_accounts == ("codex_main", "claude_backup")
 
     def test_selects_first_healthy_account_in_failover_order(self, tmp_path: Path) -> None:
         config = _config(tmp_path)

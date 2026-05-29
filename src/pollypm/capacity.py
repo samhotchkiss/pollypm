@@ -77,6 +77,7 @@ class FailoverCandidate:
     account_name: str
     provider: ProviderKind
     priority: int  # lower is better
+    remaining_pct: int | None = None
     reason: str = ""
 
 
@@ -89,6 +90,7 @@ class FailoverDecision:
     selected_account: str | None = None
     reason: str = ""
     candidates_evaluated: int = 0
+    candidate_accounts: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -308,7 +310,10 @@ def evaluate_proactive_controller_failover(
         if candidate_probe.state in FAILOVER_TRIGGERS:
             continue
         candidate_used = _probe_used_pct(candidate_probe)
-        if candidate_used is None or candidate_used >= threshold:
+        if candidate_used is None:
+            if candidate_probe.state is not CapacityState.HEALTHY:
+                continue
+        elif candidate_used >= threshold:
             continue
         if current == candidate_name:
             return ProactiveFailoverDecision(
@@ -349,12 +354,16 @@ def select_failover_account(
     config: PollyPMConfig,
     store: object | None,
     failed_account: str,
+    *,
+    require_failed_trigger: bool = True,
 ) -> FailoverDecision:
     """Select the best failover account when one fails.
 
-    Selection follows ``config.pollypm.failover_accounts`` first, then
-    the controller account, then any remaining configured accounts. The
-    first healthy account in that order wins.
+    Selection follows ``config.pollypm.failover_accounts`` first, then the
+    controller account, then any remaining configured accounts. Viable
+    accounts with known capacity are ordered by remaining headroom, with the
+    configured chain used as the tiebreaker. Unknown-headroom accounts remain
+    last-resort candidates instead of outranking known-capacity accounts.
     """
     if not config.pollypm.failover_enabled:
         return FailoverDecision(
@@ -373,7 +382,7 @@ def select_failover_account(
 
     # Check if the failed account actually needs failover
     probe = probe_capacity(config, store, failed_account)
-    if probe.state not in FAILOVER_TRIGGERS:
+    if require_failed_trigger and probe.state not in FAILOVER_TRIGGERS:
         return FailoverDecision(
             should_failover=False,
             failed_account=failed_account,
@@ -407,14 +416,17 @@ def select_failover_account(
         capacity = probe_capacity(config, store, name)
         if capacity.state in FAILOVER_TRIGGERS:
             continue  # Skip accounts that are also failing
+        remaining_pct = _probe_remaining_pct(capacity)
 
         candidates.append(FailoverCandidate(
             account_name=name,
             provider=account.provider,
             priority=order,
+            remaining_pct=remaining_pct,
             reason=(
                 f"order={order}, state={capacity.state}, "
-                f"same_provider={account.provider == failed_provider}"
+                f"same_provider={account.provider == failed_provider}, "
+                f"remaining_pct={remaining_pct if remaining_pct is not None else 'unknown'}"
             ),
         ))
 
@@ -426,16 +438,24 @@ def select_failover_account(
             candidates_evaluated=0,
         )
 
-    # Sort by configured/fallback order (lower is better)
-    candidates.sort(key=lambda c: c.priority)
+    candidates.sort(key=_failover_candidate_sort_key)
     best = candidates[0]
+    candidate_accounts = tuple(candidate.account_name for candidate in candidates)
+    remaining_label = (
+        f"{best.remaining_pct}% remaining"
+        if best.remaining_pct is not None
+        else "unknown remaining"
+    )
 
     return FailoverDecision(
         should_failover=True,
         failed_account=failed_account,
         selected_account=best.account_name,
-        reason=f"Selected {best.account_name} ({best.provider}) with priority {best.priority}",
+        reason=(
+            f"Selected {best.account_name} ({best.provider}) with {remaining_label}"
+        ),
         candidates_evaluated=len(candidates),
+        candidate_accounts=candidate_accounts,
     )
 
 
@@ -603,6 +623,24 @@ def _probe_used_pct(probe: CapacityProbeResult) -> int | None:
     if probe.used_pct is not None:
         return max(0, min(100, int(probe.used_pct)))
     return _used_pct_from_remaining(probe.remaining_pct)
+
+
+def _probe_remaining_pct(probe: CapacityProbeResult) -> int | None:
+    if probe.remaining_pct is not None:
+        return max(0, min(100, int(probe.remaining_pct)))
+    used = _probe_used_pct(probe)
+    if used is None:
+        return None
+    return max(0, min(100, 100 - used))
+
+
+def _failover_candidate_sort_key(candidate: FailoverCandidate) -> tuple[bool, int, int]:
+    remaining = candidate.remaining_pct
+    return (
+        remaining is None,
+        -(remaining if remaining is not None else -1),
+        candidate.priority,
+    )
 
 
 def _coerce_usage_threshold(value: object) -> int:

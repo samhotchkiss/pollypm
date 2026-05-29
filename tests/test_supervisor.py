@@ -102,10 +102,20 @@ def test_supervisor_failover_prefers_viable_backup(monkeypatch, tmp_path: Path) 
     config = _config(tmp_path)
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
-    launch = next(item for item in supervisor.plan_launches() if item.session.name == "operator")
+    launch = SessionLaunchSpec(
+        session=config.sessions["operator"],
+        account=config.accounts["claude_controller"],
+        window_name="pm-operator",
+        log_path=tmp_path / ".pollypm/logs/operator.log",
+        command="claude",
+    )
     restarted: dict[str, str] = {}
+    backup_auth = config.accounts["codex_backup"].home / ".codex" / "auth.json"
+    backup_auth.parent.mkdir(parents=True, exist_ok=True)
+    backup_auth.write_text("{}")
 
-    monkeypatch.setattr(supervisor, "_account_is_viable", lambda name: name == "codex_backup")
+    monkeypatch.setattr(supervisor, "_get_lease", lambda _name: None)
+    monkeypatch.setattr(supervisor, "_get_session_runtime", lambda _name: None)
     monkeypatch.setattr(
         supervisor,
         "_record_recovery_attempt",
@@ -137,9 +147,12 @@ def test_supervisor_failover_skips_pg_exhausted_account(monkeypatch, tmp_path: P
     backup_auth.write_text("{}")
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
-    launch = next(
-        item for item in supervisor.plan_launches()
-        if item.session.name == "operator"
+    launch = SessionLaunchSpec(
+        session=config.sessions["operator"],
+        account=config.accounts["claude_controller"],
+        window_name="pm-operator",
+        log_path=tmp_path / ".pollypm/logs/operator.log",
+        command="claude",
     )
     restarted: dict[str, str] = {}
 
@@ -157,6 +170,86 @@ def test_supervisor_failover_skips_pg_exhausted_account(monkeypatch, tmp_path: P
         )
 
     monkeypatch.setattr("pollypm.capacity.probe_capacity", fake_probe_capacity)
+    monkeypatch.setattr(supervisor, "_get_lease", lambda _name: None)
+    monkeypatch.setattr(supervisor, "_get_session_runtime", lambda _name: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_record_recovery_attempt",
+        lambda *_args, **_kwargs: (True, 1),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_restart_session",
+        lambda session_name, account_name, failure_type: restarted.update(
+            {"session": session_name, "account": account_name, "failure": failure_type}
+        ),
+    )
+
+    supervisor._maybe_recover_session(
+        launch,
+        failure_type="capacity_exhausted",
+        failure_message="0% left",
+    )
+
+    assert restarted == {
+        "session": "operator",
+        "account": "codex_backup",
+        "failure": "capacity_exhausted",
+    }
+
+
+def test_supervisor_failover_prefers_highest_headroom_candidate(monkeypatch, tmp_path: Path) -> None:
+    from pollypm.capacity import CapacityProbeResult, CapacityState
+
+    config = _config(tmp_path)
+    config.accounts["claude_low"] = AccountConfig(
+        name="claude_low",
+        provider=ProviderKind.CLAUDE,
+        email="claude-low@example.com",
+        home=tmp_path / ".pollypm/homes/claude_low",
+    )
+    config.pollypm.failover_accounts = ["claude_low", "codex_backup"]
+    for account_name in ("claude_low", "codex_backup"):
+        account = config.accounts[account_name]
+        if account.provider is ProviderKind.CLAUDE:
+            credentials = account.home / ".claude" / ".credentials.json"
+        else:
+            credentials = account.home / ".codex" / "auth.json"
+        credentials.parent.mkdir(parents=True, exist_ok=True)
+        credentials.write_text("{}")
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = SessionLaunchSpec(
+        session=config.sessions["operator"],
+        account=config.accounts["claude_controller"],
+        window_name="pm-operator",
+        log_path=tmp_path / ".pollypm/logs/operator.log",
+        command="claude",
+    )
+    restarted: dict[str, str] = {}
+
+    def fake_probe_capacity(config, store, account_name: str):
+        if account_name == "claude_controller":
+            state = CapacityState.EXHAUSTED
+            remaining = 0
+        elif account_name == "claude_low":
+            state = CapacityState.HEALTHY
+            remaining = 5
+        else:
+            state = CapacityState.HEALTHY
+            remaining = 80
+        return CapacityProbeResult(
+            account_name=account_name,
+            provider=config.accounts[account_name].provider,
+            state=state,
+            remaining_pct=remaining,
+            used_pct=100 - remaining,
+            reason=state.value,
+        )
+
+    monkeypatch.setattr("pollypm.capacity.probe_capacity", fake_probe_capacity)
+    monkeypatch.setattr(supervisor, "_get_lease", lambda _name: None)
+    monkeypatch.setattr(supervisor, "_get_session_runtime", lambda _name: None)
     monkeypatch.setattr(
         supervisor,
         "_record_recovery_attempt",
@@ -1664,6 +1757,7 @@ def test_restart_session_hard_failover_emits_account_failover_audit(
         "operator",
         "codex_backup",
         failure_type="auth_broken",
+        force=True,
     )
 
     events = read_events(
@@ -1684,6 +1778,62 @@ def test_restart_session_hard_failover_emits_account_failover_audit(
     assert event.metadata["provider"] == "codex"
     assert event.metadata["reason"] == "recovery_failover"
     assert event.metadata["target_session"] == "operator"
+
+
+def test_restart_session_same_account_failover_emits_suppressed_audit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.audit.log import (
+        EVENT_ACCOUNT_FAILOVER_SUPPRESSED,
+        read_events,
+    )
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = SessionLaunchSpec(
+        session=config.sessions["operator"],
+        account=config.accounts["claude_controller"],
+        window_name="pm-operator",
+        log_path=tmp_path / ".pollypm/logs/operator.log",
+        command="claude",
+    )
+    supervisor.store.upsert_session_runtime(
+        session_name="operator",
+        status="recovering",
+        effective_account="codex_backup",
+        effective_provider="codex",
+    )
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "has_session",
+        lambda _name: False,
+    )
+    monkeypatch.setattr(supervisor, "_launch_by_session", lambda _name: launch)
+    monkeypatch.setattr(supervisor, "launch_session", lambda _name: launch)
+
+    supervisor.restart_session(
+        "operator",
+        "codex_backup",
+        failure_type="auth_broken",
+        force=True,
+    )
+
+    events = read_events(
+        "pollypm",
+        project_path=tmp_path,
+        event=EVENT_ACCOUNT_FAILOVER_SUPPRESSED,
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.status == "warn"
+    assert event.metadata["failure_type"] == "auth_broken"
+    assert event.metadata["from"] == "codex_backup"
+    assert event.metadata["to"] == "codex_backup"
+    assert event.metadata["reason"] == "same_account"
 
 
 def test_auth_broken_without_candidate_emits_failover_blocked_audit(
@@ -1708,6 +1858,7 @@ def test_auth_broken_without_candidate_emits_failover_blocked_audit(
     )
 
     monkeypatch.setattr(supervisor, "_policy_recommendation", lambda *_args: None)
+    monkeypatch.setattr(supervisor, "_get_lease", lambda _name: None)
     monkeypatch.setattr(
         supervisor,
         "_record_recovery_attempt",
@@ -1734,6 +1885,56 @@ def test_auth_broken_without_candidate_emits_failover_blocked_audit(
     assert event.metadata["from"] == "claude_controller"
     assert event.metadata["to"] is None
     assert event.metadata["reason"] == "no_viable_account"
+
+
+def test_rate_limited_account_failover_emits_suppressed_audit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.audit.log import (
+        EVENT_ACCOUNT_FAILOVER_SUPPRESSED,
+        read_events,
+    )
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = SessionLaunchSpec(
+        session=config.sessions["operator"],
+        account=config.accounts["claude_controller"],
+        window_name="pm-operator",
+        log_path=tmp_path / ".pollypm/logs/operator.log",
+        command="claude",
+    )
+
+    monkeypatch.setattr(supervisor, "_policy_recommendation", lambda *_args: None)
+    monkeypatch.setattr(supervisor, "_get_lease", lambda _name: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_record_recovery_attempt",
+        lambda *_args, **_kwargs: (False, 6),
+    )
+
+    supervisor.maybe_recover_session(
+        launch,
+        failure_type="capacity_exhausted",
+        failure_message="0% left",
+    )
+
+    events = read_events(
+        "pollypm",
+        project_path=tmp_path,
+        event=EVENT_ACCOUNT_FAILOVER_SUPPRESSED,
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.status == "warn"
+    assert event.metadata["failure_type"] == "capacity_exhausted"
+    assert event.metadata["from"] == "claude_controller"
+    assert event.metadata["to"] is None
+    assert event.metadata["reason"] == "rate_limited"
+    assert event.metadata["attempts"] == 6
 
 
 def test_supervisor_record_heartbeat_routes_through_pg_facade(

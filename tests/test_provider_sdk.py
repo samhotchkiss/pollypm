@@ -205,6 +205,49 @@ def test_codex_provider_drives_status_for_new_pane_format(tmp_path: Path) -> Non
     assert snapshot.reset_at == "10:09 on 5 May"
 
 
+def test_codex_provider_dismisses_update_interstitial_before_status(tmp_path: Path) -> None:
+    adapter = CodexAdapter()
+    account = AccountConfig(
+        name="codex_primary",
+        provider=ProviderKind.CODEX,
+        home=tmp_path / "home",
+    )
+    session = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=tmp_path,
+        project="pollypm",
+    )
+    interstitial = (
+        "Update available! 0.133.0 -> 0.135.0\n"
+        "1. Update now\n"
+        "2. Skip\n"
+        "3. Skip until next version\n"
+        "Press enter to continue"
+    )
+    welcome_pane = "OpenAI Codex (v0.135.0)\n› Implement {feature}\n"
+    status_pane = (
+        "OpenAI Codex (v0.135.0)\n"
+        "/status\n"
+        "  Weekly limit: [###############-----] 75% left "
+        "(resets 10:09 on 5 May)\n"
+        "› Implement {feature}\n"
+    )
+    tmux = _FakeTmux([interstitial, welcome_pane, status_pane])
+
+    snapshot = adapter.collect_usage_snapshot(
+        tmux, "session:0", account=account, session=session,
+    )
+
+    assert tmux.sent[0] == ("session:0", "", True)
+    assert ("session:0", "/status", True) in tmux.sent
+    assert snapshot.health == "healthy"
+    assert snapshot.used_pct == 25
+    assert snapshot.remaining_pct == 75
+
+
 def test_codex_provider_uses_cli_prompt_for_fresh_launch(tmp_path: Path) -> None:
     adapter = CodexAdapter()
     account = AccountConfig(

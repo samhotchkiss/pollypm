@@ -297,6 +297,7 @@ EVENT_ACCOUNT_FAILOVER_PROACTIVE = "account.failover.proactive"
 EVENT_ACCOUNT_FAILOVER_ENGAGED = "account.failover.engaged"
 EVENT_ACCOUNT_FAILOVER_BLOCKED = "account.failover.blocked"
 EVENT_ACCOUNT_FAILOVER_FAILED = "account.failover.failed"
+EVENT_ACCOUNT_FAILOVER_SUPPRESSED = "account.failover.suppressed"
 # #2296 — public agent-side refusal observability. Agents use the
 # narrow ``pm audit agent-refusal`` command when they refuse a message
 # claiming PollyPM authority but missing/failing the auth marker.

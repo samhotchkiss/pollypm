@@ -98,6 +98,14 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     )
 
 
+def _backdate_pg_lease(pg_schema_pool, session_name: str, updated_at: str) -> None:
+    with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE leases SET updated_at = %s WHERE session_name = %s",
+            (updated_at, session_name),
+        )
+
+
 def test_supervisor_failover_prefers_viable_backup(monkeypatch, tmp_path: Path) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)
@@ -312,7 +320,7 @@ def test_human_input_creates_automatic_lease(monkeypatch, tmp_path: Path) -> Non
 
     supervisor.send_input("operator", "hello", owner="human")
 
-    lease = supervisor.store.get_lease("operator")
+    lease = supervisor._get_lease("operator")
     assert lease is not None
     assert lease.owner == "human"
 
@@ -676,7 +684,7 @@ def test_release_lease_clears_active_lease_and_records_event(tmp_path: Path) -> 
 
     supervisor.release_lease("operator", expected_owner="human")
 
-    assert supervisor.store.get_lease("operator") is None
+    assert supervisor._get_lease("operator") is None
     # #349: record_event now writes the audit row to the unified
     # ``messages`` table. Lease transitions use the synchronous Store
     # path so this query sees the row immediately.
@@ -699,28 +707,27 @@ def test_release_lease_preserves_reclaimed_lease_for_different_owner(tmp_path: P
 
     supervisor.release_lease("operator", expected_owner="polly")
 
-    lease = supervisor.store.get_lease("operator")
+    lease = supervisor._get_lease("operator")
     assert lease is not None
     assert lease.owner == "human"
 
 
-def test_release_expired_leases_clears_stale_lease_and_records_event(tmp_path: Path) -> None:
+def test_release_expired_leases_clears_stale_lease_and_records_event(
+    tmp_path: Path,
+    pg_schema_pool,
+) -> None:
     config = _config(tmp_path)
     config.pollypm.lease_timeout_minutes = 30
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
     supervisor.claim_lease("operator", "human", "manual takeover")
     expired_at = (datetime.now(UTC) - timedelta(minutes=31)).isoformat()
-    supervisor.store.execute(
-        "UPDATE leases SET updated_at = ? WHERE session_name = ?",
-        (expired_at, "operator"),
-    )
-    supervisor.store.commit()
+    _backdate_pg_lease(pg_schema_pool, "operator", expired_at)
 
     released = supervisor.release_expired_leases(now=datetime.now(UTC))
 
     assert [lease.session_name for lease in released] == ["operator"]
-    assert supervisor.store.get_lease("operator") is None
+    assert supervisor._get_lease("operator") is None
     # #349: lease transitions land in ``messages`` via the sync Store path.
     events = supervisor.msg_store.query_messages(
         type="event", scope="operator", limit=5,
@@ -735,7 +742,10 @@ def test_release_expired_leases_clears_stale_lease_and_records_event(tmp_path: P
     )
 
 
-def test_release_expired_leases_pluralises_minute_in_message(tmp_path: Path) -> None:
+def test_release_expired_leases_pluralises_minute_in_message(
+    tmp_path: Path,
+    pg_schema_pool,
+) -> None:
     """Cycle 110 — the auto-release event message hard-pluralised
     ``minutes``, so a 1-minute lease timeout produced ``after 1
     minutes``. Match the noun to the count."""
@@ -745,11 +755,7 @@ def test_release_expired_leases_pluralises_minute_in_message(tmp_path: Path) -> 
     supervisor.ensure_layout()
     supervisor.claim_lease("operator", "human", "manual takeover")
     expired_at = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
-    supervisor.store.execute(
-        "UPDATE leases SET updated_at = ? WHERE session_name = ?",
-        (expired_at, "operator"),
-    )
-    supervisor.store.commit()
+    _backdate_pg_lease(pg_schema_pool, "operator", expired_at)
     supervisor.release_expired_leases(now=datetime.now(UTC))
     events = supervisor.msg_store.query_messages(
         type="event", scope="operator", limit=5,
@@ -760,7 +766,10 @@ def test_release_expired_leases_pluralises_minute_in_message(tmp_path: Path) -> 
     assert any("after 1 minute" in m and "1 minutes" not in m for m in messages), messages
 
 
-def test_release_expired_leases_is_available_for_alerts_gc_handler(monkeypatch, tmp_path: Path) -> None:
+def test_release_expired_leases_is_available_for_alerts_gc_handler(
+    tmp_path: Path,
+    pg_schema_pool,
+) -> None:
     """Lease release is now the ``alerts.gc`` recurring handler's job
     (migrated from inline Phase 1 dispatch by #184). Verify the
     supervisor-side API is still intact so the handler can call it.
@@ -771,15 +780,11 @@ def test_release_expired_leases_is_available_for_alerts_gc_handler(monkeypatch, 
     supervisor.ensure_layout()
     supervisor.claim_lease("operator", "human", "manual takeover")
     expired_at = (datetime.now(UTC) - timedelta(minutes=31)).isoformat()
-    supervisor.store.execute(
-        "UPDATE leases SET updated_at = ? WHERE session_name = ?",
-        (expired_at, "operator"),
-    )
-    supervisor.store.commit()
+    _backdate_pg_lease(pg_schema_pool, "operator", expired_at)
 
     released = supervisor.release_expired_leases()
     assert [lease.session_name for lease in released] == ["operator"]
-    assert supervisor.store.get_lease("operator") is None
+    assert supervisor._get_lease("operator") is None
 
 
 def test_heartbeat_uses_separate_tmux_session(monkeypatch, tmp_path: Path) -> None:
@@ -1508,7 +1513,7 @@ def test_switch_session_account_restarts_in_place(monkeypatch, tmp_path: Path) -
         "account": "codex_backup",
         "failure": "manual_switch",
     }
-    runtime = supervisor.store.get_session_runtime("operator")
+    runtime = supervisor.get_session_runtime("operator")
     assert runtime is not None
     assert runtime.effective_account == "codex_backup"
 
@@ -1524,16 +1529,19 @@ def test_account_is_viable_for_claude_when_credentials_file_exists(tmp_path: Pat
 
 
 def test_account_is_viable_rejects_runtime_marked_exhausted(tmp_path: Path) -> None:
+    from pollypm.storage.pg_accounts import upsert_account_runtime
+
     config = _config(tmp_path)
     supervisor = Supervisor(config)
     auth_path = config.accounts["codex_backup"].home / ".codex" / "auth.json"
     auth_path.parent.mkdir(parents=True, exist_ok=True)
     auth_path.write_text("{}")
-    supervisor.store.upsert_account_runtime(
+    upsert_account_runtime(
         account_name="codex_backup",
         provider="codex",
         status="exhausted",
         reason="usage cap reached",
+        config=config,
     )
 
     assert supervisor._account_is_viable("codex_backup") is False
@@ -1800,7 +1808,7 @@ def test_restart_session_same_account_failover_emits_suppressed_audit(
         log_path=tmp_path / ".pollypm/logs/operator.log",
         command="claude",
     )
-    supervisor.store.upsert_session_runtime(
+    supervisor.upsert_session_runtime(
         session_name="operator",
         status="recovering",
         effective_account="codex_backup",
@@ -1997,6 +2005,12 @@ def test_stalled_worker_gets_heartbeat_nudge_after_five_identical_cycles(monkeyp
     )
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
+    monkeypatch.setattr(
+        supervisor.store,
+        "recent_heartbeats",
+        supervisor.recent_heartbeats,
+    )
+    monkeypatch.setattr(supervisor.store, "get_lease", supervisor._get_lease)
     launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
     window = TmuxWindow(
         session=supervisor.storage_closet_session_name(),
@@ -2010,7 +2024,7 @@ def test_stalled_worker_gets_heartbeat_nudge_after_five_identical_cycles(monkeyp
     )
 
     for index in range(4):
-        supervisor.store.record_heartbeat(
+        supervisor.record_heartbeat(
             session_name="worker",
             tmux_window=window.name,
             pane_id=window.pane_id,
@@ -2020,7 +2034,7 @@ def test_stalled_worker_gets_heartbeat_nudge_after_five_identical_cycles(monkeyp
             snapshot_path=str(tmp_path / f"snapshot-{index}.txt"),
             snapshot_hash="same-hash",
         )
-    supervisor.store.record_heartbeat(
+    supervisor.record_heartbeat(
         session_name="worker",
         tmux_window=window.name,
         pane_id=window.pane_id,
@@ -2050,7 +2064,7 @@ def test_stalled_worker_gets_heartbeat_nudge_after_five_identical_cycles(monkeyp
         launch,
         window,
         pane_text="Still stalled",
-        previous_log_bytes=150,
+        previous_log_bytes=200,
         previous_snapshot_hash="same-hash",
         current_log_bytes=200,
         current_snapshot_hash="same-hash",
@@ -2074,6 +2088,12 @@ def test_stalled_worker_nudge_skips_when_human_holds_lease(monkeypatch, tmp_path
     )
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
+    monkeypatch.setattr(
+        supervisor.store,
+        "recent_heartbeats",
+        supervisor.recent_heartbeats,
+    )
+    monkeypatch.setattr(supervisor.store, "get_lease", supervisor._get_lease)
     launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
     window = TmuxWindow(
         session=supervisor.storage_closet_session_name(),
@@ -2087,7 +2107,7 @@ def test_stalled_worker_nudge_skips_when_human_holds_lease(monkeypatch, tmp_path
     )
 
     for index in range(4):
-        supervisor.store.record_heartbeat(
+        supervisor.record_heartbeat(
             session_name="worker",
             tmux_window=window.name,
             pane_id=window.pane_id,
@@ -2097,7 +2117,7 @@ def test_stalled_worker_nudge_skips_when_human_holds_lease(monkeypatch, tmp_path
             snapshot_path=str(tmp_path / f"snapshot-{index}.txt"),
             snapshot_hash="same-hash",
         )
-    supervisor.store.record_heartbeat(
+    supervisor.record_heartbeat(
         session_name="worker",
         tmux_window=window.name,
         pane_id=window.pane_id,
@@ -2125,7 +2145,7 @@ def test_stalled_worker_nudge_skips_when_human_holds_lease(monkeypatch, tmp_path
         launch,
         window,
         pane_text="Still stalled",
-        previous_log_bytes=150,
+        previous_log_bytes=200,
         previous_snapshot_hash="same-hash",
         current_log_bytes=200,
         current_snapshot_hash="same-hash",
@@ -2154,7 +2174,7 @@ def test_recovery_hard_limit_stops_after_many_failures(tmp_path: Path) -> None:
     # Simulate many recovery attempts within the current window
     # so _record_recovery_attempt increments past the hard limit.
     now = datetime.now(UTC).isoformat()
-    supervisor.store.upsert_session_runtime(
+    supervisor.upsert_session_runtime(
         session_name="operator",
         status="recovering",
         recovery_attempts=21,  # already past hard limit of 20
@@ -2168,7 +2188,7 @@ def test_recovery_hard_limit_stops_after_many_failures(tmp_path: Path) -> None:
         failure_message="window gone",
     )
 
-    runtime = supervisor.store.get_session_runtime("operator")
+    runtime = supervisor.get_session_runtime("operator")
     assert runtime.status == "degraded"
     alerts = supervisor.open_alerts()
     recovery_alerts = [a for a in alerts if a.alert_type == "recovery_limit"]
@@ -3058,7 +3078,7 @@ def test_restart_session_skips_recovery_prompt_for_heartbeat(
         "heartbeat-supervisor recovery must not inject a recovery prompt"
     )
     # Post-recovery cleanup still runs.
-    runtime = supervisor.store.get_session_runtime("heartbeat")
+    runtime = supervisor.get_session_runtime("heartbeat")
     assert runtime is not None
     assert runtime.status == "healthy"
 

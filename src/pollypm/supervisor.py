@@ -2800,7 +2800,11 @@ class Supervisor:
                 account_name,
                 exc_info=True,
             )
-        if account.home is None:
+        return self._account_has_credentials(account_name)
+
+    def _account_has_credentials(self, account_name: str) -> bool:
+        account = self.config.accounts.get(account_name)
+        if account is None or account.home is None:
             return False
         if account.provider is ProviderKind.CLAUDE:
             claude_dir = account.home / ".claude"
@@ -2815,18 +2819,54 @@ class Supervisor:
             return (account.home / ".codex" / "auth.json").exists()
         return False
 
+    def _effective_account_for_launch(self, launch: SessionLaunchSpec) -> str:
+        runtime = self._get_session_runtime(launch.session.name)
+        if runtime is not None and runtime.effective_account in self.config.accounts:
+            return runtime.effective_account
+        return launch.account.name
+
     def _candidate_accounts(self, launch: SessionLaunchSpec, *, allow_same: bool) -> list[str]:
         preferred = []
-        current = launch.account.name
+        current = self._effective_account_for_launch(launch)
+        if not allow_same:
+            try:
+                from pollypm.capacity import select_failover_account
+
+                decision = select_failover_account(
+                    self.config,
+                    None,
+                    current,
+                    require_failed_trigger=False,
+                )
+                return [
+                    name
+                    for name in decision.candidate_accounts
+                    if self._account_has_credentials(name)
+                ]
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "account failover selector failed for %s; falling back",
+                    current,
+                    exc_info=True,
+                )
         if allow_same:
             preferred.append(current)
         for name in self.config.pollypm.failover_accounts:
-            if name not in preferred:
+            if not allow_same and name == current:
+                continue
+            if name in self.config.accounts and name not in preferred:
                 preferred.append(name)
         controller = self.config.pollypm.controller_account
-        if controller and controller not in preferred:
+        if (
+            controller
+            and controller in self.config.accounts
+            and controller not in preferred
+            and (allow_same or controller != current)
+        ):
             preferred.append(controller)
         for name in self.config.accounts:
+            if not allow_same and name == current:
+                continue
             if name not in preferred:
                 preferred.append(name)
         same_provider = [name for name in preferred if self.config.accounts[name].provider is launch.session.provider]
@@ -3833,6 +3873,25 @@ class Supervisor:
                 last_failure_type=failure_type,
                 last_failure_message=failure_message,
             )
+            if failure_type in self._ACCOUNT_FAILOVER_FAILURES:
+                from pollypm.audit.log import EVENT_ACCOUNT_FAILOVER_SUPPRESSED
+
+                self._emit_session_recovery_audit(
+                    EVENT_ACCOUNT_FAILOVER_SUPPRESSED,
+                    launch,
+                    status="warn",
+                    actor="supervisor",
+                    metadata={
+                        "failure_type": failure_type,
+                        "failure_message": failure_message,
+                        "from": launch.account.name,
+                        "to": None,
+                        "account": launch.account.name,
+                        "provider": launch.account.provider.value,
+                        "reason": "rate_limited",
+                        "attempts": attempts,
+                    },
+                )
             return
 
         # Force failover for auth_broken / capacity_exhausted and
@@ -4069,27 +4128,43 @@ class Supervisor:
                     actor="supervisor",
                     metadata=recovery_metadata,
                 )
-            if (
-                failure_type in self._ACCOUNT_FAILOVER_FAILURES
-                and account_name != previous_account
-            ):
-                from pollypm.audit.log import EVENT_ACCOUNT_FAILOVER_ENGAGED
+            if failure_type in self._ACCOUNT_FAILOVER_FAILURES:
+                if account_name != previous_account:
+                    from pollypm.audit.log import EVENT_ACCOUNT_FAILOVER_ENGAGED
 
-                self._emit_session_recovery_audit(
-                    EVENT_ACCOUNT_FAILOVER_ENGAGED,
-                    launch,
-                    status="ok",
-                    actor="supervisor",
-                    metadata={
-                        "failure_type": failure_type,
-                        "from": previous_account,
-                        "to": account_name,
-                        "account": account_name,
-                        "provider": account.provider.value,
-                        "configured_account": getattr(launch.session, "account", ""),
-                        "reason": "recovery_failover",
-                    },
-                )
+                    self._emit_session_recovery_audit(
+                        EVENT_ACCOUNT_FAILOVER_ENGAGED,
+                        launch,
+                        status="ok",
+                        actor="supervisor",
+                        metadata={
+                            "failure_type": failure_type,
+                            "from": previous_account,
+                            "to": account_name,
+                            "account": account_name,
+                            "provider": account.provider.value,
+                            "configured_account": getattr(launch.session, "account", ""),
+                            "reason": "recovery_failover",
+                        },
+                    )
+                else:
+                    from pollypm.audit.log import EVENT_ACCOUNT_FAILOVER_SUPPRESSED
+
+                    self._emit_session_recovery_audit(
+                        EVENT_ACCOUNT_FAILOVER_SUPPRESSED,
+                        launch,
+                        status="warn",
+                        actor="supervisor",
+                        metadata={
+                            "failure_type": failure_type,
+                            "from": previous_account,
+                            "to": account_name,
+                            "account": account_name,
+                            "provider": account.provider.value,
+                            "configured_account": getattr(launch.session, "account", ""),
+                            "reason": "same_account",
+                        },
+                    )
         # Inject recovery prompt so the agent knows what it was doing.
         # For role-scoped agents (reviewer / heartbeat) prepend an
         # identity reminder so a recovery that lands inside a noisy

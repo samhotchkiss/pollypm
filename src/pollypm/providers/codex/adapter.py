@@ -110,6 +110,10 @@ class CodexAdapter(ProviderAdapterBase):
                 tmux.send_keys(target, "", press_enter=True)
                 time.sleep(1)
                 continue
+            if self._is_enter_to_continue_interstitial(lowered):
+                tmux.send_keys(target, "", press_enter=True)
+                time.sleep(1)
+                continue
             # Codex 0.125+ surfaces usage only via the /status slash command.
             # Wait until the prompt is up (›) then drive /status, give it a
             # beat to render, and parse the response.
@@ -123,6 +127,14 @@ class CodexAdapter(ProviderAdapterBase):
                     continue
             time.sleep(1)
         return self._parse_usage_text(text)
+
+    @staticmethod
+    def _is_enter_to_continue_interstitial(lowered_text: str) -> bool:
+        if "press enter to continue" not in lowered_text:
+            return False
+        if "update available" in lowered_text:
+            return True
+        return "openai codex" not in lowered_text or "›" not in lowered_text
 
     def _parse_usage_text(self, text: str) -> ProviderUsageSnapshot:
         # Codex /status surfaces multiple buckets — typically a 5h limit and a

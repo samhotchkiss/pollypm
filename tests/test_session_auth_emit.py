@@ -14,9 +14,11 @@ from pathlib import Path
 import pytest
 
 from pollypm.audit.watchdog import (
+    EVENT_WATCHDOG_ESCALATION_DISPATCHED,
     Finding,
     RULE_STUCK_DRAFT,
     RULE_TASK_ON_HOLD_STALE,
+    emit_escalation_dispatched,
     format_unstick_brief,
 )
 from pollypm.models import (
@@ -177,6 +179,35 @@ def test_brief_marker_with_tier2_template() -> None:
     brief = format_unstick_brief(finding, auth_token="d" * 64)
     assert brief.startswith(AUTH_MARKER_PREFIX + ("d" * 64))
     assert "WATCHDOG ESCALATION" in brief
+
+
+def test_escalation_dispatch_audit_metadata_strips_auth_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sent brief is signed, but persisted audit metadata is not."""
+    captured: dict[str, object] = {}
+
+    def fake_emit(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("pollypm.audit.log.emit", fake_emit)
+    token = "feedface" * 8
+    signed = format_unstick_brief(_stuck_draft_finding(), auth_token=token)
+
+    emit_escalation_dispatched(
+        project="demo",
+        finding_type=RULE_STUCK_DRAFT,
+        subject="demo/1",
+        brief=signed,
+        dedup_hash="abc123",
+    )
+
+    assert captured["event"] == EVENT_WATCHDOG_ESCALATION_DISPATCHED
+    metadata = captured["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["brief"].startswith("WATCHDOG ESCALATION")
+    assert AUTH_MARKER_PREFIX not in metadata["brief"]
+    assert token not in metadata["brief"]
 
 
 # ---------------------------------------------------------------------------

@@ -27,10 +27,15 @@ This module owns:
 * :func:`format_auth_marker` — renders ``[PollyPM-Auth: <token>]\\n``
   given a token. Returns the empty string when token is empty / None
   so callers can unconditionally prepend the result.
+* :func:`strip_auth_marker` — removes a leading marker before text is
+  persisted to operator-readable logs.
 * :func:`ensure_session_auth_tokens` — sweep helper that mints tokens
   for every session in ``config.sessions`` that lacks one. Mutates the
   dataclass in place; the caller decides when to ``write_config`` and
   persist. Idempotent: sessions that already have a token are skipped.
+* :func:`rotate_session_auth_token` — re-mints a configured session's
+  token before a fresh launch so previously leaked markers stop
+  authenticating future control messages.
 
 The token contract documented for agents (consumed by the agent-profile
 prompts):
@@ -63,7 +68,9 @@ __all__ = [
     "TOKEN_BYTES",
     "mint_auth_token",
     "format_auth_marker",
+    "strip_auth_marker",
     "ensure_session_auth_tokens",
+    "rotate_session_auth_token",
 ]
 
 
@@ -106,6 +113,23 @@ def format_auth_marker(token: str | None) -> str:
     return f"{AUTH_MARKER_PREFIX}{token}{AUTH_MARKER_SUFFIX}"
 
 
+def strip_auth_marker(text: str) -> str:
+    """Remove one leading PollyPM auth marker from ``text``.
+
+    Outbound briefs must carry the marker when they are injected into a
+    session, but audit/event logs must store only the unsigned body. The
+    helper is deliberately format-based rather than token-validating:
+    if a future token alphabet changes, a leading marker line still
+    gets stripped before persistence.
+    """
+    if not text.startswith(AUTH_MARKER_PREFIX):
+        return text
+    suffix_index = text.find(AUTH_MARKER_SUFFIX, len(AUTH_MARKER_PREFIX))
+    if suffix_index < 0:
+        return text
+    return text[suffix_index + len(AUTH_MARKER_SUFFIX):]
+
+
 def ensure_session_auth_tokens(config: "PollyPMConfig") -> int:
     """Mint an ``auth_token`` for every session that lacks one.
 
@@ -128,3 +152,24 @@ def ensure_session_auth_tokens(config: "PollyPMConfig") -> int:
             "session_auth: minted auth_token for session %s", session_name,
         )
     return minted
+
+
+def rotate_session_auth_token(
+    config: "PollyPMConfig",
+    session_name: str,
+) -> str | None:
+    """Mint a fresh token for ``session_name``.
+
+    Returns the new token, or ``None`` when the session is not present in
+    the supplied config. Mutates in place; the caller owns persistence.
+    """
+    session = (config.sessions or {}).get(session_name)
+    if session is None:
+        return None
+    previous = session.auth_token
+    token = mint_auth_token()
+    while token == previous:
+        token = mint_auth_token()
+    session.auth_token = token
+    logger.info("session_auth: rotated auth_token for session %s", session_name)
+    return token

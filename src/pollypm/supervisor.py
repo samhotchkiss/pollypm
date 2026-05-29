@@ -58,7 +58,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1066,6 +1066,11 @@ class Supervisor:
 
         failures: list[str] = []
         for controller_account in self._controller_candidates():
+            self._rotate_auth_tokens_for_fresh_launches(
+                session.name
+                for session in self.config.sessions.values()
+                if session.enabled
+            )
             launches = self.plan_launches(controller_account=controller_account)
             if not launches:
                 raise RuntimeError("No enabled sessions found in config.")
@@ -4261,6 +4266,75 @@ class Supervisor:
             self._stabilize_launch(launch, target, on_status=on_status)
         return launch
 
+    def _rotate_auth_tokens_for_fresh_launches(
+        self,
+        session_names: Iterable[str],
+    ) -> None:
+        """Rotate auth tokens before creating fresh agent panes.
+
+        The auth contract tells agents a token is renewed on each fresh
+        launch. Keep that guarantee true before the launch planner
+        renders prompts/commands, and persist through the shared config
+        RMW lock when the config came from disk. Hand-built test configs
+        without ``config_path`` rotate only in memory so tests never
+        accidentally mutate the operator's default config.
+        """
+        names = [
+            name for name in dict.fromkeys(session_names)
+            if name in self.config.sessions
+        ]
+        if not names:
+            return
+        from pollypm.session_auth import rotate_session_auth_token
+
+        config_path = getattr(self.config, "config_path", None)
+        if config_path is None:
+            changed = False
+            for name in names:
+                rotated = rotate_session_auth_token(self.config, name)
+                changed = rotated is not None or changed
+            if changed:
+                self.invalidate_launch_cache()
+            return
+
+        from pollypm.config import config_rmw_lock, load_config, write_config
+
+        rotated: list[str] = []
+        try:
+            with config_rmw_lock(config_path):
+                fresh = load_config(config_path)
+                for name in names:
+                    if rotate_session_auth_token(fresh, name) is not None:
+                        rotated.append(name)
+                if rotated:
+                    write_config(fresh, config_path, force=True)
+                    self.config = fresh
+                    self._launch_planner_instance = None
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "session_auth: failed to rotate auth tokens before launch",
+                exc_info=True,
+            )
+            raise RuntimeError(
+                "failed to rotate session auth token before launch"
+            ) from None
+        if rotated:
+            self.invalidate_launch_cache()
+
+    def _rotate_auth_token_for_fresh_launch(self, session_name: str) -> bool:
+        before = (
+            self.config.sessions.get(session_name).auth_token
+            if session_name in self.config.sessions
+            else None
+        )
+        self._rotate_auth_tokens_for_fresh_launches([session_name])
+        after = (
+            self.config.sessions.get(session_name).auth_token
+            if session_name in self.config.sessions
+            else None
+        )
+        return bool(after and after != before)
+
     def _refresh_architect_worktree_before_launch(
         self,
         launch: SessionLaunchSpec,
@@ -4355,6 +4429,12 @@ class Supervisor:
         # #1096 — scope existence-check to the launch's tmux_session.
         if (tmux_session, launch.window_name) in window_map:
             return launch, None
+        if self._rotate_auth_token_for_fresh_launch(session_name):
+            launch = self._launch_by_session(session_name)
+            tmux_session = self._tmux_session_for_launch(launch)
+            window_map = self._window_map()
+            if (tmux_session, launch.window_name) in window_map:
+                return launch, None
         self._refresh_architect_worktree_before_launch(launch)
         existing_claude_ids: set[str] | None = None
         if (

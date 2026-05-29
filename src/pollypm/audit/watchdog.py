@@ -3481,13 +3481,16 @@ def emit_escalation_dispatched(
     """Emit a ``watchdog.escalation_dispatched`` event.
 
     The metadata carries enough to reconstruct the dispatch decision:
-    finding_type, subject, and the brief that was sent. #2015 — also
+    finding_type, subject, and the unsigned brief body. #2015 — also
     carries ``dedup_hash`` (the subject-independent finding-body hash
     from :func:`dispatch_dedup_hash`) so the throttle reader can
     collapse same-root-cause emits across sibling subjects.
     Best-effort — never raises.
     """
     from pollypm.audit.log import emit as _audit_emit
+    from pollypm.session_auth import strip_auth_marker
+
+    audit_brief = strip_auth_marker(brief)
     try:
         _audit_emit(
             event=EVENT_WATCHDOG_ESCALATION_DISPATCHED,
@@ -3498,7 +3501,7 @@ def emit_escalation_dispatched(
             metadata={
                 "finding_type": finding_type,
                 "subject": subject,
-                "brief": brief,
+                "brief": audit_brief,
                 "dedup_hash": dedup_hash,
             },
             project_path=project_path,

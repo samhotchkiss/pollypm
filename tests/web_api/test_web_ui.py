@@ -1742,7 +1742,7 @@ def test_render_dashboard_real_payload_executes() -> None:
     assert ">5<" in rendered, "tracked_count value 5 missing"
     assert "58% left this week" in rendered, "quota summary missing"
     assert "1234 today / 5678 total tokens" in rendered, "token line missing"
-    assert "5 things need you" in rendered, "lead headline missing"
+    assert "12 things need you" in rendered, "lead headline missing"
     assert 'role="button"' in rendered
     assert 'title="Open inbox"' in rendered
     assert 'title="Open alerts"' in rendered

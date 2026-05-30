@@ -1155,17 +1155,6 @@
     return count === 1 ? singular : (pluralText || singular + "s");
   }
 
-  function blockedProjectCount(data) {
-    const projects = data && Array.isArray(data.projects) ? data.projects : [];
-    return projects.filter((project) => {
-      const projectState = String(project.state || "").toLowerCase();
-      if (projectState === "blocked" || projectState === "on_hold") return true;
-      const counts = project.task_counts && typeof project.task_counts === "object"
-        ? project.task_counts : {};
-      return numeric(counts.blocked) + numeric(counts.on_hold) > 0;
-    }).length;
-  }
-
   function dashboardStatus(data) {
     if (!data || typeof data !== "object") {
       return {
@@ -1178,9 +1167,9 @@
     const rollups = data.rollups && typeof data.rollups === "object"
       ? data.rollups : {};
     const planReviews = numeric(rollups.pending_plan_reviews);
+    const inbox = numeric(rollups.open_inbox_count);
     const alerts = numeric(rollups.alert_count);
-    const blockedProjects = blockedProjectCount(data);
-    const total = planReviews + alerts + blockedProjects;
+    const total = planReviews + inbox + alerts;
     if (total === 0) {
       const sweeps = numeric(rollups.sweep_count_24h);
       const recoveries = numeric(rollups.recovery_count_24h);
@@ -1188,7 +1177,7 @@
         ? "24h: " + sweeps + " "
           + plural(sweeps, "sweep") + " / " + recoveries + " "
           + plural(recoveries, "recovery", "recoveries") + "."
-        : "No plan reviews, blockers, or alerts waiting.";
+        : "No inbox items, plan reviews, or alerts waiting.";
       return {
         title: "All handled - Polly's got it",
         detail: proof,
@@ -1206,14 +1195,14 @@
         target: "plan-review",
       };
     }
-    if (blockedProjects > 0) {
+    if (inbox > 0) {
       return {
         title: total + " " + plural(total, "thing") + " "
           + (total === 1 ? "needs" : "need") + " you",
-        detail: blockedProjects + " "
-          + plural(blockedProjects, "blocked project") + " waiting.",
-        actionLabel: "Open blocked tasks",
-        target: "blocked-tasks",
+        detail: inbox + " "
+          + plural(inbox, "inbox item") + " waiting.",
+        actionLabel: "Open inbox",
+        target: "inbox",
       };
     }
     return {
@@ -1229,13 +1218,6 @@
     if (!status) return;
     if (status.target === "plan-review") {
       selectInbox({ type: "plan_review" });
-      return;
-    }
-    if (status.target === "blocked-tasks") {
-      state.taskStatusFilter = "blocked";
-      const filter = $("task-status-filter");
-      if (filter) filter.value = state.taskStatusFilter;
-      loadSurfaces();
       return;
     }
     if (status.target === "alerts") {

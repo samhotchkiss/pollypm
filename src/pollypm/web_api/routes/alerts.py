@@ -188,10 +188,19 @@ def list_alerts_endpoint(
 ) -> AlertsResponse:
     alerts = _read_open_alerts(config)
     if not include_operational:
-        alerts = [
-            alert for alert in alerts
-            if not is_operational_alert(alert.alert_type)
-        ]
+        try:
+            from pollypm.dashboard_data import dashboard_actionable_alerts
+
+            alerts = dashboard_actionable_alerts(config, alerts)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "alerts: actionable alert filter failed; using operational-only filter",
+                exc_info=True,
+            )
+            alerts = [
+                alert for alert in alerts
+                if not is_operational_alert(alert.alert_type)
+            ]
     total = len(alerts)
     rows = [_alert_to_response(alert) for alert in alerts[:limit]]
     return AlertsResponse(

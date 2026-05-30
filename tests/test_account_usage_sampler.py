@@ -23,7 +23,6 @@ from pollypm.models import (
     RuntimeKind,
 )
 from pollypm.provider_sdk import ProviderUsageSnapshot
-from pollypm.storage.state import StateStore
 
 class _FakeTmux:
     def __init__(self) -> None:
@@ -79,8 +78,9 @@ def _config(tmp_path: Path) -> tuple[Path, PollyPMConfig]:
 
 
 def test_refresh_account_usage_persists_structured_fields(monkeypatch, tmp_path: Path) -> None:
-    config_path, config = _config(tmp_path)
+    config_path, _config_obj = _config(tmp_path)
     fake_tmux = _FakeTmux()
+    written: list[AccountUsageSample] = []
 
     monkeypatch.setattr(
         "pollypm.account_usage_sampler._build_probe_command",
@@ -99,6 +99,14 @@ def test_refresh_account_usage_persists_structured_fields(monkeypatch, tmp_path:
             period_label="current week",
         ),
     )
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler._read_cached_usage",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler._write_cached_usage",
+        lambda _config, sample: written.append(sample),
+    )
 
     sample = refresh_account_usage(
         config_path,
@@ -109,34 +117,33 @@ def test_refresh_account_usage_persists_structured_fields(monkeypatch, tmp_path:
     assert sample.remaining_pct == 79
     assert fake_tmux.created
     assert fake_tmux.killed == [fake_tmux.created[0][0]]
-
-    with StateStore(config.project.state_db) as store:
-        usage = store.get_account_usage("claude_primary")
-    assert usage is not None
-    assert usage.plan == "max"
-    assert usage.used_pct == 21
-    assert usage.remaining_pct == 79
-    assert usage.reset_at == "Apr 10 at 1am"
-    assert usage.period_label == "current week"
+    assert written == [sample]
+    assert sample.plan == "max"
+    assert sample.used_pct == 21
+    assert sample.reset_at == "Apr 10 at 1am"
+    assert sample.period_label == "current week"
 
 
 def test_refresh_account_usage_keeps_cached_shape_on_probe_failure(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    config_path, config = _config(tmp_path)
-    with StateStore(config.project.state_db) as store:
-        store.upsert_account_usage(
-            account_name="claude_primary",
-            provider="claude",
-            plan="max",
-            health="healthy",
-            usage_summary="81% left this week",
-            raw_text="old",
-            used_pct=19,
-            remaining_pct=81,
-            reset_at="Apr 09 at 1am",
-            period_label="current week",
-        )
+    from pollypm.storage.records import AccountUsageRecord
+
+    config_path, _config_obj = _config(tmp_path)
+    cached = AccountUsageRecord(
+        account_name="claude_primary",
+        provider="claude",
+        plan="max",
+        health="healthy",
+        usage_summary="81% left this week",
+        raw_text="old",
+        updated_at="2026-05-30T00:00:00+00:00",
+        used_pct=19,
+        remaining_pct=81,
+        reset_at="Apr 09 at 1am",
+        period_label="current week",
+    )
+    written: list[AccountUsageSample] = []
 
     monkeypatch.setattr(
         "pollypm.account_usage_sampler.collect_account_usage_sample",
@@ -144,19 +151,22 @@ def test_refresh_account_usage_keeps_cached_shape_on_probe_failure(
             RuntimeError("Claude probe session is not authenticated.")
         ),
     )
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler._read_cached_usage",
+        lambda *_args, **_kwargs: cached,
+    )
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler._write_cached_usage",
+        lambda _config, sample: written.append(sample),
+    )
 
     sample = refresh_account_usage(config_path, "claude_primary", tmux_client=_FakeTmux())
 
     assert sample.health == "auth-broken"
     assert "usage refresh failed" in sample.usage_summary
     assert sample.remaining_pct == 81
-
-    with StateStore(config.project.state_db) as store:
-        usage = store.get_account_usage("claude_primary")
-    assert usage is not None
-    assert usage.health == "auth-broken"
-    assert usage.remaining_pct == 81
-    assert usage.plan == "max"
+    assert sample.plan == "max"
+    assert written == [sample]
 
 
 def test_refresh_all_account_usage_continues_past_single_account_failure(
@@ -255,6 +265,102 @@ def test_collect_account_usage_sample_kills_session_on_exception_path(
     )
 
 
+def test_collect_account_usage_sample_respawns_missing_probe_window(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """A vanished tmux capture target should self-heal with one fresh probe."""
+    config_path, _ = _config(tmp_path)
+    fake_tmux = _FakeTmux()
+    calls = 0
+
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler._build_probe_command",
+        lambda *_args, **_kwargs: "probe-cmd",
+    )
+
+    def _snapshot(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise subprocess.CalledProcessError(
+                1,
+                ["tmux", "capture-pane", "-t", "missing:0"],
+                stderr="can't find window: missing",
+            )
+        return ProviderUsageSnapshot(
+            plan="max",
+            health="healthy",
+            summary="77% left this week",
+            raw_text="ok",
+            used_pct=23,
+            remaining_pct=77,
+        )
+
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler.collect_usage_snapshot",
+        _snapshot,
+    )
+
+    sample = collect_account_usage_sample(
+        config_path, "claude_primary", tmux_client=fake_tmux,
+    )
+
+    assert sample.usage_summary == "77% left this week"
+    assert calls == 2
+    assert len(fake_tmux.created) == 2
+    assert fake_tmux.killed == [row[0] for row in fake_tmux.created]
+
+
+def test_refresh_account_usage_softens_missing_probe_window_summary(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Missing tmux capture targets must not leak raw command errors to Home."""
+    from pollypm.storage.records import AccountUsageRecord
+
+    config_path, _ = _config(tmp_path)
+    cached = AccountUsageRecord(
+        account_name="claude_primary",
+        provider="claude",
+        plan="max",
+        health="healthy",
+        usage_summary="81% left this week",
+        raw_text="old",
+        updated_at="2026-05-30T00:00:00+00:00",
+        used_pct=19,
+        remaining_pct=81,
+        reset_at="Jun 1",
+        period_label="current week",
+    )
+    written: list[AccountUsageSample] = []
+
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler._read_cached_usage",
+        lambda *_args, **_kwargs: cached,
+    )
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler._write_cached_usage",
+        lambda _config, sample: written.append(sample),
+    )
+    monkeypatch.setattr(
+        "pollypm.account_usage_sampler.collect_account_usage_sample",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(
+                1,
+                ["tmux", "capture-pane", "-t", "pm-usage-missing:0"],
+                stderr="can't find window: pm-usage-missing",
+            )
+        ),
+    )
+
+    sample = refresh_account_usage(config_path, "claude_primary")
+
+    assert sample.health == "healthy"
+    assert sample.remaining_pct == 81
+    assert sample.usage_summary.startswith("headroom unavailable - ")
+    assert "capture-pane" not in sample.usage_summary
+    assert written == [sample]
+
+
 def test_collect_account_usage_sample_falls_back_to_subprocess_when_kill_raises(
     monkeypatch, tmp_path: Path,
 ) -> None:
@@ -336,6 +442,10 @@ def test_sweep_orphan_usage_sessions_kills_only_pm_usage_prefix(monkeypatch) -> 
 
     def _fake_run(args, **kwargs):
         calls.append(list(args))
+        if args[:1] == ["ps"]:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="", stderr="",
+            )
         if args[:2] == ["tmux", "list-sessions"]:
             return subprocess.CompletedProcess(
                 args=args, returncode=0, stdout=listed, stderr="",

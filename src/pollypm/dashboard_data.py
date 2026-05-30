@@ -12,6 +12,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pollypm.config import PollyPMConfig, load_config
+from pollypm.idle_placeholders import (
+    is_codex_idle_placeholder as _is_codex_idle_placeholder,
+)
+from pollypm.projects import project_state_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -107,18 +111,6 @@ def _now_feed_friendly_fallback(line: str) -> str | None:
     if text[0].islower():
         return "On the line"
     return None
-
-
-# Codex idle-input placeholder detection lives in
-# :mod:`pollypm.idle_placeholders` (#1010 extraction) so the dashboard
-# renderer here and the heartbeat session-health classifier share one
-# definition. Re-export under the legacy name for backward compat with
-# any external callers / tests pinning the old symbol.
-from pollypm.idle_placeholders import (
-    CODEX_IDLE_PLACEHOLDERS as _CODEX_IDLE_PLACEHOLDERS,
-    is_codex_idle_placeholder as _is_codex_idle_placeholder,
-)
-from pollypm.projects import project_state_db_path
 
 
 def _snapshot_activity_status(line: str) -> str | None:
@@ -568,7 +560,6 @@ def _compute_session_description(status: str, role: str, snapshot_path: str | No
                 _sanitize_snapshot_line(line)
                 for line in text.splitlines()
             ]
-            cleaned_lines = [text for text, _dirty in sanitized]
             clean_lines = [text for text, dirty in sanitized if not dirty]
             # Check for progress indicators first — only over the
             # trustworthy (escape-free) lines so we don't echo a
@@ -755,6 +746,199 @@ def _stuck_alert_already_user_waiting(
         return False
     task_id = alert_type[len(prefix):].strip()
     return bool(task_id) and task_id in user_waiting_task_ids
+
+
+def _tracked_project_keys(config: PollyPMConfig) -> frozenset[str]:
+    projects = getattr(config, "projects", {}) or {}
+    return frozenset(
+        key
+        for key, project in projects.items()
+        if getattr(project, "tracked", True)
+    )
+
+
+def _known_project_keys(config: PollyPMConfig) -> frozenset[str]:
+    return frozenset((getattr(config, "projects", {}) or {}).keys())
+
+
+def _project_task_counts_for_alert_filter(
+    config: PollyPMConfig,
+    open_alerts: list[object],
+) -> dict[str, dict[str, int]]:
+    """Return per-project work-status counts only when alert policy needs them."""
+
+    if not any(
+        str(getattr(alert, "session_name", "") or "").startswith(
+            "audit-queue_without_motion-"
+        )
+        for alert in open_alerts
+    ):
+        return {}
+    try:
+        from pollypm.cockpit_pg_aggregates import (
+            all_tasks_for_project,
+            all_tasks_grouped,
+        )
+
+        grouped = all_tasks_grouped(config)
+        if grouped is None:
+            return {}
+        counts_by_project: dict[str, dict[str, int]] = {}
+        for project_key in (getattr(config, "projects", {}) or {}):
+            counts: dict[str, int] = {}
+            for task in all_tasks_for_project(grouped, config, project_key):
+                status = getattr(task, "work_status", "") or ""
+                status_value = getattr(status, "value", status)
+                status_key = str(status_value or "")
+                if not status_key:
+                    continue
+                counts[status_key] = counts.get(status_key, 0) + 1
+            counts_by_project[project_key] = counts
+        return counts_by_project
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "dashboard_data: project task counts for alert filter failed",
+            exc_info=True,
+        )
+        return {}
+
+
+def dashboard_actionable_alerts(
+    config: PollyPMConfig,
+    open_alerts: list[object],
+    *,
+    user_waiting_task_ids: frozenset[str] | None = None,
+) -> list[object]:
+    """Return the alert rows that should drive Home/Alerts action counts."""
+
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        user_actionable_alerts,
+    )
+
+    if user_waiting_task_ids is None:
+        try:
+            user_waiting_task_ids = _user_waiting_task_ids_across_projects(config)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "dashboard_data: user-waiting task lookup failed",
+                exc_info=True,
+            )
+            user_waiting_task_ids = frozenset()
+    context = AlertActionabilityContext(
+        user_waiting_task_ids=frozenset(user_waiting_task_ids),
+        known_projects=_known_project_keys(config),
+        tracked_projects=_tracked_project_keys(config),
+        project_task_counts=_project_task_counts_for_alert_filter(
+            config,
+            open_alerts,
+        ),
+    )
+    return user_actionable_alerts(open_alerts, context=context)
+
+
+def count_dashboard_alerts(
+    config: PollyPMConfig,
+    open_alerts: list[object] | None = None,
+    *,
+    user_waiting_task_ids: frozenset[str] | None = None,
+) -> int:
+    """Count the same user-actionable alert set the Home dashboard renders."""
+
+    if open_alerts is None:
+        from pollypm.storage.pg_alerts import open_alerts as pg_open_alerts
+
+        open_alerts = list(pg_open_alerts(config=config))
+    return len(
+        dashboard_actionable_alerts(
+            config,
+            open_alerts,
+            user_waiting_task_ids=user_waiting_task_ids,
+        )
+    )
+
+
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    word = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {word}"
+
+
+_TASK_ID_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_.-]+/\d+\b")
+
+
+def _clean_briefing_title(title: str) -> str:
+    text = re.sub(r"\s+", " ", title or "").strip()
+    text = _TASK_ID_TOKEN_RE.sub("a task", text)
+    return text.rstrip(".")
+
+
+def _build_dashboard_briefing(
+    *,
+    commits: list[CommitInfo],
+    completed: list[CompletedItem],
+    inbox_count: int,
+    recent_messages: list[InboxPreview],
+    recovery_count_24h: int,
+) -> str:
+    """Build the concise Home briefing from already-gathered dashboard facts."""
+
+    lines: list[str] = ["Morning. Here's the overnight read."]
+    if completed:
+        lines.append(
+            "Shipped: "
+            + _plural(len(completed), "item")
+            + " wrapped in the last 72 hours."
+        )
+    if commits:
+        projects_touched = len({c.project for c in commits})
+        lines.append(
+            "Progress: "
+            + _plural(len(commits), "commit")
+            + " across "
+            + _plural(projects_touched, "project")
+            + "."
+        )
+    if recovery_count_24h:
+        lines.append(
+            "Saved: "
+            + _plural(recovery_count_24h, "recovery", "recoveries")
+            + " handled without handing you a mess."
+        )
+
+    if inbox_count:
+        decision = ""
+        for message in recent_messages:
+            decision = _clean_briefing_title(getattr(message, "title", "") or "")
+            if decision:
+                break
+        if decision:
+            if inbox_count == 1:
+                lines.append(
+                    "One thing needs you: "
+                    + decision
+                    + ". Open Inbox and clear that first."
+                )
+            else:
+                lines.append(
+                    "First up: "
+                    + decision
+                    + ". "
+                    + _plural(inbox_count, "inbox item")
+                    + " waiting."
+                )
+        else:
+            prefix = "One thing needs you: " if inbox_count == 1 else "Inbox needs you: "
+            lines.append(
+                prefix
+                + _plural(inbox_count, "inbox item")
+                + " waiting. Open Inbox and clear the oldest first."
+            )
+    elif len(lines) == 1:
+        lines.append("Quiet night. Nothing needs you right now.")
+    else:
+        lines.append("All handled: no inbox items waiting.")
+
+    return "\n".join(lines[:6])
 
 
 def _inbox_sender(task) -> str:
@@ -1053,58 +1237,24 @@ def gather(
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
     recoveries = sum(1 for e in day_events if "recover" in e.event_type)
 
-    # Morning briefing: generate if there are overnight results
-    def _plural(count: int, singular: str, plural: str | None = None) -> str:
-        word = singular if count == 1 else (plural or f"{singular}s")
-        return f"{count} {word}"
-
-    # 24h activity briefing. The earlier "While you were away" framing
-    # presumed every cockpit launch was a return from a trip — including
-    # the literal first-ever launch on a fresh install (#854). Use a
-    # neutral 24-hour heading instead. Recovery counts are internal
-    # plumbing (see #879 for elevation policy) and are deliberately not
-    # surfaced here so the dashboard reflects what the user did, not
-    # what the supervisor patched up behind the scenes.
-    briefing = ""
-    if commits or completed or inbox_count:
-        parts: list[str] = []
-        if commits:
-            projects_touched = len({c.project for c in commits})
-            parts.append(
-                f"{_plural(len(commits), 'commit')} across "
-                f"{_plural(projects_touched, 'project')}"
-            )
-        if completed:
-            parts.append(f"{_plural(len(completed), 'issue')} completed")
-        if inbox_count:
-            parts.append(
-                f"{_plural(inbox_count, 'inbox item')} waiting for you"
-            )
-        briefing = "Last 24 hours: " + ", ".join(parts) + "."
-
-    # Late import keeps dashboard_data out of the cockpit_alerts import
-    # graph (cockpit_alerts → cockpit_palette → cockpit, which pulls
-    # dashboard_data in at top level).
-    from pollypm.cockpit_alerts import is_operational_alert
-
-    # Drop ``stuck_on_task:<id>`` alerts whose task is already in a
-    # user-waiting state — the session sat idle because the user
-    # hasn't responded, which is the system doing what it should,
-    # not a fault to surface as a separate alert. Mirrors cycles 45
-    # / 53 / 55 dedup at the global polly-dashboard count level.
-    user_waiting = _user_waiting_task_ids_across_projects(config)
     if use_pg:
         open_alerts = pg_open_alerts()
     elif store is not None:
         open_alerts = store.open_alerts()  # type: ignore[attr-defined]
     else:
         open_alerts = []
-    alert_count = sum(
-        1 for a in open_alerts
-        if not is_operational_alert(a.alert_type)
-        and not _stuck_alert_already_user_waiting(
-            a.alert_type, user_waiting,
-        )
+    user_waiting = _user_waiting_task_ids_across_projects(config)
+    alert_count = count_dashboard_alerts(
+        config,
+        list(open_alerts),
+        user_waiting_task_ids=user_waiting,
+    )
+    briefing = _build_dashboard_briefing(
+        commits=commits,
+        completed=completed,
+        inbox_count=inbox_count,
+        recent_messages=recent_messages,
+        recovery_count_24h=recoveries,
     )
 
     return DashboardData(

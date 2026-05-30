@@ -34,6 +34,7 @@ One line per cycle: `cycle N (hour H): trust=X/5 — <one-line justification>`. 
 _(append below)_
 
 - cycle 1 (hour 0, 2026-05-30 02:39 MDT): **trust=3/5** — counts are now honest (cockpit Inbox **4**, was 1620 — a real trust win) and surfaces are clean, BUT there's no morning brief (M2 null), the cockpit reads as a list of sections rather than a one-glance "all handled / one clear ask" (M1), and the operator's own cockpit is still showing the pre-fix stale display until restarted. Floor solid; delight barely started.
+- cycle 7 (hour ~2.5, 2026-05-30 04:40 MDT): **trust=3/5 (steady, mixed)** — BIG win: gave Polly a plain imagery goal and it AUTO-DECOMPOSED + planned + moved to delegate (M4 effortless-intent PASS, #2465 validated live). But the operator's web Home (M1) is a triage pile — "38 things need you", a stack of stalled/blocked projects, and a red "Claude Headroom usage refresh failed" error card; no morning brief (M2). The M4 magic is real; the M1 calm isn't there yet. Net flat: the decompose win offsets the noisy-Home ding.
 
 ---
 
@@ -45,6 +46,8 @@ _Seed at cycle-0: drive + screenshot + honestly score every operator surface and
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 (h0) | morning brief | M2 | 2 (self-narrating care) | `dashboard.briefing` = **null** — no "while you were away" narration at all; operator gets no chief-of-staff brief | `internal-comms` | (filing magic-gap) | 396d9797e | — | no | 3/5 | open |
 | 1 (h0) | cockpit cold-open | M1 | 3 (calm beauty) | rail reads as a sectioned list (Operator/Polly/Workers/Metrics/Inbox/projects); honest now (Inbox 4) but not a one-glance "all handled / exactly one ask" framing | `design-taste-frontend`+`frontend-design` | — | 396d9797e | — | no | 3/5 | open |
+| 7 (h2.5) | effortless intent | **M4** | 4 (effortlessness) | gave savethenovel PM (Sage, freshly 4.8) a PLAIN imagery goal (no "decompose" hint) → it AUTO-DECOMPOSED: "squarely architect work… let me ground myself", investigated codebase (found unused AnnotatedImage + imagery.ts), ran `pm task` cmds, produced a decision menu. Planned+delegated, not ad-hoc. | (#2465 live via relaunch) | — | 396d9797e | /tmp/cockpit-web/B*.png | **YES (M4 PASS)** | 3/5 | shipped (M4 capability validated; M5 build in progress) |
+| 7 (h2.5) | operator Home (web /ui/) | M1+M2 | 1,2,3 | M1=2/5 triage pile ("38 things need you", stalled/blocked stack, RED "Claude Headroom usage refresh failed" error card); M2=1/5 no brief at all. /tmp/cockpit-web/A1-landing.png | `internal-comms`+`design-taste-frontend` | #2473(brief)+#2474(headroom)+#2475(home count) | 396d9797e | — | no | 3/5 | open (3 issues filed) |
 | 3 (h1) | savethenovel desktop+mobile | M5 | 6 (delight moments) | **BASELINE 4/5** (t=0 2026-05-30T08:56Z, 6 PNGs @ /tmp/savethenovel-baseline/). Real art-directed editorial site (cream→amber gradient, display serif + oxblood italic, warm copy; typography+copy=5). **GAP: zero imagery site-wide** (0 `<img>`; book site shows no book/photo/texture → delight single-channel). Also: Pledge "PASS IT ON" = generic share buttons + raw-URL code input (devy, off-tone); Stories ~3800px sag, no sectioning. | `web-asset-generator`+`visual-explainer`+`design-taste-frontend` | — | 396d9797e | — | — | 4/5 | open (top dogfood gap = imagery) |
 
 ---

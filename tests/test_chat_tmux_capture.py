@@ -129,6 +129,54 @@ def test_capture_synthesizes_multi_question_menu_with_submit_row() -> None:
     ]
 
 
+def test_capture_synthesizes_live_numbered_ask_user_tab_menu() -> None:
+    pane_text = "\n".join([
+        "⏺ I need one product direction before I queue imagery work.",
+        "",
+        "What medium should the imagery be?",
+        "",
+        "←  ☐ Imagery medium  ☐ Hero treatment  ✔ Submit  →",
+        "❯ 1. Bespoke SVG illustration",
+        "     A one-off vector treatment tailored to this launch.",
+        "  2. Curated photography",
+        "     A tighter set of sourced photographs with captions.",
+        "Type something.",
+        "Chat about this",
+    ])
+    tmux = _StubTmuxClient(output=pane_text)
+
+    envelopes = capture_envelopes(
+        tmux,
+        session_name="architect_demo",
+        target="storage-closet:architect_demo",
+    )
+
+    ask = envelopes[-1]
+    assert ask.type == MessageType.ASK_USER
+    assert ask.text == "What medium should the imagery be?"
+    assert ask.metadata["questions"] == [
+        {
+            "question": "What medium should the imagery be?",
+            "header": "Imagery medium",
+            "multiSelect": False,
+            "options": [
+                {
+                    "label": "Bespoke SVG illustration",
+                    "description": (
+                        "A one-off vector treatment tailored to this launch."
+                    ),
+                },
+                {
+                    "label": "Curated photography",
+                    "description": (
+                        "A tighter set of sourced photographs with captions."
+                    ),
+                },
+            ],
+        }
+    ]
+
+
 def test_capture_does_not_synthesize_stale_ask_user_menu() -> None:
     pane_text = "\n".join([
         "What medium should the imagery be?",
@@ -136,6 +184,24 @@ def test_capture_does_not_synthesize_stale_ask_user_menu() -> None:
         "☐ Imagery medium",
         "  ○ Bespoke SVG illustration",
         "  ○ Photography        ✔ Submit",
+        "⏺ Continuing after the answered prompt.",
+    ])
+    tmux = _StubTmuxClient(output=pane_text)
+
+    envelopes = capture_envelopes(tmux, session_name="architect_demo", target="t")
+
+    assert all(env.type == MessageType.TEXT for env in envelopes)
+
+
+def test_capture_does_not_synthesize_stale_live_tab_menu() -> None:
+    pane_text = "\n".join([
+        "What medium should the imagery be?",
+        "",
+        "←  ☐ Imagery medium  ☐ Hero treatment  ✔ Submit  →",
+        "❯ 1. Bespoke SVG illustration",
+        "  2. Curated photography",
+        "Type something.",
+        "Chat about this",
         "⏺ Continuing after the answered prompt.",
     ])
     tmux = _StubTmuxClient(output=pane_text)

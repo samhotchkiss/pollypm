@@ -33,6 +33,8 @@ One line per cycle: `cycle N (hour H): trust=X/5 — <one-line justification>`. 
 
 _(append below)_
 
+- cycle 1 (hour 0, 2026-05-30 02:39 MDT): **trust=3/5** — counts are now honest (cockpit Inbox **4**, was 1620 — a real trust win) and surfaces are clean, BUT there's no morning brief (M2 null), the cockpit reads as a list of sections rather than a one-glance "all handled / one clear ask" (M1), and the operator's own cockpit is still showing the pre-fix stale display until restarted. Floor solid; delight barely started.
+
 ---
 
 ## Cycle-0 — Delight Baseline
@@ -41,7 +43,9 @@ _Seed at cycle-0: drive + screenshot + honestly score every operator surface and
 
 | cycle | surface | M-test | principle | as-is gap | skill(s) | Codex PR | live-SHA@verify | after | moved? | trust | status |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| _0_ | _(seed at baseline)_ | | | | | | | | | | open |
+| 1 (h0) | morning brief | M2 | 2 (self-narrating care) | `dashboard.briefing` = **null** — no "while you were away" narration at all; operator gets no chief-of-staff brief | `internal-comms` | (filing magic-gap) | 396d9797e | — | no | 3/5 | open |
+| 1 (h0) | cockpit cold-open | M1 | 3 (calm beauty) | rail reads as a sectioned list (Operator/Polly/Workers/Metrics/Inbox/projects); honest now (Inbox 4) but not a one-glance "all handled / exactly one ask" framing | `design-taste-frontend`+`frontend-design` | — | 396d9797e | — | no | 3/5 | open |
+| 1 (h0) | savethenovel desktop+mobile | M5 | 6 (delight moments) | not yet baselined (site mid-redesign by architect agent) — capture per-page desktop+mobile next cycles | `design-taste-frontend`+`visual-explainer` | — | — | — | — | — | pending-baseline |
 
 ---
 

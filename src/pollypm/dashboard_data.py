@@ -209,6 +209,9 @@ _COMMIT_CACHE: dict[tuple[str, int], tuple[float, list["_CachedCommitRow"]]] = {
 _COMMIT_CACHE_TTL_SECONDS = 60.0
 _COMMIT_PER_PROJECT_TIMEOUT_SECONDS = 2.0
 _COMMIT_LOG_MAX_WORKERS = 8
+# Keep dashboard cold builds bounded: read_events(..., since=...) scans full
+# audit history, while read_events(..., limit=...) uses the reverse-tail path.
+_RECOVERY_AUDIT_TAIL_LIMIT_PER_PROJECT = 400
 
 
 @dataclass(slots=True, frozen=True)
@@ -1041,8 +1044,7 @@ def _recent_recovery_audit_narrations(
         try:
             rows = read_events(
                 str(project_key),
-                since=since,
-                limit=40,
+                limit=_RECOVERY_AUDIT_TAIL_LIMIT_PER_PROJECT,
                 project_path=getattr(project, "path", None),
             )
         except Exception:  # noqa: BLE001
@@ -1052,7 +1054,10 @@ def _recent_recovery_audit_narrations(
                 exc_info=True,
             )
             continue
-        events.extend(row for row in rows if row.event in RECOVERY_BRIEF_EVENT_NAMES)
+        events.extend(
+            row for row in rows
+            if row.event in RECOVERY_BRIEF_EVENT_NAMES and row.ts > since
+        )
 
     events.sort(key=lambda event: event.ts, reverse=True)
     unique_events = []

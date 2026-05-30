@@ -744,6 +744,67 @@ def test_recent_recovery_audit_narrations_reads_audit_events(monkeypatch) -> Non
     ]
 
 
+def test_recent_recovery_audit_narrations_uses_bounded_tail(
+    monkeypatch,
+) -> None:
+    from pollypm.dashboard_data import (
+        _RECOVERY_AUDIT_TAIL_LIMIT_PER_PROJECT,
+        _recent_recovery_audit_narrations,
+    )
+
+    calls: list[dict[str, object]] = []
+    rows = [
+        SimpleNamespace(
+            event="recovery.spawn",
+            ts="2026-05-29T23:00:00+00:00",
+            project="polly_remote",
+            subject="architect_polly_remote",
+            actor="supervisor",
+            status="ok",
+            metadata={"target_session": "architect_polly_remote"},
+        ),
+        SimpleNamespace(
+            event="recovery.spawn",
+            ts="2026-05-30T10:00:00+00:00",
+            project="polly_remote",
+            subject="architect_polly_remote",
+            actor="supervisor",
+            status="ok",
+            metadata={"target_session": "architect_polly_remote"},
+        ),
+    ]
+
+    def fake_read_events(*_args: object, **kwargs: object) -> list[object]:
+        calls.append(kwargs)
+        return rows
+
+    monkeypatch.setattr("pollypm.audit.log.read_events", fake_read_events)
+    config = SimpleNamespace(
+        projects={
+            "polly_remote": SimpleNamespace(
+                tracked=True,
+                path="/tmp/polly_remote",
+            )
+        }
+    )
+
+    narrations, count = _recent_recovery_audit_narrations(
+        config,
+        since="2026-05-30T00:00:00+00:00",
+    )
+
+    assert calls == [
+        {
+            "limit": _RECOVERY_AUDIT_TAIL_LIMIT_PER_PROJECT,
+            "project_path": "/tmp/polly_remote",
+        }
+    ]
+    assert count == 1
+    assert narrations == [
+        "I restarted the architect for polly remote as part of recovery.",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # #2308 perf — _session_description cache contract.
 #

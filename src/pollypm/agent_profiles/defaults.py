@@ -24,7 +24,10 @@ class StaticPromptProfile(AgentProfile):
     prompt: str
 
     def build_prompt(self, context: AgentProfileContext) -> str | None:
-        from pollypm.rules import render_session_manifest
+        from pollypm.rules import (
+            render_relevant_magic_manifest,
+            render_session_manifest,
+        )
 
         project_root = _project_root(context)
         prompt = self.prompt
@@ -40,6 +43,7 @@ class StaticPromptProfile(AgentProfile):
                 )
 
         parts: list[str] = [prompt]
+        magic_context_parts = _base_magic_context_parts(context, self.name)
 
         # #2012 — Lever 2 of the recovery cascade. Teach the agent the
         # PollyPM-Auth contract so it stops treating legitimate watchdog
@@ -61,7 +65,9 @@ class StaticPromptProfile(AgentProfile):
             parts.append(instruct)
 
         if self.name in ("polly", "triage"):
-            parts.append(_render_operator_state_brief(context))
+            operator_state = _render_operator_state_brief(context)
+            parts.append(operator_state)
+            magic_context_parts.append(operator_state)
 
         if self.name == "worker":
             project = context.config.projects.get(context.session.project)
@@ -71,7 +77,17 @@ class StaticPromptProfile(AgentProfile):
                     "If the user asks you to change your name, update `.pollypm/config/project.toml` "
                     "to set `[project].persona_name` to the requested value so it persists immediately."
                 )
-            parts.extend(_worker_context_parts(context, project_root))
+            worker_parts = _worker_context_parts(context, project_root)
+            parts.extend(worker_parts)
+            magic_context_parts.extend(worker_parts)
+
+        relevant_magic = render_relevant_magic_manifest(
+            project_root,
+            role=context.session.role or self.name,
+            context_text="\n\n".join(part for part in magic_context_parts if part),
+        )
+        if relevant_magic:
+            parts.append(relevant_magic)
 
         manifest = render_session_manifest(project_root)
         if manifest:
@@ -667,6 +683,28 @@ def _worker_context_parts(context: AgentProfileContext, project_root: Path) -> l
     checkpoint = _read_latest_checkpoint(context)
     if checkpoint:
         parts.append(checkpoint)
+    return parts
+
+
+def _base_magic_context_parts(
+    context: AgentProfileContext, profile_name: str
+) -> list[str]:
+    parts = [
+        f"role: {context.session.role}",
+        f"profile: {profile_name}",
+        f"session: {context.session.name}",
+        f"project: {context.session.project}",
+    ]
+    for key in (
+        "task",
+        "task_summary",
+        "summary",
+        "user_prompt",
+        "work_context",
+    ):
+        value = context.metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}: {value.strip()}")
     return parts
 
 

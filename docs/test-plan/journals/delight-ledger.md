@@ -45,7 +45,7 @@ _Seed at cycle-0: drive + screenshot + honestly score every operator surface and
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 (h0) | morning brief | M2 | 2 (self-narrating care) | `dashboard.briefing` = **null** — no "while you were away" narration at all; operator gets no chief-of-staff brief | `internal-comms` | (filing magic-gap) | 396d9797e | — | no | 3/5 | open |
 | 1 (h0) | cockpit cold-open | M1 | 3 (calm beauty) | rail reads as a sectioned list (Operator/Polly/Workers/Metrics/Inbox/projects); honest now (Inbox 4) but not a one-glance "all handled / exactly one ask" framing | `design-taste-frontend`+`frontend-design` | — | 396d9797e | — | no | 3/5 | open |
-| 1 (h0) | savethenovel desktop+mobile | M5 | 6 (delight moments) | not yet baselined (site mid-redesign by architect agent) — capture per-page desktop+mobile next cycles | `design-taste-frontend`+`visual-explainer` | — | — | — | — | — | pending-baseline |
+| 3 (h1) | savethenovel desktop+mobile | M5 | 6 (delight moments) | **BASELINE 4/5** (t=0 2026-05-30T08:56Z, 6 PNGs @ /tmp/savethenovel-baseline/). Real art-directed editorial site (cream→amber gradient, display serif + oxblood italic, warm copy; typography+copy=5). **GAP: zero imagery site-wide** (0 `<img>`; book site shows no book/photo/texture → delight single-channel). Also: Pledge "PASS IT ON" = generic share buttons + raw-URL code input (devy, off-tone); Stories ~3800px sag, no sectioning. | `web-asset-generator`+`visual-explainer`+`design-taste-frontend` | — | 396d9797e | — | — | 4/5 | open (top dogfood gap = imagery) |
 
 ---
 

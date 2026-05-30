@@ -168,7 +168,10 @@ After three prior `stuck_draft` findings for the same subject, the watchdog
 emits `audit.stuck_draft_terminated` and suppresses further findings for that
 subject. If the underlying task is still a draft and was created by
 `audit_watchdog` or by a legacy empty creator, the terminator also cancels it
-and emits `audit.stuck_draft_reclaimed`.
+and emits `audit.stuck_draft_reclaimed`. The cadence also backfills that
+reclaim on later sweeps for still-draft tasks that already have a durable
+`audit.stuck_draft_terminated` row, so old terminated subjects do not remain
+stuck just because they crossed the threshold before reclaim support existed.
 
 When a finding is a real false positive rather than stale state, record the
 terminal judgment with `pm audit dismiss-finding <rule> <project> --reason

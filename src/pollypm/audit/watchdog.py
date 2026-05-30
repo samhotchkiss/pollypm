@@ -730,6 +730,13 @@ class _StuckDraftScanResult:
     terminator_breadcrumbs: list[_TerminatorBreadcrumb]
 
 
+@dataclass(slots=True, frozen=True)
+class _StuckDraftReclaimCandidate:
+    project: str
+    subject: str
+    prior_count: int
+
+
 def _emit_stuck_draft_terminator(
     *,
     project: str,
@@ -860,6 +867,69 @@ def _maybe_reclaim_stuck_draft(
             "audit.watchdog: stuck_draft_reclaimed emit failed for %s",
             subject, exc_info=True,
         )
+
+
+def _stuck_draft_reclaim_backfill_candidates(
+    events: Sequence[AuditEvent],
+    *,
+    project: str,
+    open_tasks: Sequence[Any] | None,
+) -> list[_StuckDraftReclaimCandidate]:
+    if not open_tasks:
+        return []
+
+    terminated_subjects: dict[str, int] = {}
+    for ev in events:
+        if ev.event != EVENT_STUCK_DRAFT_TERMINATED:
+            continue
+        meta = ev.metadata or {}
+        if meta.get("rule") not in (None, "", RULE_STUCK_DRAFT):
+            continue
+        if ev.project and ev.project != project:
+            continue
+        key = _task_subject_key(ev.subject)
+        if key is None or key[0] != project:
+            continue
+        try:
+            prior_count = int(
+                meta.get(
+                    "prior_finding_count",
+                    STUCK_DRAFT_TERMINATOR_THRESHOLD,
+                )
+            )
+        except (TypeError, ValueError):
+            prior_count = STUCK_DRAFT_TERMINATOR_THRESHOLD
+        terminated_subjects[ev.subject] = max(
+            prior_count,
+            terminated_subjects.get(ev.subject, 0),
+        )
+    if not terminated_subjects:
+        return []
+
+    candidates: list[_StuckDraftReclaimCandidate] = []
+    seen: set[str] = set()
+    for task in open_tasks:
+        if _task_status_value(task) != "draft":
+            continue
+        task_project = _task_scalar_value(task, "project") or project
+        if task_project != project:
+            continue
+        task_number = getattr(task, "task_number", None)
+        if task_number is None:
+            continue
+        subject = f"{project}/{task_number}"
+        if subject in seen or subject not in terminated_subjects:
+            continue
+        creator = _task_scalar_value(task, "created_by")
+        if creator not in _STUCK_DRAFT_RECLAIMABLE_CREATORS:
+            continue
+        seen.add(subject)
+        candidates.append(_StuckDraftReclaimCandidate(
+            project=project,
+            subject=subject,
+            prior_count=terminated_subjects[subject],
+        ))
+    return candidates
 
 
 def _detect_stuck_drafts(
@@ -3670,6 +3740,18 @@ def scan_project(
         since=since,
         project_path=project_path,
     )
+    backfill_reclaims = _stuck_draft_reclaim_backfill_candidates(
+        events,
+        project=project,
+        open_tasks=open_tasks,
+    )
+    if backfill_reclaims:
+        dismissed_scopes = _dismissed_finding_scopes(events)
+        backfill_reclaims = [
+            candidate
+            for candidate in backfill_reclaims
+            if (RULE_STUCK_DRAFT, candidate.project) not in dismissed_scopes
+        ]
     # #2349 (round 3) — owned by the cadence handler. The pure
     # detector appends one :class:`_TerminatorBreadcrumb` per subject
     # that first crossed the terminator threshold this scan; we emit
@@ -3694,7 +3776,7 @@ def scan_project(
         worker_cap_back_pressure=worker_cap_back_pressure,
         stuck_draft_terminator_breadcrumbs=pending_terminators,
     )
-    if findings or pending_terminators:
+    if findings or pending_terminators or backfill_reclaims:
         durable_dismissals = _read_durable_finding_dismissals(
             project=project,
             project_path=project_path,
@@ -3710,11 +3792,24 @@ def scan_project(
                 if (RULE_STUCK_DRAFT, breadcrumb.project)
                 not in durable_dismissals
             ]
+            backfill_reclaims = [
+                candidate
+                for candidate in backfill_reclaims
+                if (RULE_STUCK_DRAFT, candidate.project)
+                not in durable_dismissals
+            ]
     for breadcrumb in pending_terminators:
         _emit_stuck_draft_terminator(
             project=breadcrumb.project,
             subject=breadcrumb.subject,
             prior_count=breadcrumb.prior_count,
+            project_path=project_path,
+        )
+    for candidate in backfill_reclaims:
+        _maybe_reclaim_stuck_draft(
+            project=candidate.project,
+            subject=candidate.subject,
+            prior_count=candidate.prior_count,
             project_path=project_path,
         )
     return findings

@@ -13,6 +13,7 @@ harness which these tests intentionally avoid.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -381,6 +382,83 @@ def test_dashboard_route_gather_bypasses_state_cache(
     dashboard_routes._gather_dashboard(config)
 
     assert seen == {"use_state_cache": False}
+
+
+def test_dashboard_cache_hit_skips_repeated_expensive_loads(
+    client, auth_headers, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"list": 0, "gather": 0}
+
+    def fake_list_projects(_config):
+        calls["list"] += 1
+        return [_api_project("myproj")]
+
+    def fake_gather(_config):
+        calls["gather"] += 1
+        return _make_data(total_tokens=42)
+
+    monkeypatch.setattr(dashboard_routes, "list_projects", fake_list_projects)
+    monkeypatch.setattr(dashboard_routes, "_gather_dashboard", fake_gather)
+
+    first = client.get("/api/v1/dashboard", headers=auth_headers)
+    second = client.get("/api/v1/dashboard", headers=auth_headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["tokens"]["total"] == 42
+    assert calls == {"list": 1, "gather": 1}
+
+
+def test_dashboard_stale_cache_returns_while_refresh_runs(
+    app, client, auth_headers, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app.state.dashboard_snapshot_cache = dashboard_routes.DashboardSnapshotCache(
+        stale_after_seconds=0.01,
+    )
+    gather_calls = 0
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+
+    def fake_list_projects(_config):
+        return [_api_project("myproj")]
+
+    def fake_gather(_config):
+        nonlocal gather_calls
+        gather_calls += 1
+        if gather_calls == 1:
+            return _make_data(total_tokens=1)
+        refresh_started.set()
+        assert release_refresh.wait(2.0)
+        return _make_data(total_tokens=2)
+
+    monkeypatch.setattr(dashboard_routes, "list_projects", fake_list_projects)
+    monkeypatch.setattr(dashboard_routes, "_gather_dashboard", fake_gather)
+
+    first = client.get("/api/v1/dashboard", headers=auth_headers)
+    assert first.status_code == 200, first.text
+    assert first.json()["tokens"]["total"] == 1
+
+    time.sleep(0.03)
+    started_at = time.monotonic()
+    second = client.get("/api/v1/dashboard", headers=auth_headers)
+    elapsed = time.monotonic() - started_at
+
+    assert second.status_code == 200, second.text
+    assert second.json()["tokens"]["total"] == 1
+    assert elapsed < 0.5
+    assert refresh_started.wait(1.0)
+
+    release_refresh.set()
+    deadline = time.monotonic() + 2.0
+    body = second.json()
+    while time.monotonic() < deadline:
+        third = client.get("/api/v1/dashboard", headers=auth_headers)
+        assert third.status_code == 200, third.text
+        body = third.json()
+        if body["tokens"]["total"] == 2:
+            break
+        time.sleep(0.02)
+    assert body["tokens"]["total"] == 2
 
 
 # ---------------------------------------------------------------------------

@@ -22,14 +22,19 @@ The route's behaviour mirrors the cockpit per spec §3.3 edge cases:
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
+from pollypm.web_api.dashboard_snapshot_cache import (
+    DashboardSnapshot,
+    DashboardSnapshotCache,
+)
 from pollypm.web_api.errors import not_found, service_unavailable
 from pollypm.web_api.models import Project
 from pollypm.web_api.routes._deps import ConfigDep
@@ -256,6 +261,92 @@ def _gather_dashboard(config: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Snapshot loading / cache access
+# ---------------------------------------------------------------------------
+
+
+def _get_dashboard_snapshot_cache(request: Request) -> DashboardSnapshotCache:
+    """Resolve the app-scoped dashboard cache, creating a fallback for tests."""
+
+    cache = getattr(request.app.state, "dashboard_snapshot_cache", None)
+    if cache is None:
+        cache = DashboardSnapshotCache()
+        request.app.state.dashboard_snapshot_cache = cache
+    return cache
+
+
+def _call_dashboard_source_pair(
+    config: Any,
+) -> tuple[tuple[bool, Any], tuple[bool, Any]]:
+    """Load project rows and rollup data concurrently."""
+
+    results: dict[str, tuple[bool, Any]] = {}
+    lock = threading.Lock()
+
+    def _run(name: str, func: Any) -> None:
+        try:
+            value = func()
+        except Exception as exc:  # noqa: BLE001
+            value = exc
+            ok = False
+        else:
+            ok = True
+        with lock:
+            results[name] = (ok, value)
+
+    threads = [
+        threading.Thread(
+            target=_run,
+            name="dashboard-list-projects",
+            args=("projects", lambda: list_projects(config)),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_run,
+            name="dashboard-gather",
+            args=("data", lambda: _gather_dashboard(config)),
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    return results["projects"], results["data"]
+
+
+def _load_dashboard_snapshot(config: Any) -> DashboardSnapshot:
+    """Run the expensive dashboard load once and normalize errors."""
+
+    projects_slot, data_slot = _call_dashboard_source_pair(config)
+    projects_ok, projects_result = projects_slot
+    data_ok, data_result = data_slot
+
+    if not projects_ok:
+        # list_projects swallows per-project failures internally; a
+        # raise here means the config itself is unreadable.
+        logger.warning("dashboard: list_projects failed: %s", projects_result)
+        raise service_unavailable(
+            "Failed to load project list for dashboard",
+            hint="Check `pm doctor` and config.toml health.",
+        ) from projects_result
+    if not data_ok:
+        logger.warning("dashboard: gather failed: %s", data_result)
+        raise service_unavailable(
+            "Dashboard gather failed; backing store may be unreachable",
+            hint="Retry shortly; check `pm doctor` for pg pool health.",
+        ) from data_result
+
+    return DashboardSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        projects=tuple(projects_result),
+        data=data_result,
+        refreshed_at_monotonic=time.monotonic(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
@@ -268,6 +359,7 @@ def _gather_dashboard(config: Any) -> Any:
 )
 async def get_dashboard_endpoint(
     config: ConfigDep,
+    request: Request,
     project: Annotated[
         str | None,
         Query(
@@ -315,25 +407,10 @@ async def get_dashboard_endpoint(
             hint="Drop ?project= to fetch the whole-system snapshot.",
         )
 
-    projects_result, data_result = await asyncio.gather(
-        asyncio.to_thread(list_projects, config),
-        asyncio.to_thread(_gather_dashboard, config),
-        return_exceptions=True,
+    snapshot = await _get_dashboard_snapshot_cache(request).get_or_refresh(
+        config,
+        _load_dashboard_snapshot,
     )
-    if isinstance(projects_result, Exception):
-        # list_projects swallows per-project failures internally; a
-        # raise here means the config itself is unreadable.
-        logger.warning("dashboard: list_projects failed: %s", projects_result)
-        raise service_unavailable(
-            "Failed to load project list for dashboard",
-            hint="Check `pm doctor` and config.toml health.",
-        ) from projects_result
-    if isinstance(data_result, Exception):
-        logger.warning("dashboard: gather failed: %s", data_result)
-        raise service_unavailable(
-            "Dashboard gather failed; backing store may be unreachable",
-            hint="Retry shortly; check `pm doctor` for pg pool health.",
-        ) from data_result
 
     # Projects view — list_projects is the authoritative cockpit row
     # builder; reuse it so the rollups derived below match the project
@@ -341,8 +418,8 @@ async def get_dashboard_endpoint(
     # payload (active sessions, commits, tokens, …). Transient pg outages
     # surface as 503 per spec §3.3 final bullet; a healthy daemon-down
     # state is captured below as ``daemon_status="down"`` (200, not 503).
-    projects_all = projects_result
-    data = data_result
+    projects_all = list(snapshot.projects)
+    data = snapshot.data
 
     if project is not None:
         projects_view = [p for p in projects_all if p.key == project]
@@ -436,7 +513,7 @@ async def get_dashboard_endpoint(
         briefing = getattr(data, "briefing", "") or ""
 
     return DashboardResponse(
-        generated_at=datetime.now(timezone.utc),
+        generated_at=snapshot.generated_at,
         daemon_status=daemon_status,
         projects=projects_view,
         rollups=rollups,
@@ -470,6 +547,7 @@ __all__ = [
     "CompletedItemModel",
     "DashboardResponse",
     "DashboardRollups",
+    "DashboardSnapshotCache",
     "DashboardTokens",
     "InboxPreviewModel",
     "SessionActivityModel",

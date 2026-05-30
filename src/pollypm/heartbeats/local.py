@@ -1625,8 +1625,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 ),
                 subject=f"{context.session_name} asked a question",
                 suggested_action=(
-                    "Open the worker pane and answer, or `pm send "
-                    f"{context.session_name} \"<answer>\"`."
+                    "Open the chat surface in the web UI and answer the "
+                    "decision card."
                 ),
             )
             api.clear_alert(context.session_name, "suspected_loop")

@@ -704,6 +704,19 @@ def _load_envelopes(
         if any(env.type == MessageType.THINKING for env in envelopes):
             return envelopes, "jsonl", archive
 
+    if archive is not None and archive.exists():
+        # A stale archive can still carry the latest open AskUserQuestion
+        # tool_use while tmux capture can only see the rendered TUI menu.
+        # Prefer the structured archive in that case so clients receive
+        # the answerable ``ask_user`` id/options instead of static text.
+        envelopes = parse_events_jsonl(
+            archive,
+            actor_fallback=actor_fallback,
+            include_thinking=include_thinking,
+        )
+        if _latest_envelope_is_open_ask_user(envelopes):
+            return envelopes, "jsonl", archive
+
     captured = _capture_for_surface(surface, actor_fallback=actor_fallback)
     if captured:
         return captured, "capture", None
@@ -715,6 +728,17 @@ def _load_envelopes(
         )
         return envelopes, "jsonl", archive
     return [], None, None
+
+
+def _latest_envelope_is_open_ask_user(envelopes: list[MessageEnvelope]) -> bool:
+    for envelope in reversed(envelopes):
+        if envelope.type == MessageType.ASK_USER:
+            return True
+        if envelope.role == MessageRole.USER or envelope.type == MessageType.TOOL_RESULT:
+            return False
+        if envelope.role == MessageRole.ASSISTANT and envelope.type == MessageType.TEXT:
+            return False
+    return False
 
 
 def _capture_for_surface(

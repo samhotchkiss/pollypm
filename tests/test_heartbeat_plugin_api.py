@@ -981,6 +981,46 @@ def test_local_heartbeat_backend_marks_waiting_on_user_for_question() -> None:
     assert api.cursor_updates[-1]["verdict"] == "blocked"
 
 
+def test_same_snapshot_interactive_ask_user_menu_routes_operator_question() -> None:
+    pane_text = "\n".join([
+        "⏺ I need one product direction before I queue imagery work.",
+        "",
+        "What medium should the imagery be?",
+        "",
+        "☐ Imagery medium",
+        "  ○ Bespoke SVG",
+        "  ○ Photography",
+        "☐ Hero treatment        ✔ Submit",
+    ])
+    context = _context(
+        session_name="architect_demo",
+        role="architect",
+        pane_text=pane_text,
+        transcript_delta="",
+        snapshot_hash="ask-user-menu",
+        previous_snapshot_hash="ask-user-menu",
+    )
+    api = FakeHeartbeatAPI(
+        [context],
+        hashes={"architect_demo": [
+            "ask-user-menu",
+            "ask-user-menu",
+            "ask-user-menu",
+        ]},
+    )
+
+    alerts = LocalHeartbeatBackend()._handle_same_snapshot_stall(
+        api,
+        context,
+        mechanical_only=False,
+    )
+
+    assert alerts == ["worker_question"]
+    alert = api.alerts[("architect_demo", "worker_question")]
+    assert "architect architect_demo is waiting" in alert.message
+    assert "What medium should the imagery be?" in alert.message
+
+
 def test_local_heartbeat_backend_recovers_missing_window() -> None:
     api = FakeHeartbeatAPI([_context(window_present=False, pane_text="", transcript_delta="")])
 

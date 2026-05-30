@@ -1034,6 +1034,40 @@ def test_no_tasks_available_does_not_match_when_followed_by_real_output() -> Non
     assert pane_shows_no_tasks_available(pane_text) is False
 
 
+def test_interactive_ask_user_menu_is_unanswered_question() -> None:
+    """Claude's AskUserQuestion menu can park on a TUI form instead of an
+    empty prompt. The heartbeat question detector must still classify it
+    as awaiting the operator, otherwise the session looks healthy while
+    work is wedged.
+    """
+    from pollypm.idle_placeholders import (
+        pane_ends_with_unanswered_question,
+        pane_shows_interactive_ask_user_question,
+    )
+
+    pane_text = "\n".join([
+        "⏺ I need one product direction before I queue imagery work.",
+        "",
+        "What medium should the imagery be?",
+        "",
+        "☐ Imagery medium",
+        "  ○ Bespoke SVG",
+        "  ○ Photography",
+        "☐ Hero treatment        ✔ Submit",
+        "",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ])
+
+    assert (
+        pane_shows_interactive_ask_user_question(pane_text)
+        == "What medium should the imagery be?"
+    )
+    assert (
+        pane_ends_with_unanswered_question(pane_text)
+        == "What medium should the imagery be?"
+    )
+
+
 def test_default_recovery_policy_classifies_no_tasks_pane_as_healthy() -> None:
     """End-to-end #1084 contract: a worker whose last reply is
     ``No tasks available.`` short-circuits to ``HEALTHY`` even when the

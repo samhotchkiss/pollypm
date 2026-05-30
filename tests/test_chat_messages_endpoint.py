@@ -1487,6 +1487,54 @@ def test_messages_endpoint_source_auto_falls_back_when_stale(
     assert body["messages"][0]["id"] == "cap_1"
 
 
+def test_messages_endpoint_source_auto_keeps_stale_open_ask_user_jsonl(
+    client,
+    auth_headers,
+    patch_registry,
+    patch_parser,
+    patch_capture,
+    monkeypatch,
+    tmp_path,
+):
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "is_archive_stale",
+        lambda path, **kw: True,
+    )
+    patch_registry([_surface(
+        "architect_demo", SurfaceType.ARCHITECT, persona="Sage",
+        project="demo", transcript_path=archive,
+    )])
+    ask_user = _env(
+        "msg_toolu_ask",
+        actor="Sage",
+        type_=MessageType.ASK_USER,
+        text="What medium should the imagery be?",
+        metadata={
+            "tool_use_id": "toolu_ask",
+            "questions": [{
+                "question": "What medium should the imagery be?",
+                "options": [{"label": "Photography"}],
+            }],
+        },
+    )
+    patch_parser({archive: [ask_user]})
+    patch_capture([_env("cap_1", text="static rendered menu")])
+
+    body = client.get(
+        "/api/v1/chat/architect_demo/messages?source=auto",
+        headers=auth_headers,
+    ).json()
+
+    assert body["transcript_source"] == "jsonl"
+    assert body["messages"][0]["id"] == "msg_toolu_ask"
+    assert body["messages"][0]["type"] == "ask_user"
+    option = body["messages"][0]["metadata"]["questions"][0]["options"][0]
+    assert option["label"] == "Photography"
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------

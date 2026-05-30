@@ -237,6 +237,35 @@ def _project_from_task_id(task_id: str) -> str | None:
     return None
 
 
+def _infer_project_from_cwd(config_obj: object | None) -> str | None:
+    """Return the registered project containing the current directory."""
+    projects = getattr(config_obj, "projects", {}) or {}
+    if not projects:
+        return None
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return None
+    matches: list[tuple[int, str]] = []
+    for key, project in projects.items():
+        raw_path = getattr(project, "path", None)
+        if raw_path is None:
+            continue
+        try:
+            project_path = Path(raw_path).expanduser().resolve()
+        except (OSError, TypeError):
+            continue
+        try:
+            cwd.relative_to(project_path)
+        except ValueError:
+            continue
+        matches.append((len(project_path.parts), str(key)))
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
 def _value(value):
     return getattr(value, "value", value)
 
@@ -1335,6 +1364,13 @@ def task_next(
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Return the highest-priority queued+unblocked task."""
+    if project is None:
+        try:
+            from pollypm.config import load_config
+
+            project = _infer_project_from_cwd(load_config())
+        except Exception:  # noqa: BLE001
+            project = None
     svc = _svc(project=project)
     task = svc.next(agent=agent, project=project)
     if task is None:

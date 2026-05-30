@@ -11058,6 +11058,35 @@ def _dashboard_trim(text: str, *, limit: int = 220) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+_TIER4_STATIC_BLOCK_RE = _re.compile(
+    r"<tier4_authority\b[^>]*>.*?</tier4_authority>|"
+    r"<tier4_runtime\b[^>]*>.*?</tier4_runtime>",
+    _re.IGNORECASE | _re.DOTALL,
+)
+
+
+def _dashboard_action_body_from_message(body: str) -> str:
+    """Return the user-action portion of a stored message body.
+
+    Tier-4 watchdog dispatches prepend static authority/rubric text to
+    the actual finding handoff. Dashboard cards must summarize the
+    concrete finding, not the authority rubric.
+    """
+    text = str(body or "").replace("\\n", "\n")
+    if "<tier4_authority" not in text.lower():
+        return text
+    stripped = _TIER4_STATIC_BLOCK_RE.sub("", text)
+    marker = "--- Finding ---"
+    if marker in stripped:
+        stripped = stripped.split(marker, 1)[1]
+    lines = [
+        line for line in stripped.splitlines()
+        if line.strip() != "TIER 4 BROADER AUTHORITY DISPATCH"
+    ]
+    cleaned = "\n".join(lines).strip()
+    return cleaned or text
+
+
 def _dashboard_summary_from_body(body: str) -> str:
     paragraphs = [
         _dashboard_plain_text(part)
@@ -12431,8 +12460,9 @@ def _dashboard_inbox_build_message_item(
     if hasattr(updated_at, "isoformat"):
         updated_at = updated_at.isoformat()
     body = message_body
+    action_body = _dashboard_action_body_from_message(body)
     subject = getattr(entry, "title", "") or "(no subject)"
-    steps = _dashboard_steps_from_body(body)
+    steps = _dashboard_steps_from_body(action_body)
     task_refs = [
         match.group(0)
         for match in _PROJECT_TASK_REF_RE.finditer(
@@ -12461,14 +12491,14 @@ def _dashboard_inbox_build_message_item(
         or _dashboard_plan_review_decision(
             project_path,
             labels,
-            body,
+            action_body,
             fallback_task_id=(
                 str(payload.get("task_id") or "")
                 if payload.get("task_id")
                 else None
             ),
         )
-        or _dashboard_plain_decision_from_body(subject, body, steps)
+        or _dashboard_plain_decision_from_body(subject, action_body, steps)
     )
     # #1397: when this is a plan_review item but
     # ``_user_prompt_decision`` won the dispatch (the
@@ -12482,7 +12512,7 @@ def _dashboard_inbox_build_message_item(
         plan_review_extras = _dashboard_plan_review_decision(
             project_path,
             labels,
-            body,
+            action_body,
             fallback_task_id=(
                 str(payload.get("task_id") or "")
                 if payload.get("task_id")
@@ -12517,10 +12547,10 @@ def _dashboard_inbox_build_message_item(
         "source": "message",
         "has_user_prompt": payload.get("user_prompt") is not None,
         "is_plan_review": "plan_review" in labels,
-        "summary": _dashboard_summary_from_body(body),
+        "summary": _dashboard_summary_from_body(action_body),
         "steps": steps,
         "next_action": _dashboard_decision_prompt_from_body(
-            subject, body, steps,
+            subject, action_body, steps,
         ),
         "primary_ref": primary_ref,
         **decision,

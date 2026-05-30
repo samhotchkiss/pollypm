@@ -31,11 +31,48 @@ from pollypm.cockpit_ui import (
     PollyProjectDashboardApp,
     _build_plan_review_denial_primer,
     _build_plan_review_primer,
+    _dashboard_action_body_from_message,
+    _dashboard_steps_from_body,
     _extract_plan_judgment_calls,
     _extract_plan_review_meta,
     _extract_plan_summary_block,
     _plan_review_has_round_trip,
 )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard action-card body extraction.
+# ---------------------------------------------------------------------------
+
+
+def test_tier4_authority_block_not_used_for_dashboard_action_copy() -> None:
+    body = """TIER 4 BROADER AUTHORITY DISPATCH
+
+<tier4_authority>
+1. Reversible without data loss
+2. Scoped appropriately
+3. Operationally safe
+</tier4_authority>
+
+--- Finding ---
+
+TIER HANDOFF
+
+Question: Project savethenovel task savethenovel/11 is stuck.
+
+Evidence:
+- subject: savethenovel/11
+- next step: archive stale watchdog ping
+"""
+
+    action_body = _dashboard_action_body_from_message(body)
+
+    assert "Reversible without data loss" not in action_body
+    assert "Scoped appropriately" not in action_body
+    assert "Question: Project savethenovel" in action_body
+    steps = _dashboard_steps_from_body(action_body)
+    assert all("Reversible without data loss" not in step for step in steps)
+    assert all("Scoped appropriately" not in step for step in steps)
 
 
 # ---------------------------------------------------------------------------

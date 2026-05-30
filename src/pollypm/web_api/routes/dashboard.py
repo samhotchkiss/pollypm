@@ -177,8 +177,9 @@ class DashboardResponse(BaseModel):
     briefing: str | None = Field(
         default=None,
         description=(
-            "Optional morning-briefing narrative. Only populated when "
-            "``?include_briefing=true`` since the body can be megabytes."
+            "Optional morning-briefing narrative. Populated by default; "
+            "set ``?include_briefing=false`` only for very small polling "
+            "responses."
         ),
     )
 
@@ -346,6 +347,21 @@ def _load_dashboard_snapshot(config: Any) -> DashboardSnapshot:
     )
 
 
+def _fresh_dashboard_alert_count(config: Any) -> int | None:
+    """Return a fresh alert count so stale dashboard snapshots cannot alarm high."""
+
+    try:
+        from pollypm.dashboard_data import count_dashboard_alerts
+
+        return count_dashboard_alerts(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "dashboard: fresh alert-count refresh failed; using cached value",
+            exc_info=True,
+        )
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -389,10 +405,11 @@ async def get_dashboard_endpoint(
         Query(
             description=(
                 "Include the morning-briefing narrative in the response. "
-                "Default false — the body can be megabytes."
+                "Default true because the Home surface uses this field; "
+                "set false for tiny machine-polling responses."
             ),
         ),
-    ] = False,
+    ] = True,
 ) -> DashboardResponse:
     """GET /api/v1/dashboard per Phase 2 spec §3.1.
 
@@ -490,12 +507,25 @@ async def get_dashboard_endpoint(
     pending_plan_reviews = sum(
         1 for p in projects_view if p.pending_plan_review
     )
+    # The full snapshot is intentionally stale-while-refresh. Alert counts are
+    # volatile enough that an old-high value can alarm the Home headline, so
+    # refresh that one cheap counter only when we are serving an aged snapshot.
+    snapshot_age = time.monotonic() - snapshot.refreshed_at_monotonic
+    fresh_alert_count = (
+        _fresh_dashboard_alert_count(config)
+        if snapshot_age > 2.0
+        else None
+    )
 
     rollups = DashboardRollups(
         tracked_count=tracked_count,
         open_inbox_count=open_inbox_count,
         pending_plan_reviews=pending_plan_reviews,
-        alert_count=int(getattr(data, "alert_count", 0) or 0),
+        alert_count=int(
+            fresh_alert_count
+            if fresh_alert_count is not None
+            else (getattr(data, "alert_count", 0) or 0)
+        ),
         sweep_count_24h=int(getattr(data, "sweep_count_24h", 0) or 0),
         message_count_24h=int(getattr(data, "message_count_24h", 0) or 0),
         recovery_count_24h=int(getattr(data, "recovery_count_24h", 0) or 0),

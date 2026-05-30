@@ -481,7 +481,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | GET    | `/api/v1/projects` | List registered projects with state, glyph, counts |
 | POST   | `/api/v1/projects` | Register a project (mirrors `pm add-project`) |
 | GET    | `/api/v1/projects/{key}` | Project drilldown — state, recent activity, top tasks, pending plan review |
-| GET    | `/api/v1/dashboard` | Dashboard/cockpit aggregate state (`?project=&include_briefing=&include_token_history=`) |
+| GET    | `/api/v1/dashboard` | Dashboard/cockpit aggregate state (`?project=&include_briefing=true&include_token_history=`; set `include_briefing=false` for tiny polling responses) |
 | GET    | `/api/v1/alerts` | Open action-required alerts with cockpit action descriptors |
 | POST   | `/api/v1/alerts/{alert_id}/actions/{kind}` | Run an alert action. `acknowledge` clears the alert and records the alert-cleared activity event |
 | POST   | `/api/v1/projects/{key}/plan` | Kick off `pm project plan` (initial or replan) |

@@ -263,6 +263,7 @@ def test_dashboard_gather_uses_rail_inbox_counter(monkeypatch, tmp_path: Path) -
     assert seen == [config]
     assert data.inbox_count == 13
     assert "13 inbox items waiting" in data.briefing
+    assert data.briefing.startswith("Morning.")
 
 
 def test_dashboard_gather_includes_cached_llm_quota_usage(
@@ -318,7 +319,10 @@ def test_dashboard_gather_includes_cached_llm_quota_usage(
     monkeypatch.setattr("pollypm.dashboard_data._recent_commits", lambda *_a, **_kw: [])
     monkeypatch.setattr("pollypm.dashboard_data._completed_issues", lambda *_a, **_kw: [])
     monkeypatch.setattr("pollypm.dashboard_data._recent_inbox_messages", lambda *_a, **_kw: [])
-    monkeypatch.setattr("pollypm.dashboard_data._count_dashboard_inbox_items", lambda _config: 0)
+    monkeypatch.setattr(
+        "pollypm.dashboard_data._count_dashboard_inbox_items",
+        lambda _config, **_kw: 0,
+    )
 
     data = gather(config, FakeStore())
 
@@ -398,7 +402,10 @@ def test_dashboard_gather_uses_bulk_heartbeat_lookup(monkeypatch) -> None:
     monkeypatch.setattr("pollypm.dashboard_data._recent_commits", lambda *_a, **_kw: [])
     monkeypatch.setattr("pollypm.dashboard_data._completed_issues", lambda *_a, **_kw: [])
     monkeypatch.setattr("pollypm.dashboard_data._recent_inbox_messages", lambda *_a, **_kw: [])
-    monkeypatch.setattr("pollypm.dashboard_data._count_dashboard_inbox_items", lambda _config: 0)
+    monkeypatch.setattr(
+        "pollypm.dashboard_data._count_dashboard_inbox_items",
+        lambda _config, **_kw: 0,
+    )
     monkeypatch.setattr("pollypm.dashboard_data._account_quota_usage", lambda *_a, **_kw: [])
     monkeypatch.setattr(
         "pollypm.dashboard_data._user_waiting_task_ids_across_projects",

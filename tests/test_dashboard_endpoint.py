@@ -547,9 +547,9 @@ def test_dashboard_returns_expected_shape(
     assert body["tokens"] == {"today": 1234, "total": 98765}
     # Daemon status driven by sessions presence
     assert body["daemon_status"] == "up"
-    # Optional fields default off
+    # Large token history remains opt-in; the compact briefing is on by default.
     assert body.get("daily_tokens") is None
-    assert body.get("briefing") is None
+    assert body.get("briefing") == ""
 
 
 def test_dashboard_daemon_down_when_no_active_sessions(
@@ -658,6 +658,17 @@ def test_dashboard_include_briefing(
         "/api/v1/dashboard?include_briefing=true", headers=auth_headers,
     ).json()
     assert body["briefing"] == "Last 24 hours: 3 commits."
+
+
+def test_dashboard_can_omit_briefing(
+    client, auth_headers, patch_gather, patch_list_projects,
+):
+    patch_list_projects([_api_project("myproj")])
+    patch_gather(_make_data(briefing="Morning. All handled."))
+    body = client.get(
+        "/api/v1/dashboard?include_briefing=false", headers=auth_headers,
+    ).json()
+    assert body["briefing"] is None
 
 
 # ---------------------------------------------------------------------------

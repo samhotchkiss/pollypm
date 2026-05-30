@@ -755,10 +755,11 @@ paths:
             pairs). Off by default — the list can be large.
         - in: query
           name: include_briefing
-          schema: { type: boolean, default: false }
+          schema: { type: boolean, default: true }
           description: |
             Include the morning-briefing narrative in the response.
-            Off by default — the body can be megabytes.
+            On by default for the Home surface; set false for small
+            machine-polling responses.
       responses:
         "200":
           description: Aggregate dashboard snapshot.
@@ -3830,8 +3831,8 @@ components:
         briefing:
           type: string
           description: |
-            Optional morning-briefing narrative. Only populated when
-            `?include_briefing=true`.
+            Optional morning-briefing narrative. Populated by default;
+            omitted only when `?include_briefing=false`.
 
     ProjectDrilldown:
       allOf:

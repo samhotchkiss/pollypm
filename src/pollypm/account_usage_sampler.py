@@ -13,6 +13,7 @@ Contract:
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,28 @@ from pollypm.session_services import create_tmux_client
 from pollypm.storage.records import AccountUsageRecord
 
 logger = logging.getLogger(__name__)
+
+
+def _is_missing_probe_target_error(exc: BaseException) -> bool:
+    """Return True when tmux lost the probe window before capture."""
+
+    parts = [str(exc)]
+    if isinstance(exc, subprocess.CalledProcessError):
+        parts.extend(
+            str(part or "")
+            for part in (exc.cmd, exc.stderr, exc.output)
+        )
+    text = " ".join(parts).lower()
+    return (
+        "capture-pane" in text
+        and (
+            "non-zero exit status 1" in text
+            or "can't find" in text
+            or "can't find pane" in text
+            or "can't find window" in text
+            or "can't find session" in text
+        )
+    )
 
 
 def _read_cached_usage(config, account_name: str) -> AccountUsageRecord | None:
@@ -105,6 +128,12 @@ def refresh_account_usage(
         if account.provider is ProviderKind.CLAUDE and "not authenticated" in lowered:
             health = "auth-broken"
             usage_summary = "usage refresh failed · Claude still opens the login flow"
+        elif _is_missing_probe_target_error(exc):
+            health = cached.health if cached is not None else "unknown"
+            usage_summary = (
+                "headroom unavailable - usage probe window disappeared; "
+                "retrying on next refresh"
+            )
         else:
             health = cached.health if cached is not None else "unknown"
             usage_summary = f"usage refresh failed · {raw_text}"
@@ -164,39 +193,56 @@ def collect_account_usage_sample(
     account = config.accounts[account_name]
     session = _probe_session_spec(config.project.root_dir, account_name, account.provider)
     tmux = tmux_client or create_tmux_client()
-    probe_session = f"{USAGE_PROBE_SESSION_PREFIX}{account_name}-{int(time.time())}"
-    try:
-        tmux.create_session(
-            probe_session,
-            "probe",
-            _build_probe_command(config, account, session),
+    last_missing_target_error: BaseException | None = None
+    for attempt in range(2):
+        probe_session = (
+            f"{USAGE_PROBE_SESSION_PREFIX}{account_name}-{time.time_ns()}"
         )
-        snapshot = collect_usage_snapshot(
-            account,
-            tmux=tmux,
-            target=f"{probe_session}:0",
-            session=session,
-        )
-        return AccountUsageSample(
-            account_name=account_name,
-            provider=account.provider,
-            plan=snapshot.plan or "unknown",
-            health=snapshot.health or "unknown",
-            usage_summary=snapshot.summary or "usage unavailable",
-            raw_text=snapshot.raw_text or "",
-            used_pct=snapshot.used_pct,
-            remaining_pct=snapshot.remaining_pct,
-            reset_at=snapshot.reset_at,
-            period_label=snapshot.period_label,
-        )
-    finally:
-        # Per-probe cleanup. Belt-and-suspenders for #1009 — first try the
-        # wrapped client (lets fakes track the kill in tests); if THAT
-        # raises, fall through to ``tmux kill-session`` directly so a
-        # broken client wrapper can't leak the session. Either way the
-        # ``=`` exact-target prefix prevents accidentally killing
-        # something whose name starts with our probe prefix.
-        _kill_probe_session(probe_session, tmux=tmux)
+        try:
+            tmux.create_session(
+                probe_session,
+                "probe",
+                _build_probe_command(config, account, session),
+            )
+            snapshot = collect_usage_snapshot(
+                account,
+                tmux=tmux,
+                target=f"{probe_session}:0",
+                session=session,
+            )
+            return AccountUsageSample(
+                account_name=account_name,
+                provider=account.provider,
+                plan=snapshot.plan or "unknown",
+                health=snapshot.health or "unknown",
+                usage_summary=snapshot.summary or "usage unavailable",
+                raw_text=snapshot.raw_text or "",
+                used_pct=snapshot.used_pct,
+                remaining_pct=snapshot.remaining_pct,
+                reset_at=snapshot.reset_at,
+                period_label=snapshot.period_label,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 0 and _is_missing_probe_target_error(exc):
+                last_missing_target_error = exc
+                logger.info(
+                    "account_usage_sampler: probe window vanished for %s; "
+                    "respawning once",
+                    account_name,
+                )
+                continue
+            raise
+        finally:
+            # Per-probe cleanup. Belt-and-suspenders for #1009 — first try the
+            # wrapped client (lets fakes track the kill in tests); if THAT
+            # raises, fall through to ``tmux kill-session`` directly so a
+            # broken client wrapper can't leak the session. Either way the
+            # ``=`` exact-target prefix prevents accidentally killing
+            # something whose name starts with our probe prefix.
+            _kill_probe_session(probe_session, tmux=tmux)
+    if last_missing_target_error is not None:
+        raise last_missing_target_error
+    raise RuntimeError("usage probe failed before a sample was collected")
 
 
 def _kill_probe_session(name: str, *, tmux=None) -> None:

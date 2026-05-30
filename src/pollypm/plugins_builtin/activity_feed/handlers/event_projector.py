@@ -414,13 +414,35 @@ class EventProjector:
                 raw_summary = payload.get("summary")
                 if isinstance(raw_summary, str) and raw_summary:
                     payload_summary = raw_summary
-            summary = parsed.summary or payload_summary or _fallback_summary(
-                kind, message, actor,
-            )
             severity = parsed.severity or _severity_from_message_row(row)
-            project = (
+            initial_project = (
                 parsed.project
                 or (payload.get("project") if isinstance(payload, dict) else None)
+                or _project_from_text(message)
+                or _project_from_actor(actor)
+            )
+            recovery_summary: str | None = None
+            if isinstance(payload, dict):
+                try:
+                    from pollypm.recovery.narration import narrate_recovery_event
+
+                    recovery_summary = narrate_recovery_event(
+                        kind,
+                        payload,
+                        subject=parsed.subject or row.get("sender") or None,
+                        project=initial_project,
+                        status=severity,
+                    )
+                except Exception:  # noqa: BLE001
+                    recovery_summary = None
+            summary = (
+                parsed.summary
+                or payload_summary
+                or recovery_summary
+                or _fallback_summary(kind, message, actor)
+            )
+            project = (
+                initial_project
                 or _project_from_text(summary)
                 or _project_from_text(message)
                 or _project_from_actor(actor)

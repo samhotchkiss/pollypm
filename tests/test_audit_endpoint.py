@@ -212,6 +212,11 @@ def test_stats_requires_auth(client: TestClient, audit_home: Path) -> None:
     assert response.status_code == 401
 
 
+def test_activity_requires_auth(client: TestClient, audit_home: Path) -> None:
+    response = client.get("/api/v1/activity")
+    assert response.status_code == 401
+
+
 # ---------------------------------------------------------------------------
 # Grep happy paths
 # ---------------------------------------------------------------------------
@@ -244,6 +249,49 @@ def test_grep_happy_path_returns_matching_events(
     assert subjects == ["myproj/1", "myproj/2"]
     # Sanity: every event carries the canonical Event shape.
     assert all("event" in e and "actor" in e for e in body["events"])
+
+
+def test_activity_endpoint_narrates_recovery_events(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """GET /activity returns activity rows with recovery prose."""
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(
+                project="polly_remote",
+                event="recovery.spawn",
+                subject="architect_polly_remote",
+                actor="supervisor",
+                metadata={
+                    "failure_type": "capacity_exhausted",
+                    "target_session": "architect_polly_remote",
+                    "project": "polly_remote",
+                    "reason": "recovery_restart",
+                },
+            )
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={"project": "myproj", "limit": 10},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["events"]) == 1
+    event = body["events"][0]
+    assert event["event"] == "recovery.spawn"
+    assert event["recovery"] is True
+    assert event["summary"] == (
+        "I restarted the architect for polly remote after capacity was exhausted."
+    )
+    assert "architect_polly_remote" not in event["summary"]
+    assert "capacity_exhausted" not in event["summary"]
 
 
 def test_grep_regex_pattern_filters_lines(

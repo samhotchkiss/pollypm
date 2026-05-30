@@ -23,3 +23,6 @@ dist/
 .claude/worktrees/
 reports/
 docs/project-overview.md
+
+# Codex parallel-fixer working area (never track)
+.codex/

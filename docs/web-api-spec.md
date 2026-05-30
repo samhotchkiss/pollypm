@@ -481,7 +481,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | GET    | `/api/v1/projects` | List registered projects with state, glyph, counts |
 | POST   | `/api/v1/projects` | Register a project (mirrors `pm add-project`) |
 | GET    | `/api/v1/projects/{key}` | Project drilldown — state, recent activity, top tasks, pending plan review |
-| GET    | `/api/v1/dashboard` | Dashboard/cockpit aggregate state (`?project=&include_briefing=&include_token_history=`) |
+| GET    | `/api/v1/dashboard` | Dashboard/cockpit aggregate state (`?project=&include_briefing=true&include_token_history=`; set `include_briefing=false` for tiny polling responses) |
 | GET    | `/api/v1/alerts` | Open action-required alerts with cockpit action descriptors |
 | POST   | `/api/v1/alerts/{alert_id}/actions/{kind}` | Run an alert action. `acknowledge` clears the alert and records the alert-cleared activity event |
 | POST   | `/api/v1/projects/{key}/plan` | Kick off `pm project plan` (initial or replan) |
@@ -504,7 +504,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | POST   | `/api/v1/inbox/{id}/archive` | Archive (close) the item |
 | GET    | `/api/v1/events` | SSE stream of audit-log events (`?since=&project=&event=`) |
 | GET    | `/api/v1/chat/sessions` | Discover every chat surface (operator/architect/advisor/worker) |
-| GET    | `/api/v1/chat/{session_name}/messages` | Paginated message history for one chat surface (`?since=&since_id=&limit=&direction=&source=&include_subagents=`) — `include_subagents=true` inlines the raw subagent JSONL at each `subagent_result.metadata.output_file` (allowlist-constrained, capped per envelope, #2052) |
+| GET    | `/api/v1/chat/{session_name}/messages` | Paginated message history for one chat surface (`?since=&since_id=&limit=&direction=&source=&include_subagents=`) — `source=auto` normally falls back to tmux capture for stale archives, but preserves stale JSONL when the newest structured envelope is an open `ask_user` so clients can answer it; `include_subagents=true` inlines the raw subagent JSONL at each `subagent_result.metadata.output_file` (allowlist-constrained, capped per envelope, #2052) |
 
 The OpenAPI document is the authoritative list; if anything here
 drifts, the YAML wins.

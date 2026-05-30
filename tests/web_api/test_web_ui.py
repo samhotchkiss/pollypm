@@ -1374,6 +1374,139 @@ process.stdout.write(elements["dashboard-rollups"].innerHTML);
     return proc.stdout
 
 
+def _node_render_chat_history(payload: dict, reply_text: str = "") -> dict:
+    """Render chat history under node and inspect AskUserQuestion state."""
+    node_bin = shutil.which("node")
+    if node_bin is None:
+        pytest.skip("node binary not available; cannot run executable JS harness")
+    app_js_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "pollypm"
+        / "web_api"
+        / "ui"
+        / "app.js"
+    )
+    harness = r"""
+const fs = require("fs");
+const path = process.argv[1];
+const payload = JSON.parse(process.argv[2]);
+const replyText = process.argv[3] || "";
+
+function makeNode(tag) {
+  const node = {
+    tagName: (tag || "div").toUpperCase(),
+    children: [],
+    attrs: {},
+    className: "",
+    textContent: "",
+    dataset: {},
+    style: {},
+  };
+  Object.defineProperty(node, "innerHTML", {
+    get() {
+      function escapeText(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+      function render(n) {
+        if (n.__text != null) return escapeText(n.__text);
+        const tag = n.tagName.toLowerCase();
+        const inner = n.textContent && n.children.length === 0
+          ? escapeText(n.textContent)
+          : n.children.map(render).join("");
+        if (tag === "fragment") return inner;
+        const parts = [];
+        for (const k of Object.keys(n.attrs)) {
+          parts.push(k + '="' + n.attrs[k] + '"');
+        }
+        if (n.className) parts.push('class="' + n.className + '"');
+        const open = parts.length
+          ? "<" + tag + " " + parts.join(" ") + ">"
+          : "<" + tag + ">";
+        return open + inner + "</" + tag + ">";
+      }
+      return node.children.map(render).join("");
+    },
+    set(v) {
+      if (v === "") node.children = [];
+    },
+  });
+  node.setAttribute = function (k, v) { node.attrs[k] = v; };
+  node.appendChild = function (child) { node.children.push(child); return child; };
+  node.removeChild = function (child) {
+    node.children = node.children.filter((c) => c !== child);
+    return child;
+  };
+  node.querySelector = function () { return null; };
+  node.querySelectorAll = function () { return []; };
+  node.addEventListener = function () {};
+  return node;
+}
+
+const elements = {
+  "dashboard-rollups": makeNode("div"),
+  "surface-list": makeNode("ul"),
+  "message-list": makeNode("div"),
+  "send-input": makeNode("input"),
+  "send-button": makeNode("button"),
+  "send-form": makeNode("form"),
+  "pane-title": makeNode("div"),
+  "pane-meta": makeNode("div"),
+  "conn-status": makeNode("div"),
+  "layout": makeNode("div"),
+};
+
+global.document = {
+  getElementById: (id) => elements[id] || null,
+  createElement: (tag) => makeNode(tag),
+  createDocumentFragment: () => makeNode("fragment"),
+  createTextNode: (text) => {
+    const n = makeNode("span");
+    n.__text = text;
+    return n;
+  },
+  addEventListener: function () {},
+  readyState: "complete",
+  body: makeNode("body"),
+};
+global.window = {};
+global.setInterval = function () { return 0; };
+global.clearInterval = function () {};
+global.setTimeout = function () { return 0; };
+global.fetch = function () { return Promise.reject(new Error("no network")); };
+
+const source = fs.readFileSync(path, "utf8");
+// eslint-disable-next-line no-eval
+eval(source);
+
+global.window.PollyPM.renderHistory(payload);
+const body = replyText
+  ? global.window.PollyPM.buildChatSendBody(payload.session_name, replyText)
+  : null;
+process.stdout.write(JSON.stringify({
+  html: elements["message-list"].innerHTML,
+  pendingAskUser: global.window.PollyPM.state.pendingAskUser[payload.session_name],
+  body: body,
+}));
+"""
+    proc = subprocess.run(
+        [node_bin, "-e", harness, str(app_js_path), json.dumps(payload), reply_text],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"node harness failed (rc={proc.returncode}):\n"
+            f"STDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
 def _node_render_surface_rail(payload: dict) -> dict:
     """Render the left rail under node and optionally select a task."""
     node_bin = shutil.which("node")
@@ -1659,6 +1792,57 @@ def test_task_detail_surfaces_cancel_and_reopen_actions() -> None:
     assert "Reopen" in cancelled["messages"]
 
 
+def test_chat_history_renders_ask_user_controls_and_routes_reply() -> None:
+    payload = {
+        "session_name": "architect_demo",
+        "surface_type": "architect",
+        "transcript_source": "events_jsonl",
+        "messages": [
+            {
+                "id": "msg_toolu_ask",
+                "ts": "2026-05-30T10:00:00Z",
+                "role": "assistant",
+                "actor": "Sage",
+                "type": "ask_user",
+                "text": "What medium should the imagery be?",
+                "metadata": {
+                    "tool_use_id": "toolu_ask",
+                    "questions": [
+                        {
+                            "question": "What medium should the imagery be?",
+                            "multiSelect": False,
+                            "options": [
+                                {
+                                    "label": "Bespoke SVG",
+                                    "description": "Custom illustration.",
+                                },
+                                {
+                                    "label": "Photography",
+                                    "description": "Use sourced photos.",
+                                },
+                            ],
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+
+    rendered = _node_render_chat_history(payload, "Use photography")
+
+    html = rendered["html"]
+    assert "ask-user-card" in html
+    assert 'data-answer-to="msg_toolu_ask"' in html
+    assert "Bespoke SVG" in html
+    assert "Photography" in html
+    assert "Submit answer" in html
+    assert rendered["pendingAskUser"]["id"] == "msg_toolu_ask"
+    assert rendered["body"] == {
+        "answer_to": "msg_toolu_ask",
+        "text": "Use photography",
+    }
+
+
 def test_render_dashboard_real_payload_executes() -> None:
     """Feed a representative DashboardResponse through ``renderDashboard``.
 
@@ -1742,7 +1926,7 @@ def test_render_dashboard_real_payload_executes() -> None:
     assert ">5<" in rendered, "tracked_count value 5 missing"
     assert "58% left this week" in rendered, "quota summary missing"
     assert "1234 today / 5678 total tokens" in rendered, "token line missing"
-    assert "5 things need you" in rendered, "lead headline missing"
+    assert "12 things need you" in rendered, "lead headline missing"
     assert 'role="button"' in rendered
     assert 'title="Open inbox"' in rendered
     assert 'title="Open alerts"' in rendered

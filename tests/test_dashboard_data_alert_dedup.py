@@ -11,6 +11,9 @@ for non-faults the user already sees as yellow.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
 from pollypm.dashboard_data import _stuck_alert_already_user_waiting
 
 
@@ -45,6 +48,269 @@ def test_stuck_alert_already_user_waiting_handles_malformed_alert() -> None:
         "stuck_on_task:   ",
         frozenset({"polly_remote/12"}),
     )
+
+
+def test_actionable_alert_filter_drops_stale_watchdog_queue_alerts() -> None:
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"media", "polly_remote"}),
+        tracked_projects=frozenset({"polly_remote"}),
+        project_task_counts={
+            "media": {"queued": 4},
+            "polly_remote": {"queued": 0},
+        },
+    )
+
+    untracked_alert = SimpleNamespace(
+        session_name="audit-queue_without_motion-media-media",
+        alert_type="audit_watchdog",
+        message="Project media has 4 queued task(s) but no motion.",
+    )
+    resolved_alert = SimpleNamespace(
+        session_name="audit-queue_without_motion-polly_remote-polly_remote",
+        alert_type="audit_watchdog",
+        message="Project polly_remote has 2 queued task(s) but no motion.",
+    )
+    live_alert = SimpleNamespace(
+        session_name="audit-queue_without_motion-polly_remote-polly_remote",
+        alert_type="audit_watchdog",
+        message="Project polly_remote has 2 queued task(s) but no motion.",
+    )
+
+    assert not is_user_actionable_alert(untracked_alert, context=context)
+    assert not is_user_actionable_alert(resolved_alert, context=context)
+    live_context = AlertActionabilityContext(
+        known_projects=context.known_projects,
+        tracked_projects=context.tracked_projects,
+        project_task_counts={"polly_remote": {"queued": 2}},
+    )
+    assert is_user_actionable_alert(live_alert, context=live_context)
+
+
+def test_actionable_count_excludes_recovery_warns_on_untracked_projects() -> None:
+    """#2475 — the operator-Home "N things need you" headline must count
+    only operator-actionable items. System-internal recovery watchdog
+    warns (``plan_missing`` / ``worker_session_gap`` /
+    ``missing_task_worker``) firing on stale / archived / synthetic test
+    projects are recovery signals the heartbeat cascade auto-handles, so
+    they're excluded from the count. The same warns on a tracked project
+    stay actionable, and a genuine operator-decision alert is never
+    demoted.
+    """
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        count_user_actionable_alerts,
+        is_user_actionable_alert,
+        user_actionable_alerts,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset(
+            {"polly_remote", "pm_test_alpha", "ghost", "queuestorm-beta"}
+        ),
+        tracked_projects=frozenset({"polly_remote"}),
+    )
+
+    # Operator-actionable: a genuine decision alert on a tracked project.
+    operator_decision = SimpleNamespace(
+        session_name="architect-polly_remote",
+        alert_type="worker_question",
+        message="Worker needs a scope call on polly_remote/14.",
+    )
+    # Operator-actionable: recovery warn, but on a TRACKED project — the
+    # operator may legitimately want to claim its queued work.
+    tracked_gap = SimpleNamespace(
+        session_name="worker_session_gap-polly_remote",
+        alert_type="worker_session_gap",
+        message="Project polly_remote has 3 queued tasks but no workers.",
+    )
+
+    # System-internal recovery noise on stale / test projects — excluded.
+    stale_plan_missing = SimpleNamespace(
+        session_name="plan_gate-pm_test_alpha",
+        alert_type="plan_missing",
+        message="Project pm_test_alpha has queued tasks but no plan.",
+    )
+    stale_worker_gap = SimpleNamespace(
+        session_name="worker_session_gap-ghost",
+        alert_type="worker_session_gap",
+        message="Project ghost has 2 queued tasks but no workers.",
+    )
+    stale_missing_worker = SimpleNamespace(
+        session_name="missing_task_worker-queuestorm-beta/7",
+        alert_type="missing_task_worker",
+        message="Task queuestorm-beta/7 is in_progress but its worker died.",
+    )
+
+    alerts = [
+        operator_decision,
+        tracked_gap,
+        stale_plan_missing,
+        stale_worker_gap,
+        stale_missing_worker,
+    ]
+
+    # Only the two tracked/operator-actionable items survive the filter.
+    assert is_user_actionable_alert(operator_decision, context=context)
+    assert is_user_actionable_alert(tracked_gap, context=context)
+    assert not is_user_actionable_alert(stale_plan_missing, context=context)
+    assert not is_user_actionable_alert(stale_worker_gap, context=context)
+    assert not is_user_actionable_alert(stale_missing_worker, context=context)
+
+    surviving = user_actionable_alerts(alerts, context=context)
+    assert surviving == [operator_decision, tracked_gap]
+    assert count_user_actionable_alerts(alerts, context=context) == 2
+
+
+def test_recovery_warn_stays_actionable_without_tracked_set() -> None:
+    """#2475 guard: with no ``tracked_projects`` set we can't tell stale
+    from live, so a recovery warn is left actionable rather than
+    over-suppressed (fail-open, not fail-closed)."""
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    warn = SimpleNamespace(
+        session_name="plan_gate-ghost",
+        alert_type="plan_missing",
+        message="Project ghost has queued tasks but no plan.",
+    )
+    # No tracked_projects provided.
+    assert is_user_actionable_alert(warn, context=AlertActionabilityContext())
+    assert is_user_actionable_alert(warn)
+
+
+def test_recovery_warn_demotes_tracked_but_dormant_project() -> None:
+    """#2480 — trackedness is not a liveness signal.
+
+    A dead project can remain ``tracked=True`` while watchdog churn keeps
+    touching its tasks. Recovery/hygiene warns on such projects should
+    not inflate the operator "needs you" headline unless the project has
+    recent real completed work.
+    """
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"polly_remote", "savethenovel"}),
+        tracked_projects=frozenset({"polly_remote", "savethenovel"}),
+        recent_real_work_projects=frozenset({"savethenovel"}),
+    )
+
+    dormant_recovery_warn = SimpleNamespace(
+        session_name="worker_session_gap-polly_remote",
+        alert_type="worker_session_gap",
+        message="Project polly_remote has 3 queued tasks but no workers.",
+    )
+    active_recovery_warn = SimpleNamespace(
+        session_name="worker_session_gap-savethenovel",
+        alert_type="worker_session_gap",
+        message="Project savethenovel has 2 queued tasks but no workers.",
+    )
+    operator_decision = SimpleNamespace(
+        session_name="architect-polly_remote",
+        alert_type="worker_question",
+        message="Worker needs a scope call.",
+    )
+
+    assert not is_user_actionable_alert(dormant_recovery_warn, context=context)
+    assert is_user_actionable_alert(active_recovery_warn, context=context)
+    assert is_user_actionable_alert(operator_decision, context=context)
+
+
+def test_queue_without_motion_demotes_tracked_project_without_recent_real_work() -> None:
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"polly_remote"}),
+        tracked_projects=frozenset({"polly_remote"}),
+        recent_real_work_projects=frozenset(),
+        project_task_counts={"polly_remote": {"queued": 12}},
+    )
+    qwm_alert = SimpleNamespace(
+        session_name="audit-queue_without_motion-polly_remote-polly_remote",
+        alert_type="audit_watchdog",
+        message="Project polly_remote has 12 queued task(s) but no motion.",
+    )
+
+    assert not is_user_actionable_alert(qwm_alert, context=context)
+
+
+def test_worktree_state_demotes_tracked_project_without_recent_real_work() -> None:
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"polly_remote"}),
+        tracked_projects=frozenset({"polly_remote"}),
+        recent_real_work_projects=frozenset(),
+    )
+    warn = SimpleNamespace(
+        session_name="worker-polly_remote-9",
+        alert_type="worktree_state:polly_remote/9:dirty_stale",
+        message="Worker worktree has stale dirty changes.",
+    )
+
+    assert not is_user_actionable_alert(warn, context=context)
+
+
+def test_alert_filter_task_facts_use_recent_done_for_liveness(monkeypatch) -> None:
+    from pollypm import dashboard_data
+
+    now = datetime.now(UTC)
+    grouped = {
+        "active": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=1),
+            )
+        ],
+        "dormant": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=14),
+            ),
+            SimpleNamespace(
+                work_status="queued",
+                updated_at=now,
+            ),
+        ],
+    }
+    config = SimpleNamespace(projects={"active": object(), "dormant": object()})
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_grouped",
+        lambda _config: grouped,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_for_project",
+        lambda data, _config, key: data[key],
+    )
+
+    facts = dashboard_data._project_task_facts_for_alert_filter(
+        config,
+        [
+            SimpleNamespace(
+                session_name="worker_session_gap-active",
+                alert_type="worker_session_gap",
+            )
+        ],
+    )
+
+    assert facts.recent_real_work_projects == frozenset({"active"})
+    assert facts.project_task_counts["dormant"]["queued"] == 1
 
 
 def test_session_description_skips_claude_tui_bottom_bar(tmp_path) -> None:
@@ -336,72 +602,43 @@ def test_session_description_truncates_at_word_boundary(tmp_path) -> None:
     assert " " not in desc[-2:]  # ellipsis follows a complete word
 
 
-def test_briefing_pluralizes_counts_correctly(tmp_path) -> None:
-    """The morning briefing rendered ``1 project(s)`` / ``1 issue(s)``
-    when counts were exactly 1 — awkward parenthetical pluralisation
-    a user reads as a bug. Pluralise properly: ``1 project`` /
-    ``2 projects`` / ``1 issue`` / ``3 issues``.
-
-    We exercise the briefing builder via the in-process gather path
-    so the test stays focused on the prose, not the SQL plumbing.
-    """
-    # Test the inline ``_plural`` helper indirectly by exercising
-    # the gather() prose builder. We can't easily call ``_plural``
-    # in isolation since it's nested inside ``gather``; instead,
-    # construct minimal fakes that exercise each pluralisation
-    # branch and inspect the resulting briefing string.
-    from datetime import UTC, datetime
-    from pollypm.dashboard_data import CommitInfo, CompletedItem, DashboardData
-
-    now = datetime.now(UTC)
-
-    def _build_briefing(commits, completed, inbox_count) -> str:
-        """Inline copy of the briefing prose builder for unit testing.
-
-        Mirrors the production logic in ``dashboard_data.gather`` so the
-        plural-handling regression stays covered. Recoveries are not
-        surfaced in the briefing (#854): they are internal recovery-loop
-        plumbing, not user-facing activity.
-        """
-        def _plural(count: int, singular: str, plural: str | None = None) -> str:
-            word = singular if count == 1 else (plural or f"{singular}s")
-            return f"{count} {word}"
-
-        if not (commits or completed or inbox_count):
-            return ""
-        parts: list[str] = []
-        if commits:
-            projects_touched = len({c.project for c in commits})
-            parts.append(
-                f"{_plural(len(commits), 'commit')} across "
-                f"{_plural(projects_touched, 'project')}"
-            )
-        if completed:
-            parts.append(f"{_plural(len(completed), 'issue')} completed")
-        if inbox_count:
-            parts.append(
-                f"{_plural(inbox_count, 'inbox item')} waiting for you"
-            )
-        return "Last 24 hours: " + ", ".join(parts) + "."
+def test_briefing_pluralizes_counts_correctly() -> None:
+    """The Home briefing stays readable for singular and plural counts."""
+    from pollypm.dashboard_data import (
+        _build_dashboard_briefing,
+        CommitInfo,
+        CompletedItem,
+        InboxPreview,
+    )
 
     # Singular case — no parenthetical-s.
-    out = _build_briefing(
+    out = _build_dashboard_briefing(
         commits=[CommitInfo("h1", "msg", "a", 0.0, "demo")],
         completed=[CompletedItem("t", "issue", "demo", 0.0)],
         inbox_count=1,
+        recent_messages=[
+            InboxPreview(
+                sender="polly",
+                title="Approval ready: demo/1",
+                project="demo",
+                task_id="demo/1",
+                age_seconds=0.0,
+            )
+        ],
+        recovery_count_24h=1,
     )
     assert "1 commit across 1 project" in out
-    assert "1 issue completed" in out
-    assert "1 inbox item waiting" in out
-    assert out.startswith("Last 24 hours:"), f"unexpected greeting: {out!r}"
-    # Recovery counts must not surface in the user-facing briefing.
-    assert "recovery" not in out.lower()
+    assert "1 item wrapped" in out
+    assert "1 recovery handled" in out
+    assert "One thing needs you:" in out
+    assert "demo/1" not in out
+    assert out.startswith("Morning."), f"unexpected greeting: {out!r}"
     # The bare singular forms must not contain the legacy parens.
     assert "(s)" not in out
     assert "(ies)" not in out
 
     # Plural case — proper plural endings, still no parens.
-    out2 = _build_briefing(
+    out2 = _build_dashboard_briefing(
         commits=[
             CommitInfo("h1", "m", "a", 0.0, "demo"),
             CommitInfo("h2", "m", "a", 0.0, "other"),
@@ -412,13 +649,99 @@ def test_briefing_pluralizes_counts_correctly(tmp_path) -> None:
             CompletedItem("t2", "issue", "demo", 0.0),
         ],
         inbox_count=4,
+        recent_messages=[
+            InboxPreview(
+                sender="polly",
+                title="Decision ready for other/99",
+                project="other",
+                task_id="other/99",
+                age_seconds=0.0,
+            )
+        ],
+        recovery_count_24h=2,
     )
     assert "3 commits across 2 projects" in out2
-    assert "2 issues completed" in out2
+    assert "2 items wrapped" in out2
+    assert "2 recoveries handled" in out2
+    assert "First up:" in out2
     assert "4 inbox items waiting" in out2
-    assert "recovery" not in out2.lower()
+    assert "other/99" not in out2
     assert "(s)" not in out2
     assert "(ies)" not in out2
+
+
+def test_briefing_all_handled_when_no_activity() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=0,
+        recent_messages=[],
+        recovery_count_24h=0,
+    )
+
+    assert "Quiet night" in out
+    assert "Nothing needs you" in out
+
+
+def test_briefing_surfaces_recovery_narration() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=0,
+        recent_messages=[],
+        recovery_count_24h=1,
+        recovery_summaries=[
+            "I restarted the architect for polly remote after capacity was exhausted.",
+        ],
+    )
+
+    assert "While you were away, I handled this:" in out
+    assert "I restarted the architect for polly remote" in out
+    assert "Saved:" not in out
+
+
+def test_recent_recovery_audit_narrations_reads_audit_events(monkeypatch) -> None:
+    from pollypm.dashboard_data import _recent_recovery_audit_narrations
+
+    rows = [
+        SimpleNamespace(
+            event="recovery.spawn",
+            ts="2026-05-30T10:00:00+00:00",
+            project="polly_remote",
+            subject="architect_polly_remote",
+            actor="supervisor",
+            status="ok",
+            metadata={
+                "failure_type": "capacity_exhausted",
+                "target_session": "architect_polly_remote",
+                "project": "polly_remote",
+            },
+        )
+    ]
+
+    monkeypatch.setattr("pollypm.audit.log.read_events", lambda *a, **k: rows)
+    config = SimpleNamespace(
+        projects={
+            "polly_remote": SimpleNamespace(
+                tracked=True,
+                path="/tmp/polly_remote",
+            )
+        }
+    )
+
+    narrations, count = _recent_recovery_audit_narrations(
+        config,
+        since="2026-05-30T00:00:00+00:00",
+    )
+
+    assert count == 1
+    assert narrations == [
+        "I restarted the architect for polly remote after capacity was exhausted.",
+    ]
 
 
 # ---------------------------------------------------------------------------

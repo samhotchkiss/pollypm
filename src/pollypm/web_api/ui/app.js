@@ -93,6 +93,7 @@
     auditErrors: {},
     auditLoading: {},
     surfaceMidStream: {},
+    pendingAskUser: {},
     surfaceFilter: "",
     activitySince: ACTIVITY_DEFAULT_SINCE,
     activityEntries: [],
@@ -1155,17 +1156,6 @@
     return count === 1 ? singular : (pluralText || singular + "s");
   }
 
-  function blockedProjectCount(data) {
-    const projects = data && Array.isArray(data.projects) ? data.projects : [];
-    return projects.filter((project) => {
-      const projectState = String(project.state || "").toLowerCase();
-      if (projectState === "blocked" || projectState === "on_hold") return true;
-      const counts = project.task_counts && typeof project.task_counts === "object"
-        ? project.task_counts : {};
-      return numeric(counts.blocked) + numeric(counts.on_hold) > 0;
-    }).length;
-  }
-
   function dashboardStatus(data) {
     if (!data || typeof data !== "object") {
       return {
@@ -1178,9 +1168,9 @@
     const rollups = data.rollups && typeof data.rollups === "object"
       ? data.rollups : {};
     const planReviews = numeric(rollups.pending_plan_reviews);
+    const inbox = numeric(rollups.open_inbox_count);
     const alerts = numeric(rollups.alert_count);
-    const blockedProjects = blockedProjectCount(data);
-    const total = planReviews + alerts + blockedProjects;
+    const total = planReviews + inbox + alerts;
     if (total === 0) {
       const sweeps = numeric(rollups.sweep_count_24h);
       const recoveries = numeric(rollups.recovery_count_24h);
@@ -1188,7 +1178,7 @@
         ? "24h: " + sweeps + " "
           + plural(sweeps, "sweep") + " / " + recoveries + " "
           + plural(recoveries, "recovery", "recoveries") + "."
-        : "No plan reviews, blockers, or alerts waiting.";
+        : "No inbox items, plan reviews, or alerts waiting.";
       return {
         title: "All handled - Polly's got it",
         detail: proof,
@@ -1206,14 +1196,14 @@
         target: "plan-review",
       };
     }
-    if (blockedProjects > 0) {
+    if (inbox > 0) {
       return {
         title: total + " " + plural(total, "thing") + " "
           + (total === 1 ? "needs" : "need") + " you",
-        detail: blockedProjects + " "
-          + plural(blockedProjects, "blocked project") + " waiting.",
-        actionLabel: "Open blocked tasks",
-        target: "blocked-tasks",
+        detail: inbox + " "
+          + plural(inbox, "inbox item") + " waiting.",
+        actionLabel: "Open inbox",
+        target: "inbox",
       };
     }
     return {
@@ -1229,13 +1219,6 @@
     if (!status) return;
     if (status.target === "plan-review") {
       selectInbox({ type: "plan_review" });
-      return;
-    }
-    if (status.target === "blocked-tasks") {
-      state.taskStatusFilter = "blocked";
-      const filter = $("task-status-filter");
-      if (filter) filter.value = state.taskStatusFilter;
-      loadSurfaces();
       return;
     }
     if (status.target === "alerts") {
@@ -1614,6 +1597,9 @@
   }
 
   function auditSummary(entry) {
+    if (entry && typeof entry.summary === "string" && entry.summary.trim()) {
+      return entry.summary.trim();
+    }
     const parts = [entry.event || "audit"];
     if (entry.subject) parts.push(entry.subject);
     if (entry.status) parts.push(entry.status);
@@ -1830,6 +1816,7 @@
       String(m.actor || ""),
       String(m.type || ""),
       String(m.text || ""),
+      JSON.stringify(m.metadata || {}),
     ]);
   }
 
@@ -1841,6 +1828,154 @@
       String(messages.length),
       messages.map(historyMessageSignature),
     ]);
+  }
+
+  function askUserQuestions(message) {
+    const metadata = message && message.metadata && typeof message.metadata === "object"
+      ? message.metadata : {};
+    return Array.isArray(metadata.questions) ? metadata.questions : [];
+  }
+
+  function askUserOptionLabel(option) {
+    if (typeof option === "string") return option;
+    if (!option || typeof option !== "object") return "";
+    return String(option.label || option.value || "").trim();
+  }
+
+  function askUserOptionDescription(option) {
+    if (!option || typeof option !== "object") return "";
+    return String(option.description || option.help || "").trim();
+  }
+
+  function askUserQuestionAllowsMultiple(question) {
+    if (!question || typeof question !== "object") return false;
+    return Boolean(
+      question.multiSelect
+      || question.multi_select
+      || question.multiselect
+      || question.multiple,
+    );
+  }
+
+  function currentAskUserFromMessages(messages) {
+    for (const message of messages || []) {
+      const type = String(message && message.type || "");
+      const role = String(message && message.role || "");
+      if (type === "ask_user" && message.id) return message;
+      if (role === "user" || type === "tool_result") return null;
+      if (type === "text" && role === "assistant") return null;
+    }
+    return null;
+  }
+
+  function buildChatSendBody(name, text) {
+    const askUser = state.pendingAskUser[name];
+    if (askUser && askUser.id) {
+      return { answer_to: askUser.id, text: text };
+    }
+    return { text: text };
+  }
+
+  function askUserAnswerText(selections, notes) {
+    const picked = (selections || []).filter(Boolean);
+    const extra = String(notes || "").trim();
+    if (picked.length && extra) return picked.join(", ") + " - " + extra;
+    if (picked.length) return picked.join(", ");
+    return extra;
+  }
+
+  async function sendAskUserAnswer(name, answerTo, selections, notes) {
+    if (!name || !answerTo) return;
+    const answerText = askUserAnswerText(selections, notes);
+    if (!answerText) {
+      showToast("warn", "choose an answer first");
+      return;
+    }
+    const local = addLocalEcho(name, answerText);
+    const path = API + "/chat/" + encodeURIComponent(name) + "/send";
+    try {
+      await apiFetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          answer_to: answerTo,
+          selections: selections || [],
+          notes: notes || "",
+        }),
+      });
+      updateLocalEcho(name, local.id, { status: "pending" });
+      delete state.pendingAskUser[name];
+      setTimeout(() => loadHistory(name), 400);
+    } catch (err) {
+      updateLocalEcho(name, local.id, {
+        status: "failed",
+        error: err.message || String(err),
+      });
+      showToast("error", "answer failed: " + (err.message || String(err)));
+      throw err;
+    }
+  }
+
+  function askUserControlsNode(message, sessionName) {
+    const questions = askUserQuestions(message);
+    if (!questions.length || !message.id) return null;
+    const groups = [];
+    questions.forEach((question, qIndex) => {
+      const options = Array.isArray(question.options) ? question.options : [];
+      const optionNodes = [];
+      options.forEach((option) => {
+        const label = askUserOptionLabel(option);
+        if (!label) return;
+        const inputType = askUserQuestionAllowsMultiple(question)
+          ? "checkbox" : "radio";
+        const input = el("input", {
+          type: inputType,
+          name: "ask-user-" + message.id + "-" + qIndex,
+          value: label,
+          "data-ask-user-option": label,
+        });
+        const description = askUserOptionDescription(option);
+        const children = [
+          input,
+          el("span", { class: "ask-user-option-label", text: label }),
+        ];
+        if (description) {
+          children.push(el("span", {
+            class: "ask-user-option-description",
+            text: description,
+          }));
+        }
+        optionNodes.push(el("label", { class: "ask-user-option" }, children));
+      });
+      const groupChildren = [];
+      const questionText = String(question.question || "").trim();
+      if (questions.length > 1 && questionText) {
+        groupChildren.push(el("div", {
+          class: "ask-user-question",
+          text: questionText,
+        }));
+      }
+      groupChildren.push(el("div", { class: "ask-user-options" }, optionNodes));
+      groups.push(el("fieldset", { class: "ask-user-group" }, groupChildren));
+    });
+    const submit = el("button", {
+      type: "submit",
+      class: "ask-user-submit",
+      text: "Submit answer",
+    });
+    const form = el("form", {
+      class: "ask-user-card",
+      "data-answer-to": message.id,
+    }, groups.concat([submit]));
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const inputs = Array.from(
+        form.querySelectorAll("input[data-ask-user-option]:checked"),
+      );
+      const selections = inputs.map((input) => input.value).filter(Boolean);
+      sendAskUserAnswer(sessionName, message.id, selections, "").catch(() => {});
+    });
+    return form;
   }
 
   function shouldSkipHistoryRender(list, sessionName, signature) {
@@ -1855,17 +1990,20 @@
     list.dataset.historySession = sessionName;
   }
 
-  function historyMessageNode(message) {
+  function historyMessageNode(message, sessionName) {
     const m = message || {};
     const roleClass = "message message-role-" + (m.role || "system");
-    return el("div", { class: roleClass }, [
+    const children = [
       el("div", { class: "message-head" }, [
         el("span", { class: "message-actor", text: m.actor || m.role || "?" }),
         el("span", { class: "message-ts", text: m.ts || "" }),
         el("span", { class: "message-type", text: m.type || "" }),
       ]),
       el("div", { class: "message-text", text: m.text || "" }),
-    ]);
+    ];
+    const askControls = askUserControlsNode(m, sessionName);
+    if (askControls) children.push(askControls);
+    return el("div", { class: roleClass }, children);
   }
 
   async function loadHistory(name, opts) {
@@ -1935,6 +2073,9 @@
     $("pane-meta").textContent = meta.join(" · ");
     const rawMessages = Array.isArray(data.messages) ? data.messages : [];
     const msgs = rawMessages.slice(0, HISTORY_RENDER_LIMIT);
+    const pendingAskUser = currentAskUserFromMessages(msgs);
+    if (pendingAskUser) state.pendingAskUser[data.session_name] = pendingAskUser;
+    else delete state.pendingAskUser[data.session_name];
     const pending = reconcilePendingMessages(data.session_name, msgs);
     state.surfaceMidStream[data.session_name] = (
       msgs.length > 0 && messageLooksMidStream(msgs[0])
@@ -1958,7 +2099,7 @@
     // at the bottom (chat convention).
     const fragment = document.createDocumentFragment();
     for (let i = msgs.length - 1; i >= 0; i -= 1) {
-      fragment.appendChild(historyMessageNode(msgs[i]));
+      fragment.appendChild(historyMessageNode(msgs[i], data.session_name));
     }
     list.appendChild(fragment);
     renderLocalEchoes(data.session_name);
@@ -1986,7 +2127,7 @@
       await apiFetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: text }),
+        body: JSON.stringify(buildChatSendBody(name, text)),
       });
       updateLocalEcho(name, local.id, { status: "pending" });
       // Refresh after a short delay so the server-confirmed line can
@@ -3230,10 +3371,10 @@
     return params;
   }
 
-  function activityGrepPath() {
+  function activityFeedPath() {
     const params = activityParams();
     params.set("limit", String(ACTIVITY_LIMIT));
-    return API + "/audit/grep?" + params.toString();
+    return API + "/activity?" + params.toString();
   }
 
   function activityStatsPath() {
@@ -3255,7 +3396,7 @@
     try {
       const [grepResult, statsResult] = await Promise.allSettled([
         apiJsonOptionalWithTimeout(
-          "activity feed", activityGrepPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
+          "activity feed", activityFeedPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
         ),
         apiJsonOptionalWithTimeout(
           "activity stats", activityStatsPath(), ACTIVITY_STATS_REQUEST_TIMEOUT_MS,
@@ -3731,8 +3872,11 @@
     renderSurfaces: renderSurfaces,
     renderProjects: renderProjects,
     renderDashboard: renderDashboard,
+    renderHistory: renderHistory,
     renderActivity: renderActivity,
     dedupeTaskSurfaces: dedupeTaskSurfaces,
+    buildChatSendBody: buildChatSendBody,
+    currentAskUserFromMessages: currentAskUserFromMessages,
     state: state,
   };
 

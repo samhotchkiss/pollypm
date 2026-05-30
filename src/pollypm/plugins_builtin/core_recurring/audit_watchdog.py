@@ -232,6 +232,81 @@ def _route_to_alert_sink(
         return False
 
 
+def _clear_alert_best_effort(store: Any, session_name: str, alert_type: str) -> bool:
+    clear = getattr(store, "clear_alert", None)
+    if not callable(clear):
+        return False
+    try:
+        clear(
+            session_name,
+            alert_type,
+            who_cleared="audit_watchdog:stale-alert-sweep",
+        )
+        return True
+    except TypeError:
+        try:
+            clear(session_name, alert_type)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sweep_stale_watchdog_alerts(*, services: Any) -> int:
+    """Close watchdog alert rows no longer counted as user-actionable."""
+
+    store = getattr(services, "msg_store", None) or getattr(
+        services, "state_store", None,
+    )
+    config = getattr(services, "config", None)
+    if store is None or config is None:
+        return 0
+    list_open = getattr(store, "open_alerts", None)
+    if not callable(list_open):
+        return 0
+    try:
+        alerts = list(list_open())
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: stale-alert sweep open_alerts failed",
+            exc_info=True,
+        )
+        return 0
+    try:
+        from pollypm.dashboard_data import dashboard_actionable_alerts
+
+        actionable = {
+            (
+                getattr(alert, "session_name", "") or "",
+                getattr(alert, "alert_type", "") or "",
+            )
+            for alert in dashboard_actionable_alerts(config, alerts)
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: stale-alert actionability filter failed",
+            exc_info=True,
+        )
+        return 0
+    cleared = 0
+    for alert in alerts:
+        alert_type = getattr(alert, "alert_type", "") or ""
+        if alert_type != WATCHDOG_ALERT_TYPE:
+            continue
+        session_name = getattr(alert, "session_name", "") or ""
+        if (session_name, alert_type) in actionable:
+            continue
+        if _clear_alert_best_effort(store, session_name, alert_type):
+            cleared += 1
+    if cleared:
+        logger.info(
+            "audit.watchdog: cleared %d stale audit_watchdog alert(s)",
+            cleared,
+        )
+    return cleared
+
+
 def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
     """Build a :class:`WatchdogConfig` from the handler payload."""
     if not isinstance(payload, dict):
@@ -3798,6 +3873,7 @@ def _scan_one_project_counters() -> dict[str, int]:
         "tier4_terminal_handoff_failed": 0,
         "watchdog_notify_drafts_reclaimed": 0,
         "watchdog_notify_draft_reclaim_failed": 0,
+        "stale_alerts_cleared": 0,
     }
 
 
@@ -4327,6 +4403,16 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
             sweep_counters = {}
         for k, v in sweep_counters.items():
             totals[k] = totals.get(k, 0) + int(v)
+
+        try:
+            totals["stale_alerts_cleared"] = _sweep_stale_watchdog_alerts(
+                services=services,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: stale-alert sweep raised",
+                exc_info=True,
+            )
     finally:
         try:
             services.close()

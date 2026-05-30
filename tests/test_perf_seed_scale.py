@@ -51,6 +51,33 @@ def test_seed_dry_run_writes_s_scale_fixture(tmp_path: Path) -> None:
     assert "CREATE SCHEMA IF NOT EXISTS" in Path(manifest["sql_path"]).read_text()
 
 
+def test_seed_config_pins_dsn_to_perf_schema(tmp_path: Path) -> None:
+    args = Namespace(
+        scale="s",
+        dsn="postgresql://localhost:6543/pollypm_test?sslmode=disable",
+        execute=False,
+        schema="perf_test_schema",
+        workspace=str(tmp_path / "perf"),
+        force_clean=True,
+        json_out=None,
+    )
+
+    manifest = seed_scale.seed(args)
+
+    config_text = Path(manifest["config_path"]).read_text(encoding="utf-8")
+    assert "sslmode=disable" in config_text
+    assert "options=-csearch_path%3Dperf_test_schema%2Cpublic" in config_text
+
+
+def test_dsn_with_search_path_preserves_existing_options() -> None:
+    dsn = seed_scale.dsn_with_search_path(
+        "postgresql://localhost:6543/pollypm_test?options=-cstatement_timeout%3D5000",
+        "perf_test_schema",
+    )
+
+    assert "options=-cstatement_timeout%3D5000+-csearch_path%3Dperf_test_schema%2Cpublic" in dsn
+
+
 def test_execute_requires_non_ambient_dsn(tmp_path: Path) -> None:
     args = Namespace(
         scale="s",

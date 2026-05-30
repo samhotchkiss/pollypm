@@ -19,10 +19,10 @@ _ROLE_KEYS = ("operator_pm", "architect", "worker", "reviewer", "advisor")
 # roles (worker, architect, advisor) where its tool dispatch shines.
 # See #1737.
 _DUAL_PROVIDER_DEFAULTS: dict[str, ModelAssignment] = {
-    "operator_pm": ModelAssignment(alias="opus-4.7"),
+    "operator_pm": ModelAssignment(alias="opus-4.8"),
     "architect": ModelAssignment(alias="codex-gpt-5.4"),
     "worker": ModelAssignment(alias="codex-gpt-5.4"),
-    "reviewer": ModelAssignment(alias="opus-4.7"),
+    "reviewer": ModelAssignment(alias="opus-4.8"),
     "advisor": ModelAssignment(alias="codex-gpt-5.4"),
 }
 
@@ -30,11 +30,11 @@ _DUAL_PROVIDER_DEFAULTS: dict[str, ModelAssignment] = {
 # are configured, every role falls back to that provider's strongest
 # alias. Preserves the "config still works with one provider" invariant.
 _CLAUDE_ONLY_DEFAULTS: dict[str, ModelAssignment] = {
-    "operator_pm": ModelAssignment(alias="opus-4.7"),
-    "architect": ModelAssignment(alias="opus-4.7"),
-    "worker": ModelAssignment(alias="opus-4.7"),
-    "reviewer": ModelAssignment(alias="opus-4.7"),
-    "advisor": ModelAssignment(alias="opus-4.7"),
+    "operator_pm": ModelAssignment(alias="opus-4.8"),
+    "architect": ModelAssignment(alias="opus-4.8"),
+    "worker": ModelAssignment(alias="opus-4.8"),
+    "reviewer": ModelAssignment(alias="opus-4.8"),
+    "advisor": ModelAssignment(alias="opus-4.8"),
 }
 _CODEX_ONLY_DEFAULTS: dict[str, ModelAssignment] = {
     "operator_pm": ModelAssignment(alias="codex-gpt-5.4"),
@@ -45,15 +45,14 @@ _CODEX_ONLY_DEFAULTS: dict[str, ModelAssignment] = {
 }
 
 # Static safety net used when no PollyPMConfig is in hand or no
-# accounts are configured (e.g. some unit tests). Matches the historical
-# table that shipped before #1737 so anything reaching this branch
-# behaves like the pre-#1737 system.
+# accounts are configured (e.g. some unit tests). Keeps the historical
+# pre-#1737 provider split while using the current default aliases.
 _FALLBACK_ASSIGNMENTS: dict[str, ModelAssignment] = {
     "operator_pm": ModelAssignment(alias="codex-gpt-5.4"),
-    "architect": ModelAssignment(alias="opus-4.7"),
+    "architect": ModelAssignment(alias="opus-4.8"),
     "worker": ModelAssignment(alias="codex-gpt-5.4"),
     "reviewer": ModelAssignment(alias="sonnet-4.6"),
-    "advisor": ModelAssignment(alias="opus-4.7"),
+    "advisor": ModelAssignment(alias="opus-4.8"),
 }
 
 

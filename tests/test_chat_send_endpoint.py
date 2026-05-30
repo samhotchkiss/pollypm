@@ -79,6 +79,7 @@ class FakeTmuxClient:
     send_enter_delays: list[float] = []
     list_panes_side_effect: Exception | None = None
     list_windows_side_effect: Exception | None = None
+    capture_output: str = ""
 
     def list_windows(self, session: str) -> list[FakeWindow]:
         if self.list_windows_side_effect is not None:
@@ -91,6 +92,9 @@ class FakeTmuxClient:
         # Tests register panes by either window target ("session:window")
         # or session, depending on the call shape; check both.
         return list(self.panes_by_target.get(target, []))
+
+    def capture_pane(self, target: str, lines: int = 3000) -> str:  # noqa: ARG002
+        return self.capture_output
 
     def send_keys(
         self,
@@ -115,6 +119,7 @@ def _reset_fake_tmux():
     FakeTmuxClient.send_enter_delays = []
     FakeTmuxClient.list_panes_side_effect = None
     FakeTmuxClient.list_windows_side_effect = None
+    FakeTmuxClient.capture_output = ""
     yield
 
 
@@ -1192,6 +1197,50 @@ def test_answer_to_multiselect_newline_joined(
     assert response.status_code == 200
     _target, text, _enter = patched_tmux.send_calls[0]
     assert text == "alpha\nbravo"
+
+
+def test_answer_to_captured_ask_user_menu(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.capture_output = "\n".join([
+        "⏺ I need one product direction before I queue imagery work.",
+        "",
+        "What medium should the imagery be?",
+        "",
+        "☐ Imagery medium",
+        "  ○ Bespoke SVG illustration",
+        "  ○ Photography",
+        "☐ Hero treatment        ✔ Submit",
+    ])
+    captured = chat_send_routes.capture_envelopes(
+        patched_tmux(),
+        session_name="operator",
+        target="pollypm-test-storage-closet:pm-operator",
+    )
+    ask_id = next(env.id for env in captured if str(env.type) == "ask_user")
+
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={
+            "answer_to": ask_id,
+            "selections": ["Bespoke SVG illustration"],
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.json()
+    assert patched_tmux.send_calls == [
+        (
+            "pollypm-test-storage-closet:pm-operator",
+            "Bespoke SVG illustration",
+            True,
+        ),
+    ]
 
 
 def test_answer_to_missing_returns_400(

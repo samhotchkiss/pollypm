@@ -59,6 +59,92 @@ def test_capture_envelopes_one_per_line() -> None:
     assert texts == ["line one", "line two", "line three"]
 
 
+def test_capture_synthesizes_active_ask_user_menu() -> None:
+    pane_text = "\n".join([
+        "⏺ I need one product direction before I queue imagery work.",
+        "",
+        "What medium should the imagery be?",
+        "",
+        "☐ Imagery medium",
+        "  ○ Bespoke SVG illustration",
+        "  ○ Photography",
+        "☐ Hero treatment        ✔ Submit",
+        "",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ])
+    tmux = _StubTmuxClient(output=pane_text)
+
+    envelopes = capture_envelopes(
+        tmux,
+        session_name="architect_demo",
+        target="storage-closet:architect_demo",
+    )
+
+    ask = envelopes[-1]
+    assert ask.type == MessageType.ASK_USER
+    assert ask.text == "What medium should the imagery be?"
+    assert ask.metadata["from_capture"] is True
+    assert ask.metadata["synthetic"] is True
+    assert ask.metadata["tool_use_id"] == ask.id
+    assert ask.metadata["questions"][0]["header"] == "Imagery medium"
+    assert ask.metadata["questions"][0]["options"] == [
+        {"label": "Bespoke SVG illustration", "description": ""},
+        {"label": "Photography", "description": ""},
+    ]
+    assert ask.metadata["questions"][1]["options"] == [
+        {"label": "Hero treatment", "description": ""},
+    ]
+
+
+def test_capture_synthesizes_multi_question_menu_with_submit_row() -> None:
+    pane_text = "\n".join([
+        "Choose the imagery direction.",
+        "",
+        "☐ Medium",
+        "  ○ Bespoke SVG illustration",
+        "  ○ Photography",
+        "☐ Placement",
+        "  ☐ Hero first",
+        "  ☐ Inline accents",
+        "✔ Submit",
+    ])
+    tmux = _StubTmuxClient(output=pane_text)
+
+    ask = capture_envelopes(
+        tmux,
+        session_name="architect_demo",
+        target="storage-closet:architect_demo",
+    )[0]
+
+    assert ask.type == MessageType.ASK_USER
+    assert [question["header"] for question in ask.metadata["questions"]] == [
+        "Medium",
+        "Placement",
+    ]
+    assert ask.metadata["questions"][0]["multiSelect"] is False
+    assert ask.metadata["questions"][1]["multiSelect"] is True
+    assert ask.metadata["questions"][1]["options"] == [
+        {"label": "Hero first", "description": ""},
+        {"label": "Inline accents", "description": ""},
+    ]
+
+
+def test_capture_does_not_synthesize_stale_ask_user_menu() -> None:
+    pane_text = "\n".join([
+        "What medium should the imagery be?",
+        "",
+        "☐ Imagery medium",
+        "  ○ Bespoke SVG illustration",
+        "  ○ Photography        ✔ Submit",
+        "⏺ Continuing after the answered prompt.",
+    ])
+    tmux = _StubTmuxClient(output=pane_text)
+
+    envelopes = capture_envelopes(tmux, session_name="architect_demo", target="t")
+
+    assert all(env.type == MessageType.TEXT for env in envelopes)
+
+
 def test_capture_envelope_marked_text_type_and_from_capture() -> None:
     tmux = _StubTmuxClient(output="hello world\n")
     envelopes = capture_envelopes(

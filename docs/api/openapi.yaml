@@ -912,7 +912,10 @@ paths:
         stale (>60s) or missing, except that a stale archive whose
         newest structured envelope is an open `ask_user` is returned
         so clients keep the answerable question id/options instead of
-        static tmux text; `source=jsonl` forces archive reads
+        static tmux text. When an active AskUserQuestion form exists
+        only in tmux capture, the captured menu is synthesized as an
+        `ask_user` envelope with `metadata.questions[].options[]`.
+        `source=jsonl` forces archive reads
         and 404s when the archive isn't on disk; `source=capture` is
         strict — missing windows / unavailable tmux / capture failures
         all 503 with a typed error code instead of returning an empty
@@ -980,8 +983,10 @@ paths:
           description: |
             Transcript source. `auto` = JSONL with capture fallback
             when stale, preserving stale JSONL for open `ask_user`
-            envelopes; `jsonl` = force archive (404 if absent),
-            `capture` = force tmux capture (503 on any failure).
+            envelopes and synthesizing active captured AskUserQuestion
+            menus into `ask_user` envelopes; `jsonl` = force archive
+            (404 if absent), `capture` = force tmux capture (503 on
+            any failure).
       responses:
         "200":
           description: Page of envelopes for this surface.
@@ -4109,6 +4114,10 @@ components:
             and carry `metadata.synthetic=true` with
             `metadata.model="<synthetic>"`; clients should render them
             as notice/banner content, not as assistant speech.
+            Captured AskUserQuestion menus are also synthetic in the
+            sense that `metadata.synthetic=true`, but retain
+            `type=ask_user` and carry `metadata.questions[].options[]`
+            so clients can render and answer them normally.
 
     ChatMessagesResponse:
       type: object

@@ -1535,6 +1535,55 @@ def test_messages_endpoint_source_auto_keeps_stale_open_ask_user_jsonl(
     assert option["label"] == "Photography"
 
 
+def test_messages_endpoint_source_capture_synthesizes_ask_user_menu(
+    client,
+    auth_headers,
+    patch_registry,
+    monkeypatch,
+):
+    patch_registry([_surface(
+        "architect_demo", SurfaceType.ARCHITECT, persona="Sage",
+        project="demo",
+    )])
+
+    class _LiveTmuxClient:
+        def capture_pane(self, target, lines=3000):  # noqa: ARG002
+            return "\n".join([
+                "⏺ I need one product direction before I queue imagery work.",
+                "",
+                "What medium should the imagery be?",
+                "",
+                "☐ Imagery medium",
+                "  ○ Bespoke SVG illustration",
+                "  ○ Photography",
+                "☐ Hero treatment        ✔ Submit",
+                "",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ])
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_tmux_client",
+        lambda: _LiveTmuxClient(),
+    )
+
+    body = client.get(
+        "/api/v1/chat/architect_demo/messages?source=capture&direction=desc",
+        headers=auth_headers,
+    ).json()
+
+    assert body["transcript_source"] == "capture"
+    message = body["messages"][0]
+    assert message["type"] == "ask_user"
+    assert message["text"] == "What medium should the imagery be?"
+    assert message["metadata"]["from_capture"] is True
+    assert message["metadata"]["synthetic"] is True
+    assert message["metadata"]["questions"][0]["options"] == [
+        {"label": "Bespoke SVG illustration", "description": ""},
+        {"label": "Photography", "description": ""},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------

@@ -85,6 +85,9 @@ from pollypm.audit.log import EVENT_CHAT_SEND_FORCE_BYPASS, emit as audit_emit
 from pollypm.tmux.client import DeadPaneError, TmuxClient
 from pollypm.web_api.chat import (
     ChatSurface,
+    MessageEnvelope,
+    MessageType,
+    capture_envelopes,
     find_chat_surface,
 )
 from pollypm.web_api.errors import APIError
@@ -1067,9 +1070,7 @@ def _find_ask_user_envelope(
     # P1's envelope id is ``msg_<tool_use_id>``; the raw events.jsonl
     # only carries the bare id. Try both forms so the route accepts
     # the envelope id the GET endpoints hand out AND the raw id.
-    candidates = {answer_to}
-    if answer_to.startswith("msg_"):
-        candidates.add(answer_to[len("msg_"):])
+    candidates = _answer_to_candidates(answer_to)
     for event in events:
         event_id = _event_message_id(event)
         if event_id is None:
@@ -1077,6 +1078,61 @@ def _find_ask_user_envelope(
         if event_id in candidates:
             return event
     return None
+
+
+def _find_captured_ask_user_envelope(
+    tmux: TmuxClient,
+    *,
+    session_name: str,
+    target: str,
+    actor_fallback: str,
+    answer_to: str,
+) -> dict[str, Any] | None:
+    """Locate a synthetic ask_user envelope from the live tmux capture.
+
+    Live Claude ``AskUserQuestion`` menus can reach the web chat only
+    through tmux capture when the structured JSONL archive is absent or
+    stale. The read endpoint synthesizes those menus into ``ask_user``
+    envelopes; this mirrors that normalization so ``answer_to=<cap_* id>``
+    from the web UI is answerable through the same public POST contract.
+    """
+    candidates = _answer_to_candidates(answer_to)
+    captured = capture_envelopes(
+        tmux,
+        session_name=session_name,
+        target=target,
+        actor_fallback=actor_fallback,
+    )
+    for envelope in captured:
+        if envelope.type != MessageType.ASK_USER:
+            continue
+        ids = {envelope.id}
+        tool_use_id = envelope.metadata.get("tool_use_id")
+        if isinstance(tool_use_id, str) and tool_use_id:
+            ids.add(tool_use_id)
+        if ids & candidates:
+            return _captured_ask_user_event(envelope)
+    return None
+
+
+def _captured_ask_user_event(envelope: MessageEnvelope) -> dict[str, Any]:
+    return {
+        "id": envelope.id,
+        "event_type": "tool_call",
+        "metadata": envelope.metadata,
+        "payload": {
+            "type": "ask_user",
+            "id": envelope.metadata.get("tool_use_id") or envelope.id,
+            "questions": envelope.metadata.get("questions") or [],
+        },
+    }
+
+
+def _answer_to_candidates(answer_to: str) -> set[str]:
+    candidates = {answer_to}
+    if answer_to.startswith("msg_"):
+        candidates.add(answer_to[len("msg_"):])
+    return candidates
 
 
 def _event_message_id(event: dict[str, Any]) -> str | None:
@@ -1480,6 +1536,18 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
             raw_id = _event_message_id(ask_envelope)
             if isinstance(raw_id, str) and raw_id:
                 ask_exempt_ids.add(raw_id)
+        else:
+            ask_envelope = _find_captured_ask_user_envelope(
+                tmux,
+                session_name=session_name,
+                target=target,
+                actor_fallback=surface.persona or "agent",
+                answer_to=body.answer_to,
+            )
+            if ask_envelope is not None:
+                raw_id = _event_message_id(ask_envelope)
+                if isinstance(raw_id, str) and raw_id:
+                    ask_exempt_ids.add(raw_id)
 
     # 3. Safety gates (§4.1, §4.3) — use the exact session transcript
     # (Codex review block 3).

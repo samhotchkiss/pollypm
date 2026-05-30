@@ -38,6 +38,7 @@ from pollypm.recovery.default import DefaultRecoveryPolicy
 
 
 SANDBOX_MARKERS = ("sandbox", "chaos", "test")
+PG_SANDBOX_MARKERS = SANDBOX_MARKERS + ("fixture", "tmp")
 UNSAFE_MARKERS = ("prod", "production", "live")
 
 
@@ -297,6 +298,15 @@ def assert_non_ambient_pg_dsn(dsn: str) -> None:
         raise ValueError(
             "Refusing to run task-stall against the ambient local pollypm DB; "
             "use tests/conftest_pg.py fixtures or an isolated test DSN."
+        )
+    lowered = dsn.lower()
+    if any(marker in lowered for marker in UNSAFE_MARKERS) or not any(
+        marker in lowered for marker in PG_SANDBOX_MARKERS
+    ):
+        raise ValueError(
+            "Refusing to run task-stall against a DSN that is not visibly "
+            "sandbox/test-scoped; include sandbox, chaos, test, fixture, or tmp "
+            "in the database/user/schema name and avoid prod/live names."
         )
 
 

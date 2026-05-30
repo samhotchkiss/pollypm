@@ -21,6 +21,15 @@ def test_safety_rejects_ambient_operator_pg_dsn() -> None:
         assert_non_ambient_pg_dsn("postgresql://localhost:5432/pollypm")
 
 
+def test_safety_rejects_non_sandbox_pg_dsn() -> None:
+    with pytest.raises(ValueError, match="not visibly sandbox/test-scoped"):
+        assert_non_ambient_pg_dsn("postgresql://db.example.com/customer")
+
+
+def test_safety_accepts_test_scoped_pg_dsn() -> None:
+    assert_non_ambient_pg_dsn("postgresql://localhost:5432/pollypm_test")
+
+
 @pytest.mark.parametrize("mode", ["auth_broken", "capacity_exhausted"])
 def test_failover_injector_trips_heartbeat_recovery_path(mode: str) -> None:
     result = run_failover_injector(mode=mode)

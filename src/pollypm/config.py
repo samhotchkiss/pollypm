@@ -1432,10 +1432,10 @@ def _build_example_config(root: Path, *, tmux_session: str = "pollypm") -> Polly
             # example-config` round-trips — delete any line to opt back
             # into the computed fallback.
             role_assignments={
-                "operator_pm": ModelAssignment(alias="opus-4.7"),
+                "operator_pm": ModelAssignment(alias="opus-4.8"),
                 "architect": ModelAssignment(alias="codex-gpt-5.4"),
                 "worker": ModelAssignment(alias="codex-gpt-5.4"),
-                "reviewer": ModelAssignment(alias="opus-4.7"),
+                "reviewer": ModelAssignment(alias="opus-4.8"),
             },
         ),
         accounts={

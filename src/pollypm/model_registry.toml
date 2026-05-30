@@ -1,3 +1,8 @@
+[aliases."opus-4.8"]
+provider = "claude"
+model = "claude-opus-4-8"
+capabilities = ["reasoning", "tool_use", "long_context", "strong_planning"]
+
 [aliases."opus-4.7"]
 provider = "claude"
 model = "claude-opus-4-7"

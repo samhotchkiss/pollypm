@@ -55,6 +55,8 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert config.pollypm.failover_accounts == ["claude_primary"]
     assert config.pollypm.failover_usage_threshold_pct == 85
     assert config.pollypm.lease_timeout_minutes == 30
+    assert config.pollypm.role_assignments["operator_pm"].alias == "opus-4.8"
+    assert config.pollypm.role_assignments["reviewer"].alias == "opus-4.8"
     assert config.memory.backend == "file"
     assert set(config.accounts) == {"codex_primary", "claude_primary"}
     assert set(config.sessions) == {"heartbeat", "operator"}

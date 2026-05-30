@@ -36,6 +36,16 @@ class Registry:
 def _fallback_registry() -> Registry:
     return Registry(
         aliases={
+            "opus-4.8": AliasRecord(
+                provider="claude",
+                model="claude-opus-4-8",
+                capabilities=(
+                    "reasoning",
+                    "tool_use",
+                    "long_context",
+                    "strong_planning",
+                ),
+            ),
             "opus-4.7": AliasRecord(
                 provider="claude",
                 model="claude-opus-4-7",

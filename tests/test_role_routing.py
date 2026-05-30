@@ -77,7 +77,7 @@ def test_fallback_assignment_used_when_no_configured_assignment(tmp_path: Path) 
 
     resolved = resolve_role_assignment("reviewer", "demo", config=config)
 
-    assert resolved.alias == "opus-4.7"
+    assert resolved.alias == "opus-4.8"
     assert resolved.provider == "claude"
     assert resolved.source == "fallback"
 
@@ -97,8 +97,8 @@ def test_dual_provider_fallback_table(tmp_path: Path) -> None:
     )
 
     expectations = {
-        "operator_pm": ("opus-4.7", "claude"),
-        "reviewer": ("opus-4.7", "claude"),
+        "operator_pm": ("opus-4.8", "claude"),
+        "reviewer": ("opus-4.8", "claude"),
         "worker": ("codex-gpt-5.4", "codex"),
         "architect": ("codex-gpt-5.4", "codex"),
         "advisor": ("codex-gpt-5.4", "codex"),
@@ -144,7 +144,7 @@ def test_claude_only_fallback_routes_all_roles_to_claude(tmp_path: Path) -> None
         project = None if role == "operator_pm" else "demo"
         resolved = resolve_role_assignment(role, project, config=config)
         assert resolved.provider == "claude"
-        assert resolved.alias == "opus-4.7"
+        assert resolved.alias == "opus-4.8"
         assert resolved.source == "fallback"
 
 

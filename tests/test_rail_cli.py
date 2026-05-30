@@ -103,7 +103,7 @@ def test_build_items_skips_hidden_items(monkeypatch, tmp_path: Path) -> None:
             return [], [], [], [], []
 
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0,
     )
     monkeypatch.setattr(
         "pollypm.cockpit_rail.load_config", lambda path: _FakeConfig(tmp_path),
@@ -144,7 +144,7 @@ def test_build_items_collapses_sections(monkeypatch, tmp_path: Path) -> None:
             return [], [], [], [], []
 
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0,
     )
     monkeypatch.setattr(
         "pollypm.cockpit_rail.load_config", lambda path: _FakeConfig(tmp_path),

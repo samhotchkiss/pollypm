@@ -242,7 +242,7 @@ def test_dashboard_gather_uses_rail_inbox_counter(monkeypatch, tmp_path: Path) -
 
     seen: list[object] = []
 
-    def fake_rail_count(arg):
+    def fake_rail_count(arg, **_kw):
         seen.append(arg)
         return 13
 

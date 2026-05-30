@@ -241,7 +241,12 @@ def _inbox_count(ctx: RailContext) -> int:
     if cached is not None:
         return cached
     try:
-        count = int(_count_inbox_tasks_for_label(config) or 0)
+        count = int(
+            _count_inbox_tasks_for_label(
+                config,
+                use_state_cache=False,
+            ) or 0
+        )
     except Exception:  # noqa: BLE001
         logger.exception("core_rail_items: inbox count raised")
         return 0

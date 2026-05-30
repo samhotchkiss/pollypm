@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2815,6 +2816,114 @@ def test_cadence_handler_routes_human_needed_on_hold_to_operator_once(
     assert len(operator_sent) == 1
     assert "Ready except for you" in operator_sent[0][0]
     assert "external credentials" in operator_sent[0][1]
+
+
+def test_operator_inbox_task_reuses_deduped_watchdog_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bumping a deduped watchdog message must not mint another chat task."""
+    from pollypm.inbox.kind import InboxItemKind
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    message_id = 123
+    dedup_key = "watchdog:demo:stale"
+    existing_task = SimpleNamespace(
+        task_id="demo/7",
+        work_status="queued",
+        labels=["notify", "watchdog", f"notify_message:{message_id}"],
+        kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
+    )
+    duplicate_task = SimpleNamespace(
+        task_id="demo/8",
+        work_status="queued",
+        labels=["notify", "watchdog", f"notify_message:{message_id}"],
+        kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
+    )
+
+    class _Store:
+        def __init__(self) -> None:
+            self.rows = [
+                {
+                    "id": message_id,
+                    "type": "notify",
+                    "state": "open",
+                    "recipient": "user",
+                    "subject": "old",
+                    "body": "old",
+                    "payload": {
+                        "dedup_key": dedup_key,
+                        "count": 4,
+                        "task_id": existing_task.task_id,
+                    },
+                    "labels": ["notify", "watchdog"],
+                }
+            ]
+
+        def query_messages(self, **filters):
+            rows = []
+            for row in self.rows:
+                matched = True
+                for key, value in filters.items():
+                    actual = row.get(key)
+                    if isinstance(value, list):
+                        matched = actual in value
+                    else:
+                        matched = actual == value
+                    if not matched:
+                        break
+                if matched:
+                    rows.append(row)
+            return rows
+
+        def update_message(self, msg_id: int, **fields) -> None:
+            row = next(row for row in self.rows if row["id"] == msg_id)
+            row.update(fields)
+
+    class _Service:
+        def __init__(self) -> None:
+            self.created = 0
+            self.archived: list[str] = []
+
+        def get(self, task_id: str):
+            if task_id == existing_task.task_id:
+                return existing_task
+            raise KeyError(task_id)
+
+        def list_nonterminal_tasks(self, *, project: str):
+            assert project == "demo"
+            return [existing_task, duplicate_task]
+
+        def create(self, **_kwargs):
+            self.created += 1
+            raise AssertionError("reused dedup message should not create a task")
+
+        def archive_task(self, task_id: str, **_kwargs) -> None:
+            self.archived.append(task_id)
+
+        def close(self) -> None:
+            pass
+
+    store = _Store()
+    service = _Service()
+    config = SimpleNamespace(storage=SimpleNamespace(backend="postgres"))
+    monkeypatch.setattr(aw, "_resolve_notify_config", lambda _path: config)
+    monkeypatch.setattr("pollypm.store.get_store", lambda _config: store)
+    monkeypatch.setattr("pollypm.work.create_work_service", lambda **_kw: service)
+
+    task_id = aw._create_operator_inbox_task(
+        project_key="demo",
+        project_path=None,
+        subject="Repeated stale review ping",
+        body="Task demo/1 is stale",
+        dedup_key=dedup_key,
+    )
+
+    assert task_id == existing_task.task_id
+    assert service.created == 0
+    assert service.archived == [duplicate_task.task_id]
+    payload = store.rows[0]["payload"]
+    assert payload["task_id"] == existing_task.task_id
+    assert payload["count"] == 5
 
 
 def test_classify_on_hold_reason_defaults_to_architect() -> None:

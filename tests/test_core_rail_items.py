@@ -334,7 +334,7 @@ def test_build_items_identical_to_legacy_shape(monkeypatch, tmp_path: Path) -> N
     to that.
     """
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 1,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 1,
     )
     _write_config(tmp_path)
     router = CockpitRouter(tmp_path / "pollypm.toml")
@@ -371,11 +371,34 @@ def test_build_items_identical_to_legacy_shape(monkeypatch, tmp_path: Path) -> N
     assert inbox_item.label == "Inbox (1)"
 
 
+def test_inbox_rail_count_bypasses_state_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def _fake_count(_config, **kwargs):
+        calls.append(dict(kwargs))
+        return 4
+
+    monkeypatch.setattr(
+        "pollypm.cockpit._count_inbox_tasks_for_label",
+        _fake_count,
+    )
+    core_rail_items_plugin._INBOX_COUNT_CACHE.clear()
+    ctx = RailContext(
+        router=object(),
+        config=_FakeConfig(tmp_path),
+    )
+
+    assert core_rail_items_plugin._inbox_label(ctx) == "Inbox (4)"
+    assert calls == [{"use_state_cache": False}]
+
+
 def test_build_items_keeps_projects_section_when_empty(
     monkeypatch, tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0,
     )
     _write_config(tmp_path)
     router = CockpitRouter(tmp_path / "pollypm.toml")
@@ -408,7 +431,7 @@ def test_russell_rail_entry_hidden_when_reviewer_session_unconfigured(
     test pins that contract — no ``reviewer`` config, no rail row.
     """
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0,
     )
     _write_config(tmp_path)
     router = CockpitRouter(tmp_path / "pollypm.toml")
@@ -437,7 +460,7 @@ def test_russell_rail_entry_visible_when_reviewer_session_configured(
     block does exist, the rail entry must surface so the user can jump
     to Russell's chat pane (the originally-intended UX)."""
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0,
     )
     _write_config(tmp_path)
     router = CockpitRouter(tmp_path / "pollypm.toml")
@@ -461,7 +484,7 @@ def test_build_items_preserves_working_project_session_state(
 ) -> None:
     """Working sessions must not silently fall back to idle in rail rows."""
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0,
     )
     _write_config(tmp_path)
     router = CockpitRouter(tmp_path / "pollypm.toml")
@@ -577,7 +600,7 @@ def test_removing_core_rail_items_yields_empty_rail(monkeypatch, tmp_path: Path)
         "pollypm.plugin_host.extension_host_for_root", lambda root: host,
     )
     monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0,
     )
     _write_config(tmp_path)
     router = CockpitRouter(tmp_path / "pollypm.toml")

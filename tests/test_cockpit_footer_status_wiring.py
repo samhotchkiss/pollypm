@@ -89,12 +89,12 @@ def _build_app(
     hint = _StubHint(width=hint_width)
     app.hint = hint  # type: ignore[assignment]
 
-    # Stub the cached inbox fanout so the test doesn't need a real DB.
-    fake_items = [object()] * inbox_count
+    # Stub the shared rail/footer inbox count so the test doesn't need
+    # a real DB.
     if monkeypatch is not None:
         monkeypatch.setattr(
-            "pollypm.cockpit_inbox.pm_inbox_awaits_user_list",
-            lambda _config: list(fake_items),
+            "pollypm.cockpit_inbox._count_inbox_tasks_for_label",
+            lambda _config, **_kw: inbox_count,
         )
 
     # Precompute the footer snapshot so ``_update_hint`` (which is now
@@ -312,3 +312,29 @@ def test_resolve_footer_state_returns_snapshot_with_expected_counts(
     assert snapshot.inbox_count == 11
     # Stub store reports no heartbeat → no alert chunk.
     assert snapshot.alert is None
+
+
+def test_resolve_footer_state_bypasses_state_cache(monkeypatch) -> None:
+    """The operator-visible footer count must read the live default lens."""
+    calls: list[dict[str, object]] = []
+
+    def _fake_count(_config, **kwargs):
+        calls.append(dict(kwargs))
+        return 7
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_inbox._count_inbox_tasks_for_label",
+        _fake_count,
+    )
+    app, _hint = _build_app(
+        projects={"p": object()},
+        sessions={"s": object()},
+        hint_width=120,
+        seed_footer_state=False,
+    )
+
+    snapshot = app._resolve_footer_state()
+
+    assert snapshot is not None
+    assert snapshot.inbox_count == 7
+    assert calls == [{"use_state_cache": False}]

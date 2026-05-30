@@ -685,11 +685,17 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
     grouped = inbox_tasks_grouped(config)
     if grouped is None:
         return 0
+    from pollypm.notify_task import is_notify_only_inbox_entry
+
     total = 0
     for project_key, project in getattr(config, "projects", {}).items():
         if not getattr(project, "tracked", False):
             continue
-        total += len(inbox_tasks_for_project(grouped, config, project_key))
+        total += sum(
+            1
+            for task in inbox_tasks_for_project(grouped, config, project_key)
+            if not is_notify_only_inbox_entry(task)
+        )
     return total
 
 

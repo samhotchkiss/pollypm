@@ -165,7 +165,16 @@ def test_awaits_user_list_annotates_only_actionable_rows(
         title="Deployment complete",
         description="",
     )
-    grouped = {"demo": [informational, actionable]}
+    stale_watchdog = SimpleNamespace(
+        task_id="demo/3",
+        project="demo",
+        kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH,
+        labels=["notify", "watchdog", "notify_message:123"],
+        roles={"requester": "user", "operator": "user"},
+        title="Repeated stale review ping",
+        description="",
+    )
+    grouped = {"demo": [informational, stale_watchdog, actionable]}
     calls = {"annotate": 0}
 
     def annotate(item, *, known_projects):

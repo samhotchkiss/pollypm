@@ -314,13 +314,20 @@ def list_projects(config: PollyPMConfig, *, tracked_only: bool = False) -> list[
     """
     out: list[APIProject] = []
     snapshots = _project_task_snapshots(config)
+    inbox_counts = _project_inbox_counts(config) if snapshots is not None else None
     for key, project in config.projects.items():
         if tracked_only and not project.tracked:
             continue
         if snapshots is not None:
             out.append(
                 _project_to_api_from_tasks(
-                    config, key, project, snapshots.get(key, [])
+                    config,
+                    key,
+                    project,
+                    snapshots.get(key, []),
+                    open_inbox_count=(
+                        inbox_counts.get(key) if inbox_counts is not None else None
+                    ),
                 )
             )
         else:
@@ -939,13 +946,20 @@ def _counts_from_tasks(tasks: list[object]) -> dict[str, int]:
     return counts
 
 
-def _open_inbox_count_from_tasks(tasks: list[object]) -> int:
+def _open_inbox_count_from_tasks(
+    tasks: list[object],
+    *,
+    membership_checked: bool = False,
+) -> int:
     count = 0
     for task in tasks:
-        if getattr(task, "flow_template_id", "") != "chat":
+        if _status_value(task) in _TERMINAL_STATUS_VALUES:
             continue
-        if _status_value(task) not in _TERMINAL_STATUS_VALUES:
-            count += 1
+        if not membership_checked and not _is_inbox_member(task):
+            continue
+        if is_notify_only_inbox_entry(task):
+            continue
+        count += 1
     return count
 
 
@@ -990,18 +1004,48 @@ def _project_task_snapshots(
         return None
 
 
+def _project_inbox_counts(config: PollyPMConfig) -> dict[str, int] | None:
+    """Return API-default inbox counts grouped by registered project."""
+    try:
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        if not is_pg_backend(config):
+            return None
+        from pollypm.cockpit_pg_aggregates import (
+            inbox_tasks_for_project,
+            inbox_tasks_grouped,
+        )
+
+        grouped = inbox_tasks_grouped(config)
+        if grouped is None:
+            return None
+        return {
+            key: _open_inbox_count_from_tasks(
+                inbox_tasks_for_project(grouped, config, key),
+                membership_checked=True,
+            )
+            for key in config.projects
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("project inbox aggregate unavailable", exc_info=True)
+        return None
+
+
 def _project_to_api_from_tasks(
     config: PollyPMConfig,
     key: str,
     project: KnownProject,
     tasks: list[object],
+    *,
+    open_inbox_count: int | None = None,
 ) -> APIProject:
     counts = _counts_from_tasks(tasks)
     pending_plan_review = any(
         _status_value(task) == "review" and _is_plan_task(task)
         for task in tasks
     )
-    open_inbox_count = _open_inbox_count_from_tasks(tasks)
+    if open_inbox_count is None:
+        open_inbox_count = _open_inbox_count_from_tasks(tasks)
     last_activity_at = _max_datetime(
         _latest_task_activity(tasks),
         _latest_audit_activity(key, project),
@@ -1185,14 +1229,15 @@ def _count_open_inbox(config: PollyPMConfig, project_key: str) -> int:
 
 def _count_open_inbox_with_service(svc: object, project_key: str) -> int:
     try:
-        list_nonterminal = getattr(svc, "list_nonterminal_tasks", None)
-        if callable(list_nonterminal):
-            tasks = list_nonterminal(project=project_key)
-        else:
-            tasks = svc.list_tasks(project=project_key)  # type: ignore[attr-defined]
+        from pollypm.work.inbox_view import inbox_tasks
+
+        tasks = inbox_tasks(svc, project=project_key)
     except Exception:  # noqa: BLE001
         return 0
-    return _open_inbox_count_from_tasks(list(tasks or []))
+    return _open_inbox_count_from_tasks(
+        list(tasks or []),
+        membership_checked=True,
+    )
 
 
 # ---------------------------------------------------------------------------

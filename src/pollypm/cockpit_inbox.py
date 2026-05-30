@@ -417,6 +417,7 @@ def _pm_inbox_awaits_user_list_uncached(
     """
     try:
         from pollypm.inbox import awaits_user
+        from pollypm.notify_task import is_notify_only_inbox_entry
         from pollypm.cockpit_inbox_items import (
             _WORKSPACE_DB_KEY,
             _filter_approved_plan_reviews,
@@ -461,7 +462,7 @@ def _pm_inbox_awaits_user_list_uncached(
                 pg_inbox_grouped, config, project_key,
             ):
                 item = task_to_inbox_entry(task, db_path=db_path)
-                if awaits_user(item):
+                if awaits_user(item) and not is_notify_only_inbox_entry(item):
                     if annotate_entries:
                         item = annotate_inbox_entry(
                             item,
@@ -499,7 +500,7 @@ def _pm_inbox_awaits_user_list_uncached(
                 source_key=source_key,
                 db_path=entry_dbpath or Path("."),
             )
-            if awaits_user(item):
+            if awaits_user(item) and not is_notify_only_inbox_entry(item):
                 if annotate_entries:
                     item = annotate_inbox_entry(
                         item,
@@ -566,10 +567,11 @@ def _count_inbox_tasks_for_label(
     updates and FYI messages stay discoverable inside the inbox's
     archive lenses.
 
-    **Three surfaces, one predicate (intentional, load-bearing).** The
+    **Three surfaces, one default lens (intentional, load-bearing).** The
     rail badge, the operator dashboard's "Waiting on you" section
     (#1572), AND the inbox UI's default lens (#1573) all read from
-    :func:`pollypm.inbox.awaits_user` via :func:`pm_inbox_awaits_user_list`.
+    :func:`pollypm.inbox.awaits_user` via :func:`pm_inbox_awaits_user_list`,
+    then exclude notify-only rows that the API default inbox lens hides.
     The badge count, the dashboard section length, and the default
     inbox row count MUST agree on every config; ``tests/test_inbox_default_lens.py``
     pins that invariant. Any new "what's waiting on the user?" surface

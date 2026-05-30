@@ -585,7 +585,7 @@ def test_build_dashboard_renders_new_header_and_suggestions(
         "pollypm.cockpit_sections.dashboard._dashboard_project_tasks",
         lambda project_key, project_path: (partitions, counts) if project_key == "demo" else ({}, {}),
     )
-    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0)
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0)
     monkeypatch.setattr("pollypm.cockpit_sections.dashboard.datetime", _FrozenDateTime)
 
     emit_briefing(
@@ -710,7 +710,7 @@ def test_dashboard_activity_line_pluralises_singular_counts(
         "pollypm.cockpit_sections.dashboard._dashboard_project_tasks",
         lambda project_key, project_path: ({}, {}),
     )
-    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0)
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0)
 
     class _FrozenDateTime(datetime):
         @classmethod
@@ -768,7 +768,7 @@ def test_dashboard_footer_pluralises_project_count(monkeypatch, tmp_path: Path) 
         "pollypm.cockpit_sections.dashboard._dashboard_project_tasks",
         lambda project_key, project_path: ({}, {}),
     )
-    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0)
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0)
 
     base_dir = tmp_path / ".pollypm"
     supervisor = SimpleNamespace(store=_FakeStore())

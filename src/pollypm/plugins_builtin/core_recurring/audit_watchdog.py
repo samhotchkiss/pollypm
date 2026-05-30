@@ -2214,6 +2214,124 @@ def _resolve_notify_config(config_path: Path | None) -> Any | None:
         return None
 
 
+_TERMINAL_TASK_STATUS_VALUES = frozenset({"done", "cancelled"})
+
+
+def _task_status_value(task: Any) -> str:
+    status = getattr(task, "work_status", None)
+    return str(getattr(status, "value", status) or "").lower()
+
+
+def _is_reusable_watchdog_inbox_task(
+    task: Any,
+    *,
+    message_id: int,
+    tier4: bool,
+) -> bool:
+    if _task_status_value(task) in _TERMINAL_TASK_STATUS_VALUES:
+        return False
+    labels = {str(label) for label in (getattr(task, "labels", None) or [])}
+    if "watchdog" not in labels or "notify" not in labels:
+        return False
+    if f"notify_message:{message_id}" not in labels:
+        return False
+    if tier4 and "tier4" not in labels:
+        return False
+    kind = getattr(task, "kind", None)
+    kind_value = str(getattr(kind, "value", kind) or "")
+    return kind_value in {
+        "",
+        InboxItemKind.LEGACY.value,
+        InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
+    }
+
+
+def _archive_duplicate_watchdog_inbox_tasks(
+    svc: Any,
+    *,
+    keep_task_id: str,
+    candidates: list[Any],
+) -> None:
+    for candidate in candidates:
+        task_id = str(getattr(candidate, "task_id", "") or "")
+        if not task_id or task_id == keep_task_id:
+            continue
+        try:
+            svc.archive_task(task_id, actor="audit_watchdog", strict=False)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit_watchdog: duplicate operator inbox task cleanup "
+                "skipped for %s",
+                task_id,
+                exc_info=True,
+            )
+
+
+def _find_reusable_watchdog_inbox_task(
+    svc: Any,
+    *,
+    project_key: str,
+    message_id: int,
+    payload: dict[str, Any],
+    tier4: bool = False,
+) -> str | None:
+    """Return the existing live task for a deduped watchdog message.
+
+    The message row is deduped, so the generated work task must be
+    deduped too. Older ticks created a fresh chat task on every bump;
+    when we see those rows again, keep the payload-linked task and
+    archive same-message duplicates.
+    """
+    candidates: list[Any] = []
+    seen: set[str] = set()
+
+    def add_candidate(task: Any) -> None:
+        task_id = str(getattr(task, "task_id", "") or "")
+        if not task_id or task_id in seen:
+            return
+        if not _is_reusable_watchdog_inbox_task(
+            task,
+            message_id=message_id,
+            tier4=tier4,
+        ):
+            return
+        seen.add(task_id)
+        candidates.append(task)
+
+    payload_task_id = str(payload.get("task_id") or "").strip()
+    payload_task: Any | None = None
+    if payload_task_id:
+        try:
+            payload_task = svc.get(payload_task_id)
+        except Exception:  # noqa: BLE001
+            payload_task = None
+        if payload_task is not None:
+            add_candidate(payload_task)
+
+    try:
+        list_nonterminal = getattr(svc, "list_nonterminal_tasks", None)
+        if callable(list_nonterminal):
+            tasks = list_nonterminal(project=project_key)
+        else:
+            tasks = svc.list_tasks(project=project_key)
+    except Exception:  # noqa: BLE001
+        tasks = []
+    for task in tasks or []:
+        add_candidate(task)
+
+    if not candidates:
+        return None
+    keep = payload_task if payload_task in candidates else candidates[0]
+    keep_id = str(getattr(keep, "task_id", "") or "")
+    if keep_id:
+        _archive_duplicate_watchdog_inbox_tasks(
+            svc,
+            keep_task_id=keep_id,
+            candidates=candidates,
+        )
+    return keep_id or None
+
+
 def _create_operator_inbox_task(
     *,
     project_key: str,
@@ -2298,16 +2416,12 @@ def _create_operator_inbox_task(
         existing = find_open_dedup_message(
             store, dedup_key, recipient="user",
         ) if dedup_key else None
+        existing_payload = existing.get("payload") if existing is not None else {}
+        if not isinstance(existing_payload, dict):
+            existing_payload = {}
+        seeded_payload: dict[str, Any] | None = None
         if existing is not None:
-            message_id = bump_dedup_message(
-                store,
-                existing,
-                subject=subject,
-                body=body,
-                payload={**payload, "dedup_key": dedup_key},
-                labels=["notify", "watchdog"],
-                tier="immediate",
-            )
+            message_id = int(existing.get("id"))
         else:
             seeded_payload = (
                 initial_dedup_payload(payload, dedup_key)
@@ -2342,6 +2456,26 @@ def _create_operator_inbox_task(
             svc_kwargs["project_path"] = db_path.parent.parent
         svc = create_work_service(**svc_kwargs)
         try:
+            if existing is not None:
+                reusable_task_id = _find_reusable_watchdog_inbox_task(
+                    svc,
+                    project_key=project_key,
+                    message_id=message_id,
+                    payload=existing_payload,
+                )
+                bump_payload = {**payload, "dedup_key": dedup_key}
+                if reusable_task_id:
+                    bump_payload["task_id"] = reusable_task_id
+                    bump_dedup_message(
+                        store,
+                        existing,
+                        subject=subject,
+                        body=body,
+                        payload=bump_payload,
+                        labels=["notify", "watchdog"],
+                        tier="immediate",
+                    )
+                    return reusable_task_id
             task_labels = [
                 "notify",
                 "watchdog",
@@ -2363,12 +2497,31 @@ def _create_operator_inbox_task(
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
             inbox_task_id = task.task_id
-            # Reuse the same configured-backend store for the task_id
-            # back-fill so both writes land on the same backend.
-            store.update_message(
-                message_id,
-                payload={**payload, "task_id": inbox_task_id},
-            )
+            update_payload = {**payload, "task_id": inbox_task_id}
+            if existing is not None:
+                bump_dedup_message(
+                    store,
+                    existing,
+                    subject=subject,
+                    body=body,
+                    payload={
+                        **update_payload,
+                        "dedup_key": dedup_key,
+                    },
+                    labels=["notify", "watchdog"],
+                    tier="immediate",
+                )
+            else:
+                # Reuse the same configured-backend store for the
+                # task_id back-fill so both writes land on the same
+                # backend, preserving the initial dedup payload.
+                store.update_message(
+                    message_id,
+                    payload={
+                        **(seeded_payload or payload),
+                        "task_id": inbox_task_id,
+                    },
+                )
             return inbox_task_id
         finally:
             svc.close()
@@ -2501,16 +2654,12 @@ def _create_operator_tier4_inbox_task(
         existing = find_open_dedup_message(
             store, dedup_key, recipient="user",
         ) if dedup_key else None
+        existing_payload = existing.get("payload") if existing is not None else {}
+        if not isinstance(existing_payload, dict):
+            existing_payload = {}
+        seeded_payload: dict[str, Any] | None = None
         if existing is not None:
-            message_id = bump_dedup_message(
-                store,
-                existing,
-                subject=subject,
-                body=body,
-                payload={**payload, "dedup_key": dedup_key},
-                labels=["notify", "watchdog", "tier4"],
-                tier="immediate",
-            )
+            message_id = int(existing.get("id"))
         else:
             seeded_payload = (
                 initial_dedup_payload(payload, dedup_key)
@@ -2542,6 +2691,27 @@ def _create_operator_tier4_inbox_task(
             svc_kwargs["project_path"] = db_path.parent.parent
         svc = create_work_service(**svc_kwargs)
         try:
+            if existing is not None:
+                reusable_task_id = _find_reusable_watchdog_inbox_task(
+                    svc,
+                    project_key=project_key,
+                    message_id=message_id,
+                    payload=existing_payload,
+                    tier4=True,
+                )
+                bump_payload = {**payload, "dedup_key": dedup_key}
+                if reusable_task_id:
+                    bump_payload["task_id"] = reusable_task_id
+                    bump_dedup_message(
+                        store,
+                        existing,
+                        subject=subject,
+                        body=body,
+                        payload=bump_payload,
+                        labels=["notify", "watchdog", "tier4"],
+                        tier="immediate",
+                    )
+                    return reusable_task_id
             task_labels = [
                 "notify",
                 "watchdog",
@@ -2564,10 +2734,28 @@ def _create_operator_tier4_inbox_task(
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
             inbox_task_id = task.task_id
-            store.update_message(
-                message_id,
-                payload={**payload, "task_id": inbox_task_id},
-            )
+            update_payload = {**payload, "task_id": inbox_task_id}
+            if existing is not None:
+                bump_dedup_message(
+                    store,
+                    existing,
+                    subject=subject,
+                    body=body,
+                    payload={
+                        **update_payload,
+                        "dedup_key": dedup_key,
+                    },
+                    labels=["notify", "watchdog", "tier4"],
+                    tier="immediate",
+                )
+            else:
+                store.update_message(
+                    message_id,
+                    payload={
+                        **(seeded_payload or payload),
+                        "task_id": inbox_task_id,
+                    },
+                )
             return inbox_task_id
         finally:
             svc.close()

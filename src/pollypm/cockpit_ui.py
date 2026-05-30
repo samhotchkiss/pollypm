@@ -2590,15 +2590,16 @@ class PollyCockpitApp(App[None]):
             sessions = getattr(config, "sessions", {}) or {}
             agent_count = len(sessions)
 
-            # inbox_count: re-use the shared ``pm_inbox_awaits_user_list``
-            # so the footer can never disagree with the rail badge /
-            # ``pm inbox --awaits-user`` (#1571). The 1s TTL cache in
-            # ``cockpit_inbox`` collapses this with the rail badge's
-            # own ``_inbox_count`` lookup that the same worker just
-            # ran, so this is a cache hit on the hot path.
-            from pollypm.cockpit_inbox import pm_inbox_awaits_user_list
-            inbox_items = pm_inbox_awaits_user_list(config) or []
-            inbox_count = len(inbox_items)
+            # inbox_count: share the rail badge helper, but bypass the
+            # state-cache snapshot so the operator-visible footer
+            # reconciles with the live /api/v1/inbox default lens.
+            from pollypm.cockpit_inbox import _count_inbox_tasks_for_label
+            inbox_count = int(
+                _count_inbox_tasks_for_label(
+                    config,
+                    use_state_cache=False,
+                ) or 0
+            )
 
             # alert: the only footer-class alert today is the
             # heartbeat-offline warning. Reuse the existing detection

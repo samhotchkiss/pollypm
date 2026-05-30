@@ -73,7 +73,7 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
             windows = [FakeWindow("pm-operator"), FakeWindow("worker-demo")]
             return launches, windows, [], [], []
 
-    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 1)
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 1)
     (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
     router = CockpitRouter(tmp_path / "pollypm.toml")
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
@@ -184,7 +184,7 @@ def test_cockpit_router_build_items_keeps_mounted_task_worker_visible(
             assert target == "pollypm-storage-closet"
             return []
 
-    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0)
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 0)
     (tmp_path / "pollypm.toml").write_text(
         f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
     )
@@ -3624,7 +3624,7 @@ def test_build_cockpit_detail_dashboard_shows_activity_and_tokens(monkeypatch, t
 
     monkeypatch.setattr("pollypm.cockpit.load_config", lambda path: config)
     monkeypatch.setattr("pollypm.cockpit.PollyPMService.load_supervisor", lambda self: FakeSupervisor())
-    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 1)
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config, **_kw: 1)
 
     detail = build_cockpit_detail(config_path, "dashboard")
 

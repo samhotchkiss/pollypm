@@ -289,8 +289,27 @@ def test_list_projects_uses_pg_bulk_task_snapshot(
     """Dashboard project rows should not open the work service per project."""
     from types import SimpleNamespace
 
+    from pollypm.inbox.kind import InboxItemKind
     from pollypm.web_api import service as api_service
 
+    real_inbox_task = SimpleNamespace(
+        project="myproj",
+        task_id="myproj/2",
+        work_status="queued",
+        flow_template_id="chat",
+        labels=[],
+        roles={"requester": "user", "operator": "polly"},
+        kind="legacy",
+    )
+    stale_watchdog_task = SimpleNamespace(
+        project="myproj",
+        task_id="myproj/198",
+        work_status="queued",
+        flow_template_id="chat",
+        labels=["notify", "watchdog", "notify_message:123"],
+        roles={"requester": "user", "operator": "user"},
+        kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
+    )
     grouped = {
         "myproj": [
             SimpleNamespace(
@@ -299,15 +318,16 @@ def test_list_projects_uses_pg_bulk_task_snapshot(
                 work_status="review",
                 flow_template_id="plan_review",
                 labels=[],
+                roles={},
+                kind="legacy",
             ),
-            SimpleNamespace(
-                project="myproj",
-                task_id="myproj/2",
-                work_status="queued",
-                flow_template_id="chat",
-                labels=[],
-            ),
+            real_inbox_task,
+            stale_watchdog_task,
         ],
+        "otherproj": [],
+    }
+    inbox_grouped = {
+        "myproj": [real_inbox_task, stale_watchdog_task],
         "otherproj": [],
     }
 
@@ -322,6 +342,10 @@ def test_list_projects_uses_pg_bulk_task_snapshot(
     monkeypatch.setattr(
         "pollypm.cockpit_pg_aggregates.all_tasks_for_project",
         lambda rows, _config, key: list(rows.get(key, [])),
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.inbox_tasks_grouped",
+        lambda _config: inbox_grouped,
     )
     monkeypatch.setattr(
         api_service,

@@ -25,7 +25,6 @@ issue calls out).
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,13 +37,11 @@ from pollypm.audit.log import (
     EVENT_TASK_STATUS_CHANGED,
     EVENT_WATCHDOG_OPERATOR_DISPATCHED,
     AuditEvent,
-    central_log_path,
     read_events,
 )
 from pollypm.audit.watchdog import (
     Finding,
     InboxItemBuilder,
-    OPERATOR_DISPATCH_THROTTLE_SECONDS,
     REJECTION_LOOP_THRESHOLD,
     REJECTION_LOOP_WINDOW_SECONDS,
     RULE_DUPLICATE_ADVISOR_TASKS,
@@ -606,6 +603,42 @@ def test_queue_without_motion_silent_when_operator_draft_already_exists(
         now=now,
         config=cfg,
         open_tasks=[queued, existing_operator_draft],
+        project="demo",
+    )
+
+    assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
+
+
+def test_queue_without_motion_silent_when_legacy_generated_draft_exists(
+    now: datetime,
+) -> None:
+    cfg = WatchdogConfig(queue_motion_threshold_seconds=600)
+    queued = _StubTask(
+        project="demo",
+        task_number=4,
+        work_status_str="queued",
+        executions=[],
+        updated_at=now - timedelta(hours=2),
+    )
+    legacy_operator_draft = _StubTask(
+        project="demo",
+        task_number=99,
+        work_status_str="draft",
+        executions=[],
+        title=(
+            "Project demo has 1 queued task(s) but no claim / execution / "
+            "status-change activity for the entire scan window."
+        ),
+        labels=(),
+        kind=None,
+        created_by=None,
+    )
+
+    findings = scan_events(
+        [],
+        now=now,
+        config=cfg,
+        open_tasks=[queued, legacy_operator_draft],
         project="demo",
     )
 
@@ -1614,8 +1647,6 @@ def test_get_workspace_state_tolerates_missing_table(tmp_path: Path) -> None:
     ``OperationalError`` so downstream consumers (gate / doctor) treat
     it as "no state".
     """
-    import sqlite3
-
     from pollypm.storage.state import StateStore
     db = tmp_path / "no_table.db"
     store = StateStore(db)

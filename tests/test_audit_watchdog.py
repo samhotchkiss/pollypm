@@ -27,6 +27,7 @@ from pollypm.audit.watchdog import (
     EVENT_AUDIT_FINDING_DISMISSED,
     EVENT_AUDIT_FINDING,
     EVENT_HEARTBEAT_TICK,
+    EVENT_STUCK_DRAFT_RECLAIMED,
     EVENT_STUCK_DRAFT_TERMINATED,
     RULE_QUEUE_WITHOUT_MOTION,
     RULE_CANCEL_NO_PROMOTION,
@@ -445,6 +446,134 @@ def test_scan_events_remains_pure_when_terminator_threshold_hit(
         "authorised emitter for stuck_draft_terminated breadcrumbs. "
         f"Observed: {spy_calls!r}"
     )
+
+
+@pytest.mark.parametrize("created_by", [None, "", "audit_watchdog"])
+def test_stuck_draft_terminator_reclaims_watchdog_owned_drafts(
+    created_by: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.audit.watchdog import _emit_stuck_draft_terminator
+
+    class _Status:
+        value = "draft"
+
+    class _Task:
+        work_status = _Status()
+
+        def __init__(self, creator: str | None = created_by) -> None:
+            self.created_by = creator
+
+    emitted: list[dict[str, object]] = []
+    cancel_calls: list[tuple[str, str, str]] = []
+    factory_calls: list[dict[str, object]] = []
+
+    def _record(**kwargs: object) -> None:
+        emitted.append(kwargs)
+
+    class _Service:
+        def __enter__(self) -> "_Service":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def get(self, task_id: str) -> _Task:
+            assert task_id == "demo/2"
+            return _Task()
+
+        def cancel(self, task_id: str, actor: str, reason: str) -> _Task:
+            cancel_calls.append((task_id, actor, reason))
+            return _Task()
+
+    def _factory(**kwargs: object) -> _Service:
+        factory_calls.append(kwargs)
+        return _Service()
+
+    monkeypatch.setattr("pollypm.audit.log.emit", _record)
+    monkeypatch.setattr("pollypm.work.create_work_service", _factory)
+
+    _emit_stuck_draft_terminator(
+        project="demo",
+        subject="demo/2",
+        prior_count=STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        project_path=tmp_path,
+    )
+
+    assert factory_calls == [
+        {"project_path": tmp_path, "project_key": "demo"},
+    ]
+    assert len(cancel_calls) == 1
+    task_id, actor, reason = cancel_calls[0]
+    assert task_id == "demo/2"
+    assert actor == "audit_watchdog"
+    assert "terminator threshold reached" in reason
+    assert [event["event"] for event in emitted] == [
+        EVENT_STUCK_DRAFT_TERMINATED,
+        EVENT_STUCK_DRAFT_RECLAIMED,
+    ]
+    assert emitted[1]["metadata"] == {
+        "rule": RULE_STUCK_DRAFT,
+        "prior_finding_count": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        "threshold": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        "action": "cancelled",
+        "created_by": created_by or None,
+        "reason": reason,
+    }
+
+
+def test_stuck_draft_terminator_preserves_human_owned_drafts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.audit.watchdog import _emit_stuck_draft_terminator
+
+    class _Status:
+        value = "draft"
+
+    class _Task:
+        work_status = _Status()
+        created_by = "samhotchkiss"
+
+    emitted: list[dict[str, object]] = []
+    cancel_calls: list[tuple[str, str, str]] = []
+
+    def _record(**kwargs: object) -> None:
+        emitted.append(kwargs)
+
+    class _Service:
+        def __enter__(self) -> "_Service":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def get(self, task_id: str) -> _Task:
+            assert task_id == "demo/2"
+            return _Task()
+
+        def cancel(self, task_id: str, actor: str, reason: str) -> _Task:
+            cancel_calls.append((task_id, actor, reason))
+            return _Task()
+
+    monkeypatch.setattr("pollypm.audit.log.emit", _record)
+    monkeypatch.setattr(
+        "pollypm.work.create_work_service",
+        lambda **_: _Service(),
+    )
+
+    _emit_stuck_draft_terminator(
+        project="demo",
+        subject="demo/2",
+        prior_count=STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        project_path=tmp_path,
+    )
+
+    assert cancel_calls == []
+    assert [event["event"] for event in emitted] == [
+        EVENT_STUCK_DRAFT_TERMINATED,
+    ]
 
 
 def test_stuck_draft_terminator_durable_across_scan_project_calls(

@@ -60,6 +60,7 @@ import hashlib
 import json
 import logging
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -92,6 +93,7 @@ __all__ = [
     "EVENT_AUDIT_FINDING",
     "EVENT_AUDIT_FINDING_DISMISSED",
     "EVENT_STUCK_DRAFT_TERMINATED",
+    "EVENT_STUCK_DRAFT_RECLAIMED",
     "STUCK_DRAFT_TERMINATOR_THRESHOLD",
     "RULE_ORPHAN_MARKER",
     "RULE_MARKER_LEAKED",
@@ -328,10 +330,13 @@ QUEUE_MOTION_THRESHOLD_SECONDS = 1800
 # After ``STUCK_DRAFT_TERMINATOR_THRESHOLD`` prior ``audit.finding`` rows
 # for ``(rule=stuck_draft, subject=X)`` we stop re-emitting the finding
 # for that subject and write a single ``audit.stuck_draft_terminated``
-# breadcrumb. The operator can still manually retry by promoting or
-# cancelling the underlying draft — the terminator just stops the loop.
+# breadcrumb. #2456 also attempts to reclaim watchdog-created draft
+# tasks at the same threshold so the source row stops accumulating
+# queue_without_motion follow-up drafts.
 EVENT_STUCK_DRAFT_TERMINATED = "audit.stuck_draft_terminated"
+EVENT_STUCK_DRAFT_RECLAIMED = "audit.stuck_draft_reclaimed"
 STUCK_DRAFT_TERMINATOR_THRESHOLD = 3
+_STUCK_DRAFT_RECLAIMABLE_CREATORS = frozenset({"", "audit_watchdog"})
 
 # Audit events emitted *by* the watchdog itself.
 EVENT_HEARTBEAT_TICK = "heartbeat.tick"
@@ -737,8 +742,10 @@ def _emit_stuck_draft_terminator(
     Emits a single ``audit.stuck_draft_terminated`` row so a forensic
     grep can answer "why did the heartbeat stop nagging me about
     pollypm/191?" without us having to dig through the detector.
-    Best-effort — must never raise; the loss of a single forensic
-    breadcrumb is far better than crashing the cadence handler.
+    Once that breadcrumb is durable, also best-effort cancels a still-draft
+    watchdog-owned source row so synthetic queue-without-motion drafts stop
+    feeding the cascade. Both actions must never raise into the cadence
+    handler.
 
     ``project_path`` MUST be threaded through from the cadence handler
     (via ``scan_project``) so the breadcrumb lands in the per-project
@@ -754,6 +761,7 @@ def _emit_stuck_draft_terminator(
     values; ``scan_project`` materialises them via this helper. Pure
     ``scan_events`` callers never reach this code path.
     """
+    terminator_emitted = False
     try:
         from pollypm.audit.log import emit as _audit_emit
 
@@ -774,9 +782,82 @@ def _emit_stuck_draft_terminator(
             },
             project_path=project_path,
         )
+        terminator_emitted = True
     except Exception:  # noqa: BLE001
         logger.debug(
             "audit.watchdog: stuck_draft_terminated emit failed for %s",
+            subject, exc_info=True,
+        )
+    if terminator_emitted:
+        _maybe_reclaim_stuck_draft(
+            project=project,
+            subject=subject,
+            prior_count=prior_count,
+            project_path=project_path,
+        )
+
+
+def _maybe_reclaim_stuck_draft(
+    *,
+    project: str,
+    subject: str,
+    prior_count: int,
+    project_path: Path | str | None,
+) -> None:
+    parsed = _task_subject_key(subject)
+    if parsed is None or parsed[0] != project:
+        return
+
+    reason = (
+        "stuck_draft terminator threshold reached "
+        f"after {prior_count} prior findings"
+    )
+    creator = ""
+    try:
+        from pollypm.work import create_work_service
+
+        svc = create_work_service(
+            project_path=project_path,
+            project_key=project,
+        )
+        manager = svc if hasattr(svc, "__enter__") else nullcontext(svc)
+        with manager as work:
+            task = work.get(subject)
+            if _task_status_value(task) != "draft":
+                return
+            creator = _task_scalar_value(task, "created_by")
+            if creator not in _STUCK_DRAFT_RECLAIMABLE_CREATORS:
+                return
+            work.cancel(subject, "audit_watchdog", reason)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: stuck_draft reclaim failed for %s",
+            subject, exc_info=True,
+        )
+        return
+
+    try:
+        from pollypm.audit.log import emit as _audit_emit
+
+        _audit_emit(
+            event=EVENT_STUCK_DRAFT_RECLAIMED,
+            project=project,
+            subject=subject,
+            actor="audit_watchdog",
+            status="ok",
+            metadata={
+                "rule": RULE_STUCK_DRAFT,
+                "prior_finding_count": prior_count,
+                "threshold": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+                "action": "cancelled",
+                "created_by": creator or None,
+                "reason": reason,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: stuck_draft_reclaimed emit failed for %s",
             subject, exc_info=True,
         )
 
@@ -3041,26 +3122,15 @@ def _is_unactioned_queue_without_motion_task(
 
     The tier-3 materializer writes these as ordinary work tasks so the
     pure probe can only inspect the open-task snapshot. Keep the match
-    narrow: same project, still ``draft``, watchdog/operator-shaped,
-    and carrying the queue_without_motion subject/body produced by the
-    shipped prompt path. Older production rows may have no
-    ``created_by`` but do carry the title shape and watchdog label.
+    narrow: same project, still ``draft``, and carrying the generated
+    queue_without_motion subject/body produced by the shipped prompt
+    path. Older production rows may have no ``created_by``, kind, or
+    watchdog labels, so the generated title/body is the durable shape.
     """
     if _task_status_value(task) != "draft":
         return False
     project = _task_scalar_value(task, "project")
     if project and project != project_key:
-        return False
-
-    labels = _task_label_set(task)
-    kind = _task_scalar_value(task, "kind")
-    created_by = _task_scalar_value(task, "created_by")
-    watchdog_shaped = (
-        kind == "watchdog_operator_dispatch"
-        or "watchdog" in labels
-        or created_by == "audit_watchdog"
-    )
-    if not watchdog_shaped:
         return False
 
     title = _task_scalar_value(task, "title")

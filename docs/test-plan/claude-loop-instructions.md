@@ -207,7 +207,14 @@ The cardinal rule: tick must end cleanly. A tick that runs into the next /loop f
 
 ## Stop conditions (loop exit)
 
-Pen down `ENGAGEMENT-COMPLETE` in the journal and return without dispatching anything when ALL hold:
+> **⚠️ OVERRIDE FOR THE 48-HOUR MAGIC RUN.** When this loop is driving the 48h run (`48h-magic-loop.md`), the proxy `ENGAGEMENT-COMPLETE` conditions below are **DISABLED**. They exit on proxies (an empty queue, green smoke) that say nothing about the operator's lived experience — and the queue is *already* nearly empty (0 release-blockers, 0 needs-claude PRs), so honoring them would wind the loop down to passive watching within hours: the exact "gave up after 8h of a 72h mandate" failure, encoded.
+>
+> For the 48h run:
+> - **The ONLY valid exit is `48h-magic-loop.md` Part VI** — floor-by-measurement (K≥6 trailing-clean + full chaos rotation) **+** ceiling-by-artifact (the M-tests + delight-ledger) **+** end-user-by-looking (the dogfood beauty pass) **+** the 48h wall-clock. Nothing less.
+> - **An empty GitHub queue is NOT a stop condition.** If the queue is empty, the cycle's work is: inject the next chaos scenario, run the delight engine on an un-inspected surface, advance the dogfood, or load a surface you haven't looked at — there is always real work if you actually look.
+> - **Tick-start assertion:** every tick, confirm you can read `48h-magic-loop.md`. If you cannot (clean checkout / worktree / stash), **STOP and surface it** — do NOT fall back to the proxy exit below. (The mission docs must be git-tracked for this to hold; see the weekend plan §2.)
+
+`ENGAGEMENT-COMPLETE` (proxy exit — for ordinary issue-burndown engagements ONLY, never the 48h run): pen it down in the journal and return without dispatching anything when ALL hold:
 
 1. 0 open `release-blocker` issues
 2. 0 open `needs-claude` PRs by samhotchkiss

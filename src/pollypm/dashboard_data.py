@@ -872,6 +872,17 @@ def _clean_briefing_title(title: str) -> str:
     return text.rstrip(".")
 
 
+def _recovery_narration_line(recovery_summaries: list[str] | None) -> str | None:
+    summaries: list[str] = []
+    for summary in recovery_summaries or []:
+        cleaned = re.sub(r"\s+", " ", summary or "").strip()
+        if cleaned:
+            summaries.append(cleaned)
+    if not summaries:
+        return None
+    return "While you were away, I handled this: " + " ".join(summaries[:2])
+
+
 def _build_dashboard_briefing(
     *,
     commits: list[CommitInfo],
@@ -879,6 +890,7 @@ def _build_dashboard_briefing(
     inbox_count: int,
     recent_messages: list[InboxPreview],
     recovery_count_24h: int,
+    recovery_summaries: list[str] | None = None,
 ) -> str:
     """Build the concise Home briefing from already-gathered dashboard facts."""
 
@@ -898,7 +910,10 @@ def _build_dashboard_briefing(
             + _plural(projects_touched, "project")
             + "."
         )
-    if recovery_count_24h:
+    recovery_line = _recovery_narration_line(recovery_summaries)
+    if recovery_line:
+        lines.append(recovery_line)
+    elif recovery_count_24h:
         lines.append(
             "Saved: "
             + _plural(recovery_count_24h, "recovery", "recoveries")
@@ -939,6 +954,73 @@ def _build_dashboard_briefing(
         lines.append("All handled: no inbox items waiting.")
 
     return "\n".join(lines[:6])
+
+
+def _recent_recovery_audit_narrations(
+    config: PollyPMConfig,
+    *,
+    since: str,
+    limit: int = 3,
+) -> tuple[list[str], int]:
+    """Return recent recovery/self-heal audit narration for the Home brief."""
+
+    try:
+        from pollypm.audit.log import read_events
+        from pollypm.recovery.narration import (
+            RECOVERY_BRIEF_EVENT_NAMES,
+            narrate_recovery_event,
+        )
+    except Exception:  # noqa: BLE001
+        return [], 0
+
+    events = []
+    for project_key, project in (getattr(config, "projects", {}) or {}).items():
+        if not getattr(project, "tracked", False):
+            continue
+        try:
+            rows = read_events(
+                str(project_key),
+                since=since,
+                limit=40,
+                project_path=getattr(project, "path", None),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "dashboard_data: recovery audit read failed for %s",
+                project_key,
+                exc_info=True,
+            )
+            continue
+        events.extend(row for row in rows if row.event in RECOVERY_BRIEF_EVENT_NAMES)
+
+    events.sort(key=lambda event: event.ts, reverse=True)
+    unique_events = []
+    seen: set[tuple[str, str, str]] = set()
+    for event in events:
+        metadata = event.metadata or {}
+        dedupe_key = (
+            event.event,
+            str(metadata.get("target_session") or metadata.get("session") or event.subject),
+            str(metadata.get("finding_type") or metadata.get("reason") or ""),
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        unique_events.append(event)
+
+    narrations: list[str] = []
+    for event in unique_events[:limit]:
+        metadata = event.metadata or {}
+        sentence = narrate_recovery_event(
+            event.event,
+            metadata,
+            subject=event.subject,
+            project=event.project,
+            status=event.status,
+        )
+        if sentence:
+            narrations.append(sentence)
+    return narrations, len(unique_events)
 
 
 def _inbox_sender(task) -> str:
@@ -1235,7 +1317,14 @@ def gather(
     )
     recent_messages = _recent_inbox_messages(config)
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
-    recoveries = sum(1 for e in day_events if "recover" in e.event_type)
+    recovery_summaries, audit_recovery_count = _recent_recovery_audit_narrations(
+        config,
+        since=cutoff,
+    )
+    recoveries = (
+        sum(1 for e in day_events if "recover" in e.event_type)
+        + audit_recovery_count
+    )
 
     if use_pg:
         open_alerts = pg_open_alerts()
@@ -1255,6 +1344,7 @@ def gather(
         inbox_count=inbox_count,
         recent_messages=recent_messages,
         recovery_count_24h=recoveries,
+        recovery_summaries=recovery_summaries,
     )
 
     return DashboardData(

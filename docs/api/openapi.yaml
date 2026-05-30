@@ -94,6 +94,8 @@ tags:
     description: Inbox items and threads.
   - name: Events
     description: Realtime audit-log stream.
+  - name: Activity
+    description: Operator-facing activity rows with narrated recovery events.
   - name: Audit
     description: |
       Historical audit-log queries (grep + stats). The streaming
@@ -2909,6 +2911,67 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /activity:
+    get:
+      tags: [Activity]
+      operationId: listActivity
+      summary: Recent operator-facing activity events
+      description: |
+        Returns recent audit events shaped for the dashboard activity
+        rail. The event stream is audit-backed like `/audit/grep`,
+        but each row includes a `summary` sentence; recovery/self-heal
+        events such as `recovery.spawn` and
+        `watchdog.escalation_dispatched` are rendered from structured
+        metadata into calm operator-facing prose.
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+          description: Scope to one project (per-project log + central tail).
+        - in: query
+          name: since
+          schema: { type: string }
+          description: ISO-8601 timestamp or shortcut like `1h`, `24h`, or `7d`.
+        - in: query
+          name: event_type
+          schema: { type: string }
+          description: Exact match on the audit `.event` field.
+        - in: query
+          name: pattern
+          schema:
+            type: string
+            maxLength: 200
+          description: Literal substring by default; regex with `safe_regex=true`.
+        - in: query
+          name: safe_regex
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - in: query
+          name: deadline_seconds
+          schema:
+            type: number
+            format: float
+            minimum: 0.5
+            maximum: 60.0
+            default: 5.0
+      responses:
+        "200":
+          description: Activity events with operator-facing summaries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActivityResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /audit/stats:
     get:
       tags: [Audit]
@@ -5493,6 +5556,57 @@ components:
             instead of letting the exception escape as a 500. Non-zero
             means at least one archive needs operator attention.
             (Codex round-7 finding, PR #2062.)
+
+    ActivityEvent:
+      allOf:
+        - $ref: "#/components/schemas/Event"
+        - type: object
+          required: [summary, recovery]
+          properties:
+            summary:
+              type: string
+              description: |
+                Operator-facing activity sentence. Recovery/self-heal
+                events are narrated from structured metadata instead
+                of exposing raw event ids.
+            recovery:
+              type: boolean
+              default: false
+              description: True when this row belongs to the recovery/self-heal family.
+
+    ActivityResponse:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActivityEvent"
+        next_cursor:
+          type: string
+          nullable: true
+          description: Reserved for cursor-paginated variants. Always `null` today.
+        _malformed_rows_skipped:
+          type: integer
+          default: 0
+          description: Same diagnostic meaning as in `AuditGrepResponse`.
+        _pattern_timeouts:
+          type: integer
+          default: 0
+          description: Same diagnostic meaning as in `AuditGrepResponse`.
+        _truncated_by_deadline:
+          type: boolean
+          default: false
+          description: Same diagnostic meaning as in `AuditGrepResponse`.
+        _lines_scanned:
+          type: integer
+          default: 0
+          description: Same diagnostic meaning as in `AuditGrepResponse`.
+        _corrupt_archives_skipped:
+          type: integer
+          default: 0
+          minimum: 0
+          description: Same diagnostic meaning as in `AuditGrepResponse`.
 
     AuditStatsResponse:
       type: object

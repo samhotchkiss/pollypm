@@ -685,6 +685,65 @@ def test_briefing_all_handled_when_no_activity() -> None:
     assert "Nothing needs you" in out
 
 
+def test_briefing_surfaces_recovery_narration() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=0,
+        recent_messages=[],
+        recovery_count_24h=1,
+        recovery_summaries=[
+            "I restarted the architect for polly remote after capacity was exhausted.",
+        ],
+    )
+
+    assert "While you were away, I handled this:" in out
+    assert "I restarted the architect for polly remote" in out
+    assert "Saved:" not in out
+
+
+def test_recent_recovery_audit_narrations_reads_audit_events(monkeypatch) -> None:
+    from pollypm.dashboard_data import _recent_recovery_audit_narrations
+
+    rows = [
+        SimpleNamespace(
+            event="recovery.spawn",
+            ts="2026-05-30T10:00:00+00:00",
+            project="polly_remote",
+            subject="architect_polly_remote",
+            actor="supervisor",
+            status="ok",
+            metadata={
+                "failure_type": "capacity_exhausted",
+                "target_session": "architect_polly_remote",
+                "project": "polly_remote",
+            },
+        )
+    ]
+
+    monkeypatch.setattr("pollypm.audit.log.read_events", lambda *a, **k: rows)
+    config = SimpleNamespace(
+        projects={
+            "polly_remote": SimpleNamespace(
+                tracked=True,
+                path="/tmp/polly_remote",
+            )
+        }
+    )
+
+    narrations, count = _recent_recovery_audit_narrations(
+        config,
+        since="2026-05-30T00:00:00+00:00",
+    )
+
+    assert count == 1
+    assert narrations == [
+        "I restarted the architect for polly remote after capacity was exhausted.",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # #2308 perf — _session_description cache contract.
 #

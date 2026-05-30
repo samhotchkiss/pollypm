@@ -1597,6 +1597,9 @@
   }
 
   function auditSummary(entry) {
+    if (entry && typeof entry.summary === "string" && entry.summary.trim()) {
+      return entry.summary.trim();
+    }
     const parts = [entry.event || "audit"];
     if (entry.subject) parts.push(entry.subject);
     if (entry.status) parts.push(entry.status);
@@ -3368,10 +3371,10 @@
     return params;
   }
 
-  function activityGrepPath() {
+  function activityFeedPath() {
     const params = activityParams();
     params.set("limit", String(ACTIVITY_LIMIT));
-    return API + "/audit/grep?" + params.toString();
+    return API + "/activity?" + params.toString();
   }
 
   function activityStatsPath() {
@@ -3393,7 +3396,7 @@
     try {
       const [grepResult, statsResult] = await Promise.allSettled([
         apiJsonOptionalWithTimeout(
-          "activity feed", activityGrepPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
+          "activity feed", activityFeedPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
         ),
         apiJsonOptionalWithTimeout(
           "activity stats", activityStatsPath(), ACTIVITY_STATS_REQUEST_TIMEOUT_MS,

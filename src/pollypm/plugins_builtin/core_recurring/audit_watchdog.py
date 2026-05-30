@@ -26,7 +26,9 @@ want to see "this fired N ticks in a row" as a signal of severity.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2215,11 +2217,233 @@ def _resolve_notify_config(config_path: Path | None) -> Any | None:
 
 
 _TERMINAL_TASK_STATUS_VALUES = frozenset({"done", "cancelled"})
+_WATCHDOG_NOTIFY_RECLAIMABLE_CREATORS = frozenset({"", "audit_watchdog"})
+_TASK_REF_TOKEN_RE = re.compile(
+    r"(?<![\w/-])(?P<project>[A-Za-z0-9_.-]+)/(?P<num>\d+)(?![\w/-])"
+)
 
 
 def _task_status_value(task: Any) -> str:
     status = getattr(task, "work_status", None)
     return str(getattr(status, "value", status) or "").lower()
+
+
+def _task_scalar_value(task: Any, attr: str) -> str:
+    raw = getattr(task, attr, "") or ""
+    value = getattr(raw, "value", raw)
+    return value if isinstance(value, str) else str(value)
+
+
+def _task_id_value(task: Any) -> str:
+    explicit = _task_scalar_value(task, "task_id").strip()
+    if explicit:
+        return explicit
+    project = _task_scalar_value(task, "project").strip()
+    task_number = getattr(task, "task_number", None)
+    if project and task_number is not None:
+        return f"{project}/{task_number}"
+    return ""
+
+
+def _string_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for key, child in value.items():
+            out.extend(_string_values(key))
+            out.extend(_string_values(child))
+        return out
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out = []
+        for child in value:
+            out.extend(_string_values(child))
+        return out
+    return []
+
+
+def _task_text_fields(task: Any) -> list[str]:
+    fields = [
+        _task_scalar_value(task, "title"),
+        _task_scalar_value(task, "description"),
+        _task_scalar_value(task, "body"),
+    ]
+    fields.extend(str(label) for label in (getattr(task, "labels", None) or []))
+    fields.extend(_string_values(getattr(task, "external_refs", None)))
+    return [field for field in fields if field]
+
+
+def _task_ref_tokens(task: Any) -> set[str]:
+    own_id = _task_id_value(task)
+    refs: set[str] = set()
+    for field in _task_text_fields(task):
+        for match in _TASK_REF_TOKEN_RE.finditer(field):
+            ref = f"{match.group('project')}/{match.group('num')}"
+            if ref != own_id:
+                refs.add(ref)
+    return refs
+
+
+def _notify_message_ids(task: Any) -> set[int]:
+    ids: set[int] = set()
+    for label in getattr(task, "labels", None) or []:
+        label_text = str(label)
+        if not label_text.startswith("notify_message:"):
+            continue
+        raw = label_text.removeprefix("notify_message:")
+        try:
+            ids.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def _is_reclaimable_watchdog_notify_draft(task: Any) -> bool:
+    if _task_status_value(task) != "draft":
+        return False
+    labels = {str(label) for label in (getattr(task, "labels", None) or [])}
+    if "watchdog" not in labels or "notify" not in labels:
+        return False
+    creator = _task_scalar_value(task, "created_by")
+    return creator in _WATCHDOG_NOTIFY_RECLAIMABLE_CREATORS
+
+
+def _is_queue_without_motion_watchdog_draft(
+    task: Any,
+    *,
+    project_key: str,
+) -> bool:
+    title = _task_scalar_value(task, "title")
+    expected_prefix = f"Project {project_key} has "
+    if (
+        title.startswith(expected_prefix)
+        and "queued task(s) but no claim / execution / status-change activity"
+        in title
+    ):
+        return True
+    body = "\n".join(_task_text_fields(task))
+    return (
+        f"Project {project_key} is wedged" in body
+        and "queued_subjects" in body
+        and "threshold_seconds" in body
+    )
+
+
+def _project_has_queued_work(
+    open_tasks: list[Any],
+    *,
+    project_key: str,
+) -> bool:
+    for task in open_tasks:
+        if _task_status_value(task) != "queued":
+            continue
+        task_project = _task_scalar_value(task, "project")
+        if task_project == project_key:
+            return True
+    return False
+
+
+def _watchdog_notify_draft_resolved(
+    work: Any,
+    task: Any,
+    *,
+    project_key: str,
+    open_tasks: list[Any],
+) -> bool:
+    refs = _task_ref_tokens(task)
+    if refs:
+        saw_terminal_ref = False
+        for ref in refs:
+            try:
+                referenced = work.get(ref)
+            except Exception:  # noqa: BLE001
+                return False
+            if _task_status_value(referenced) not in _TERMINAL_TASK_STATUS_VALUES:
+                return False
+            saw_terminal_ref = True
+        return saw_terminal_ref
+
+    if _is_queue_without_motion_watchdog_draft(
+        task,
+        project_key=project_key,
+    ):
+        return not _project_has_queued_work(open_tasks, project_key=project_key)
+    return False
+
+
+def _close_notify_messages_for_task(msg_store: Any, task: Any) -> None:
+    close_message = getattr(msg_store, "close_message", None)
+    if not callable(close_message):
+        return
+    for message_id in _notify_message_ids(task):
+        try:
+            close_message(message_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit_watchdog: notify message close skipped for %s",
+                message_id,
+                exc_info=True,
+            )
+
+
+def _reclaim_resolved_watchdog_notify_drafts(
+    *,
+    project_key: str,
+    project_path: Path | None,
+    open_tasks: list[Any],
+    msg_store: Any,
+    config_path: Path | None,
+) -> dict[str, int]:
+    candidates = [
+        task for task in open_tasks
+        if _is_reclaimable_watchdog_notify_draft(task)
+    ]
+    if not candidates:
+        return {
+            "watchdog_notify_drafts_reclaimed": 0,
+            "watchdog_notify_draft_reclaim_failed": 0,
+        }
+
+    from pollypm.work import create_work_service
+
+    svc_kwargs: dict[str, Any] = {"project_key": project_key}
+    if project_path is not None:
+        svc_kwargs["project_path"] = project_path
+    resolved_config = _resolve_notify_config(config_path)
+    if resolved_config is not None:
+        svc_kwargs["config"] = resolved_config
+
+    counters = {
+        "watchdog_notify_drafts_reclaimed": 0,
+        "watchdog_notify_draft_reclaim_failed": 0,
+    }
+    svc = create_work_service(**svc_kwargs)
+    manager = svc if hasattr(svc, "__enter__") else nullcontext(svc)
+    with manager as work:
+        for task in candidates:
+            task_id = _task_id_value(task)
+            if not task_id:
+                continue
+            try:
+                if not _watchdog_notify_draft_resolved(
+                    work,
+                    task,
+                    project_key=project_key,
+                    open_tasks=open_tasks,
+                ):
+                    continue
+                work.archive_task(task_id, actor="audit_watchdog", strict=False)
+                _close_notify_messages_for_task(msg_store, task)
+                counters["watchdog_notify_drafts_reclaimed"] += 1
+            except Exception:  # noqa: BLE001
+                counters["watchdog_notify_draft_reclaim_failed"] += 1
+                logger.debug(
+                    "audit_watchdog: resolved notify draft reclaim skipped "
+                    "for %s",
+                    task_id,
+                    exc_info=True,
+                )
+    return counters
 
 
 def _is_reusable_watchdog_inbox_task(
@@ -3572,6 +3796,8 @@ def _scan_one_project_counters() -> dict[str, int]:
         "tier4_demoted_cleared": 0,
         "tier4_budget_exhausted": 0,
         "tier4_terminal_handoff_failed": 0,
+        "watchdog_notify_drafts_reclaimed": 0,
+        "watchdog_notify_draft_reclaim_failed": 0,
     }
 
 
@@ -3929,6 +4155,15 @@ def _scan_one_project(
             now=now,
             counters=counters,
         )
+    reclaim_counters = _reclaim_resolved_watchdog_notify_drafts(
+        project_key=project_key,
+        project_path=project_path,
+        open_tasks=list(open_tasks or []),
+        msg_store=msg_store,
+        config_path=config_path,
+    )
+    for key, value in reclaim_counters.items():
+        counters[key] = counters.get(key, 0) + int(value)
     return counters
 
 def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3995,6 +4230,8 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "tier4_demoted_cleared": 0,
         "tier4_budget_exhausted": 0,
         "tier4_terminal_handoff_failed": 0,
+        "watchdog_notify_drafts_reclaimed": 0,
+        "watchdog_notify_draft_reclaim_failed": 0,
     }
 
     try:

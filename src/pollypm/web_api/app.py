@@ -38,6 +38,7 @@ from pollypm.web_api.auth import (
     make_sse_auth_dependency,
     mint_session_cookie,
 )
+from pollypm.web_api.dashboard_snapshot_cache import DashboardSnapshotCache
 from pollypm.web_api.token import DEFAULT_TOKEN_PATH, load_token
 from pollypm.web_api.errors import (
     APIError,
@@ -443,6 +444,7 @@ def create_app(
         expose_headers=["Last-Event-ID", "X-PollyPM-Warning"],
     )
     app.state.tailnet_trust_enabled = tailnet_trust_enabled
+    app.state.dashboard_snapshot_cache = DashboardSnapshotCache()
 
     # Wire the config provider. When the loaded config carries the
     # on-disk ``config_path`` (always true for ``pm serve``), re-invoke

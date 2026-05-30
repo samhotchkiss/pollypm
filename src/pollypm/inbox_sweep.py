@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -50,6 +51,7 @@ DEFAULT_NOTIFY_RETENTION_DAYS = 14
 # this here rather than threading it through the API so callers don't
 # need to know the implementation detail.
 _PINNED_LABEL = "pinned"
+_WATCHDOG_LABEL = "watchdog"
 
 
 def _retention_days() -> int:
@@ -109,6 +111,38 @@ def _row_created_at(row: dict[str, Any]) -> datetime | None:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     return None
+
+
+def _task_ref_re(task_id: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![\w/-]){re.escape(task_id)}(?![\w/-])")
+
+
+def _payload_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for key, child in value.items():
+            out.extend(_payload_strings(key))
+            out.extend(_payload_strings(child))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for child in value:
+            out.extend(_payload_strings(child))
+        return out
+    return []
+
+
+def _row_mentions_task_ref(row: dict[str, Any], task_id: str) -> bool:
+    ref_re = _task_ref_re(task_id)
+    fields = [
+        str(row.get("subject") or ""),
+        str(row.get("body") or ""),
+        *_payload_strings(row.get("payload") or {}),
+        *_row_labels(row),
+    ]
+    return any(ref_re.search(field) for field in fields)
 
 
 def sweep_stale_notifies(
@@ -216,8 +250,62 @@ def sweep_notifies_for_done_task(
     return archived
 
 
+def sweep_watchdog_notifies_for_terminal_task(
+    store,
+    task_id: str,
+) -> int:
+    """Archive open watchdog notifies that mention a terminal task.
+
+    Watchdog operator dispatches can reference the real source task in
+    the message body while ``payload.task_id`` points at the generated
+    inbox task. This sweep closes those stale pings when the source task
+    itself is completed or cancelled.
+    """
+    if not task_id:
+        return 0
+    try:
+        rows = store.query_messages(
+            type="notify", state="open", recipient="user",
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "watchdog notify sweep failed for %s", task_id, exc_info=True,
+        )
+        return 0
+
+    archived = 0
+    for row in rows:
+        labels = _row_labels(row)
+        if _PINNED_LABEL in labels:
+            continue
+        if _WATCHDOG_LABEL not in labels:
+            continue
+        if not _row_mentions_task_ref(row, task_id):
+            continue
+        msg_id = row.get("id")
+        if msg_id is None:
+            continue
+        try:
+            store.close_message(int(msg_id))
+            archived += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "watchdog notify close_message(%r) failed",
+                msg_id,
+                exc_info=True,
+            )
+    if archived:
+        word = "notify" if archived == 1 else "notifies"
+        logger.info(
+            "watchdog notify sweep archived %d %s for %s",
+            archived, word, task_id,
+        )
+    return archived
+
+
 __all__ = [
     "DEFAULT_NOTIFY_RETENTION_DAYS",
     "sweep_notifies_for_done_task",
     "sweep_stale_notifies",
+    "sweep_watchdog_notifies_for_terminal_task",
 ]

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -176,6 +177,49 @@ def _coerce_status(raw: str) -> WorkStatus:
         # Unknown statuses surface as DRAFT so a corrupt row is at least
         # readable. Matches the sqlite path's tolerant decode.
         return WorkStatus.DRAFT
+
+
+def _task_ref_re(task_id: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![\w/-]){re.escape(task_id)}(?![\w/-])")
+
+
+def _string_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for key, child in value.items():
+            out.extend(_string_values(key))
+            out.extend(_string_values(child))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for child in value:
+            out.extend(_string_values(child))
+        return out
+    return []
+
+
+def _task_mentions_task_ref(task: Task, task_id: str) -> bool:
+    ref_re = _task_ref_re(task_id)
+    fields = [
+        task.title or "",
+        task.description or "",
+        *[str(label) for label in task.labels],
+        *_string_values(task.external_refs),
+    ]
+    return any(ref_re.search(field) for field in fields)
+
+
+def _is_watchdog_dispatch_task(task: Task) -> bool:
+    labels = {str(label) for label in task.labels}
+    return (
+        "watchdog" in labels
+        and (
+            task.kind == InboxItemKind.WATCHDOG_OPERATOR_DISPATCH
+            or "notify" in labels
+        )
+    )
 
 
 def _coerce_priority(raw: str) -> Priority:
@@ -1978,6 +2022,66 @@ class PgWorkService:
             ended_at=ended_at,
         )
 
+    def _after_terminal_transition(self, task_id: str) -> None:
+        self._sweep_notifies_for_terminal_task(task_id)
+        self._archive_watchdog_dispatches_for_terminal_subject(task_id)
+
+    def _sweep_notifies_for_terminal_task(self, task_id: str) -> None:
+        if self._config is None:
+            return
+        try:
+            from pollypm.inbox_sweep import (
+                sweep_notifies_for_done_task,
+                sweep_watchdog_notifies_for_terminal_task,
+            )
+            from pollypm.store.registry import get_store
+
+            store = get_store(self._config)
+            sweep_notifies_for_done_task(store, task_id)
+            sweep_watchdog_notifies_for_terminal_task(store, task_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "terminal notify sweep skipped for %s",
+                task_id,
+                exc_info=True,
+            )
+
+    def _archive_watchdog_dispatches_for_terminal_subject(
+        self,
+        task_id: str,
+    ) -> None:
+        try:
+            project, _ = _parse_task_id(task_id)
+            candidates = self.list_nonterminal_tasks(project=project)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "watchdog dispatch cleanup scan skipped for %s",
+                task_id,
+                exc_info=True,
+            )
+            return
+
+        for candidate in candidates:
+            if candidate.task_id == task_id:
+                continue
+            if not _is_watchdog_dispatch_task(candidate):
+                continue
+            if not _task_mentions_task_ref(candidate, task_id):
+                continue
+            try:
+                self.archive_task(
+                    candidate.task_id,
+                    actor="audit_watchdog",
+                    strict=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "watchdog dispatch cleanup skipped %s for %s",
+                    candidate.task_id,
+                    task_id,
+                    exc_info=True,
+                )
+
     def mark_done(self, task_id: str, actor: str) -> Task:
         """Force a task to ``done`` without running the flow.
 
@@ -2174,6 +2278,8 @@ class PgWorkService:
             to_state=to_state,
             ended_at=now,
         )
+        if to_state in TERMINAL_STATUSES:
+            self._after_terminal_transition(task_id)
         return task
 
     def _emit_status_changed_audit(
@@ -3736,6 +3842,7 @@ class PgWorkService:
                     task_id,
                     exc_info=True,
                 )
+            self._after_terminal_transition(task_id)
             # #1782: record the first_shipped milestone the same way
             # the sqlite service does. ``maybe_record_first_shipped``
             # checks whether the task landed a commit artifact and, if
@@ -4569,6 +4676,7 @@ class PgWorkService:
                 task_id,
                 exc_info=True,
             )
+        self._after_terminal_transition(task_id)
         return result
 
     def task_numbers_with_context_entry(

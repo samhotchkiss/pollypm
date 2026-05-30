@@ -24,6 +24,7 @@ import time
 
 import pytest
 
+from pollypm.inbox.kind import InboxItemKind
 from pollypm.work.models import WorkStatus
 from pollypm.work.service_support import (
     InvalidTransitionError,
@@ -43,6 +44,22 @@ def _inbox_task(svc, *, title: str = "Hello Sam", body: str = "Read me.") -> str
         roles={"requester": "user", "operator": "polly"},
         priority="normal",
         created_by="polly",
+    )
+    return task.task_id
+
+
+def _watchdog_dispatch_task(svc, *, body: str, title: str = "Watchdog") -> str:
+    task = svc.create(
+        title=title,
+        description=body,
+        type="task",
+        project="demo",
+        flow_template="chat",
+        roles={"requester": "user", "operator": "user"},
+        priority="high",
+        created_by="audit_watchdog",
+        labels=["notify", "watchdog", "notify_message:123"],
+        kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
     )
     return task.task_id
 
@@ -283,6 +300,41 @@ class TestArchiveTask:
             and (tr.reason or "").startswith("inbox.archive")
         ]
         assert len(archive_transitions) == 1
+
+
+# ---------------------------------------------------------------------------
+# stale watchdog dispatch cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogDispatchCleanup:
+    def test_terminal_subject_archives_related_watchdog_dispatch(
+        self, pg_work_service,
+    ):
+        svc = pg_work_service
+        source_id = _inbox_task(svc, title="Real work")
+        dispatch_id = _watchdog_dispatch_task(
+            svc,
+            body=f"Tier handoff for completed task {source_id}.",
+        )
+
+        svc.mark_done(source_id, actor="worker")
+
+        assert svc.get(dispatch_id).work_status == WorkStatus.DONE
+
+    def test_terminal_subject_cleanup_requires_exact_task_ref(
+        self, pg_work_service,
+    ):
+        svc = pg_work_service
+        source_id = _inbox_task(svc, title="Real work")
+        dispatch_id = _watchdog_dispatch_task(
+            svc,
+            body=f"Tier handoff for a different task {source_id}0.",
+        )
+
+        svc.mark_done(source_id, actor="worker")
+
+        assert svc.get(dispatch_id).work_status != WorkStatus.DONE
 
 
 # ---------------------------------------------------------------------------

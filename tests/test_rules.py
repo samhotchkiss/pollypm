@@ -3,6 +3,7 @@ from pathlib import Path
 from pollypm.rules import (
     discover_magic,
     discover_rules,
+    render_relevant_magic_manifest,
     render_magic_manifest,
     render_rules_manifest,
     render_session_manifest,
@@ -77,6 +78,17 @@ def test_discover_magic_respects_override_hierarchy(monkeypatch, tmp_path: Path)
     assert magic["screenshot-verify"].description == "Screenshot verification"
 
 
+def test_discover_magic_includes_packaged_magic_skills(tmp_path: Path) -> None:
+    magic = discover_magic(tmp_path)
+
+    assert "frontend-design" in magic
+    assert magic["frontend-design"].description.startswith("Bold design decisions")
+    assert "design a UI" in magic["frontend-design"].triggers
+    assert magic["frontend-design"].display_path == (
+        "pollypm/plugins_builtin/magic/skills/frontend-design.md"
+    )
+
+
 def test_magic_manifest_lists_merged_magic(monkeypatch, tmp_path: Path) -> None:
     fake_home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", lambda: fake_home)
@@ -90,6 +102,24 @@ def test_magic_manifest_lists_merged_magic(monkeypatch, tmp_path: Path) -> None:
     assert "## Available Magic" in manifest
     assert "- screenshot-verify: Screenshot verification -> .pollypm/magic/screenshot-verify.md (when checking UI output visually)" in manifest
     assert "- deploy-site: Deploy a site and verify it works -> pollypm/defaults/magic/deploy-site.md" in manifest
+
+
+def test_relevant_magic_manifest_matches_task_context(tmp_path: Path) -> None:
+    manifest = render_relevant_magic_manifest(
+        tmp_path,
+        role="worker",
+        context_text=(
+            "Build a frontend UI for the dashboard. It feels generic; make it "
+            "beautiful and verify in browser with a screenshot."
+        ),
+        limit=5,
+    )
+
+    assert "## Relevant Magic Skills" in manifest
+    assert "frontend-design" in manifest
+    assert "design-taste-frontend" in manifest
+    assert "webapp-testing-playwright" in manifest
+    assert "internal-comms" not in manifest
 
 
 def test_session_manifest_is_compact_and_writes_full_manifest(monkeypatch, tmp_path: Path) -> None:

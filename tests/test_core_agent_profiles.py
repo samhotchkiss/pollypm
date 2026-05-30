@@ -344,3 +344,22 @@ def test_worker_profile_explains_optional_overrides_and_missing_files(tmp_path: 
     assert present_prompt is not None
     assert "system override body" in present_prompt
     assert "project override body" in present_prompt
+
+
+def test_worker_profile_surfaces_relevant_magic_skills(tmp_path: Path) -> None:
+    context, project_root = _make_worker_context(tmp_path)
+    (project_root / "docs").mkdir()
+    (project_root / "docs" / "project-overview.md").write_text(
+        "Build a frontend UI dashboard. It feels generic; make it beautiful "
+        "and verify in browser before handoff.\n",
+        encoding="utf-8",
+    )
+    profile = core_profiles.plugin.agent_profiles["worker"]()
+
+    prompt = profile.build_prompt(context)
+
+    assert prompt is not None
+    assert "## Relevant Magic Skills" in prompt
+    assert "frontend-design" in prompt
+    assert "design-taste-frontend" in prompt
+    assert "webapp-testing-playwright" in prompt

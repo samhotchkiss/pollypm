@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from importlib import resources
 from pathlib import Path
+import re
+from typing import Any
+
 from pollypm.projects import project_magic_dir, project_rules_dir
 
 _SESSION_MANIFEST_PATH = Path(".pollypm/MANIFEST.md")
 _SESSION_SECTION_LIMIT = 6
+_RELEVANT_MAGIC_LIMIT = 5
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(slots=True)
@@ -14,9 +20,22 @@ class CatalogFile:
     name: str
     description: str
     trigger: str
+    triggers: tuple[str, ...]
     source_path: Path
     display_path: str
     content: str
+
+
+def _yaml_load_frontmatter(raw: str) -> dict[str, Any]:
+    try:
+        import yaml  # type: ignore
+
+        loaded = yaml.safe_load(raw)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
 
 
 def _parse_catalog_metadata(
@@ -29,7 +48,7 @@ def _parse_catalog_metadata(
 ) -> CatalogFile:
     name = name_override if name_override is not None else path.stem
     description = ""
-    trigger = ""
+    triggers: list[str] = []
     # Strip a YAML frontmatter block if present so that directory-style skills
     # (SKILL.md) can use ``description:`` inside the front matter.
     body_lines = content.splitlines()
@@ -41,7 +60,22 @@ def _parse_catalog_metadata(
                 fm_end = idx
                 break
         if fm_end is not None:
-            scan_lines = body_lines[1:fm_end] + body_lines[fm_end + 1 : fm_end + 21]
+            metadata = _yaml_load_frontmatter("\n".join(body_lines[1:fm_end]))
+            if name_override is None and isinstance(metadata.get("name"), str):
+                name = metadata["name"].strip() or name
+            if isinstance(metadata.get("description"), str):
+                description = metadata["description"].strip()
+            raw_triggers = metadata.get("when_to_trigger")
+            if isinstance(raw_triggers, list):
+                triggers.extend(
+                    str(item).strip() for item in raw_triggers if str(item).strip()
+                )
+            elif isinstance(raw_triggers, str):
+                triggers.append(raw_triggers.strip())
+            raw_trigger = metadata.get("trigger")
+            if isinstance(raw_trigger, str) and raw_trigger.strip():
+                triggers.append(raw_trigger.strip())
+            scan_lines = body_lines[fm_end + 1 : fm_end + 21]
         else:
             scan_lines = body_lines[:20]
     else:
@@ -51,12 +85,14 @@ def _parse_catalog_metadata(
         lowered = stripped.casefold()
         if not description and lowered.startswith("description:"):
             description = stripped.split(":", 1)[1].strip()
-        elif not trigger and lowered.startswith("trigger:"):
-            trigger = stripped.split(":", 1)[1].strip()
+        elif not triggers and lowered.startswith("trigger:"):
+            triggers.append(stripped.split(":", 1)[1].strip())
     if not description:
         description = default_description.format(name=name)
-    if not trigger:
-        trigger = default_trigger.format(name=name)
+    if not triggers:
+        triggers.append(default_trigger.format(name=name))
+    triggers_tuple = tuple(dict.fromkeys(trigger for trigger in triggers if trigger))
+    trigger = "; ".join(triggers_tuple)
     display_path = str(path)
     try:
         home = Path.home().resolve()
@@ -69,6 +105,7 @@ def _parse_catalog_metadata(
         name=name,
         description=description,
         trigger=trigger,
+        triggers=triggers_tuple,
         source_path=path,
         display_path=display_path,
         content=content,
@@ -81,6 +118,10 @@ def _builtin_rules_dir() -> Path:
 
 def _builtin_magic_dir() -> Path:
     return Path(str(resources.files("pollypm.defaults.magic")))
+
+
+def _builtin_magic_skills_dir() -> Path:
+    return Path(__file__).resolve().parent / "plugins_builtin" / "magic" / "skills"
 
 
 def _scan_catalog_dir(
@@ -140,6 +181,7 @@ def discover_rules(project_root: Path) -> dict[str, CatalogFile]:
         default_trigger="When doing {name} work",
     )
     from pollypm.projects import global_pollypm_dir as _global_dir
+
     merged.update(
         _scan_catalog_dir(
             _global_dir() / "rules",
@@ -159,14 +201,32 @@ def discover_rules(project_root: Path) -> dict[str, CatalogFile]:
     return merged
 
 
-def discover_magic(project_root: Path) -> dict[str, CatalogFile]:
+@lru_cache(maxsize=1)
+def _builtin_magic_catalog() -> dict[str, CatalogFile]:
     merged = _scan_catalog_dir(
-        _builtin_magic_dir(),
-        display_base="pollypm/defaults/magic",
+        _builtin_magic_skills_dir(),
+        display_base="pollypm/plugins_builtin/magic/skills",
         default_description="Capability for {name}",
         default_trigger="When {name} would help",
     )
+    # The historical defaults include deployment recipes and the
+    # directory-style visual-explainer skill. Let them win over starter-pack
+    # files with the same slug so existing paths remain stable.
+    merged.update(
+        _scan_catalog_dir(
+            _builtin_magic_dir(),
+            display_base="pollypm/defaults/magic",
+            default_description="Capability for {name}",
+            default_trigger="When {name} would help",
+        )
+    )
+    return merged
+
+
+def discover_magic(project_root: Path) -> dict[str, CatalogFile]:
+    merged = dict(_builtin_magic_catalog())
     from pollypm.projects import global_pollypm_dir as _global_dir
+
     merged.update(
         _scan_catalog_dir(
             _global_dir() / "magic",
@@ -186,6 +246,104 @@ def discover_magic(project_root: Path) -> dict[str, CatalogFile]:
     return merged
 
 
+def _tokenize(text: str) -> tuple[str, ...]:
+    return tuple(_TOKEN_RE.findall(text.casefold()))
+
+
+def _score_trigger(trigger: str, haystack: str, haystack_tokens: set[str]) -> int:
+    normalized = " ".join(_tokenize(trigger))
+    if not normalized:
+        return 0
+    if normalized in haystack:
+        return 100 + len(normalized)
+    trigger_tokens = {token for token in _tokenize(trigger) if len(token) >= 3}
+    if not trigger_tokens:
+        return 0
+    overlap = trigger_tokens & haystack_tokens
+    if overlap == trigger_tokens:
+        return 40 + len(overlap)
+    if len(overlap) >= 2:
+        return 15 + len(overlap)
+    if len(overlap) == 1 and len(trigger_tokens) == 1:
+        return 6
+    return 0
+
+
+def _score_magic_entry(
+    entry: CatalogFile,
+    *,
+    role: str,
+    context_text: str,
+) -> tuple[int, tuple[str, ...]]:
+    haystack = " ".join(_tokenize(f"{role}\n{context_text}"))
+    haystack_tokens = set(haystack.split())
+    score = 0
+    matched: list[str] = []
+    for trigger in entry.triggers:
+        trigger_score = _score_trigger(trigger, haystack, haystack_tokens)
+        if trigger_score:
+            score += trigger_score
+            matched.append(trigger)
+    name_tokens = set(_tokenize(entry.name.replace("-", " ")))
+    if name_tokens and name_tokens <= haystack_tokens:
+        score += 10
+    return score, tuple(matched)
+
+
+def _rank_relevant_magic(
+    magic: dict[str, CatalogFile],
+    *,
+    role: str,
+    context_text: str,
+) -> list[tuple[int, CatalogFile, tuple[str, ...]]]:
+    ranked: list[tuple[int, CatalogFile, tuple[str, ...]]] = []
+    for entry in magic.values():
+        score, matched = _score_magic_entry(
+            entry,
+            role=role,
+            context_text=context_text,
+        )
+        if score > 0:
+            ranked.append((score, entry, matched))
+    ranked.sort(key=lambda item: (-item[0], item[1].name))
+    return ranked
+
+
+def render_relevant_magic_manifest(
+    project_root: Path,
+    *,
+    role: str,
+    context_text: str,
+    limit: int = _RELEVANT_MAGIC_LIMIT,
+) -> str:
+    """Return a compact list of skills matched to this session's work context."""
+    if limit <= 0 or not context_text.strip():
+        return ""
+    ranked = _rank_relevant_magic(
+        discover_magic(project_root),
+        role=role,
+        context_text=context_text,
+    )
+    if not ranked:
+        return ""
+    lines = [
+        "## Relevant Magic Skills",
+        (
+            "These skills match the current role and task context. Apply them "
+            "when they fit; read the linked file for the full workflow."
+        ),
+    ]
+    for _, entry, matched in ranked[:limit]:
+        trigger_hint = f" (matched: {', '.join(matched[:2])})" if matched else ""
+        lines.append(
+            f"- {entry.name}: {entry.description} -> {entry.display_path}{trigger_hint}"
+        )
+    remaining = len(ranked) - limit
+    if remaining > 0:
+        lines.append(f"- … {remaining} more matching skills omitted from this prompt")
+    return "\n".join(lines)
+
+
 def render_rules_manifest(project_root: Path) -> str:
     rules = discover_rules(project_root)
     if not rules:
@@ -196,7 +354,9 @@ def render_rules_manifest(project_root: Path) -> str:
     ]
     for name in sorted(rules):
         rule = rules[name]
-        lines.append(f"- {rule.name}: {rule.description} -> {rule.display_path} ({rule.trigger})")
+        lines.append(
+            f"- {rule.name}: {rule.description} -> {rule.display_path} ({rule.trigger})"
+        )
     return "\n".join(lines)
 
 
@@ -210,7 +370,9 @@ def render_magic_manifest(project_root: Path) -> str:
     ]
     for name in sorted(magic):
         entry = magic[name]
-        lines.append(f"- {entry.name}: {entry.description} -> {entry.display_path} ({entry.trigger})")
+        lines.append(
+            f"- {entry.name}: {entry.description} -> {entry.display_path} ({entry.trigger})"
+        )
     return "\n".join(lines)
 
 
@@ -249,9 +411,7 @@ def _render_compact_catalog(
         # (``pollypm/defaults/rules/build.md``) are unambiguous to the
         # session. Workers need the exact file to read for any rule they
         # invoke.
-        lines.append(
-            f"- {entry.name}: {entry.description} ({entry.display_path})"
-        )
+        lines.append(f"- {entry.name}: {entry.description} ({entry.display_path})")
     remaining = len(names) - _SESSION_SECTION_LIMIT
     if remaining > 0:
         lines.append(f"- … {remaining} more in `{_SESSION_MANIFEST_PATH.as_posix()}`")

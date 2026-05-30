@@ -17,24 +17,23 @@ from pollypm.cockpit_alerts import is_operational_alert
 
 _STUCK_ON_TASK_PREFIX = "stuck_on_task:"
 _QUEUE_WITHOUT_MOTION_SESSION_PREFIX = "audit-queue_without_motion-"
+_WORKTREE_STATE_PREFIX = "worktree_state:"
 _WATCHDOG_ALERT_TYPE = "audit_watchdog"
 _QWM_PROJECT_RE = re.compile(r"\bProject\s+(?P<project>[A-Za-z0-9_.-]+)\s+has\b")
 
-# #2475 — system-internal recovery watchdog warns. Each of these alert
-# types is a mechanical recovery signal raised by the task-assignment
-# sweep that the heartbeat/cascade auto-handles (re-spawn the per-task
-# worker, refresh the plan gate, claim the queued task). They are NOT
-# operator decisions. On a live workspace the operator-Home "N things
-# need you" headline was dominated by these warns firing on stale /
-# archived / synthetic test projects (``pm_test_*``, ``ghost``,
-# ``alpha``, ``queuestorm_*``, ...) — none of which the operator can or
-# should act on. We demote a recovery warn from the operator-action
-# count when it is scoped to a project that is NOT tracked. A warn on a
-# tracked project still surfaces (the operator may legitimately want to
-# claim its queued work), so genuine operator-decision signals are
-# preserved. The session-name → project extraction mirrors the synthetic
-# scope strings the sweep writes (see
-# ``plugins_builtin/task_assignment_notify/handlers/sweep.py``):
+# #2475/#2480 — system-internal recovery watchdog warns. Each of these
+# alert types is a mechanical recovery signal raised by the
+# task-assignment sweep that the heartbeat/cascade auto-handles
+# (re-spawn the per-task worker, refresh the plan gate, claim the
+# queued task). They are NOT operator decisions. The operator-Home "N
+# things need you" headline was dominated by these warns firing on
+# stale / archived / synthetic test projects (``pm_test_*``,
+# ``ghost``, ``alpha``, ``queuestorm_*``, ...) — many of which were
+# still tracked, so trackedness alone was a false liveness signal. We
+# demote a recovery warn when it is scoped to a project that is not
+# tracked OR has no recent real completed work. The session-name →
+# project extraction mirrors the synthetic scope strings the sweep
+# writes (see ``plugins_builtin/task_assignment_notify/handlers/sweep.py``):
 #   plan_missing        -> ``plan_gate-<project>``
 #   worker_session_gap  -> ``worker_session_gap-<project>``
 #   missing_task_worker -> ``missing_task_worker-<project>/<task-number>``
@@ -52,6 +51,7 @@ class AlertActionabilityContext:
     user_waiting_task_ids: frozenset[str] = frozenset()
     known_projects: frozenset[str] | None = None
     tracked_projects: frozenset[str] | None = None
+    recent_real_work_projects: frozenset[str] | None = None
     project_task_counts: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
 
 
@@ -122,7 +122,7 @@ def _queue_without_motion_is_stale(
     if not project:
         return False
 
-    if context.tracked_projects is not None and project not in context.tracked_projects:
+    if _project_is_inactive_for_operator_count(project, context=context):
         return True
 
     counts = context.project_task_counts.get(project)
@@ -130,6 +130,55 @@ def _queue_without_motion_is_stale(
         return True
 
     return False
+
+
+def _worktree_state_project(
+    alert_type: str,
+    *,
+    known_projects: frozenset[str] | None,
+) -> str | None:
+    if not alert_type.startswith(_WORKTREE_STATE_PREFIX):
+        return None
+    tail = alert_type[len(_WORKTREE_STATE_PREFIX):].strip()
+    if not tail:
+        return None
+    # Production shape is ``worktree_state:<project>/<task>:<reason>``.
+    if "/" in tail:
+        return tail.split("/", 1)[0].strip() or None
+    if known_projects:
+        for project in sorted(known_projects, key=len, reverse=True):
+            if tail == project or tail.startswith(project + ":"):
+                return project
+    return tail.split(":", 1)[0].strip() or None
+
+
+def _project_is_inactive_for_operator_count(
+    project: str,
+    *,
+    context: AlertActionabilityContext,
+) -> bool:
+    if context.tracked_projects is not None and project not in context.tracked_projects:
+        return True
+    if (
+        context.recent_real_work_projects is not None
+        and project not in context.recent_real_work_projects
+    ):
+        return True
+    return False
+
+
+def _worktree_state_is_stale(
+    alert_type: str,
+    *,
+    context: AlertActionabilityContext,
+) -> bool:
+    project = _worktree_state_project(
+        alert_type,
+        known_projects=context.known_projects or context.tracked_projects,
+    )
+    if not project:
+        return False
+    return _project_is_inactive_for_operator_count(project, context=context)
 
 
 def _recovery_watchdog_project(
@@ -178,19 +227,20 @@ def _recovery_watchdog_warn_is_self_healing(
 ) -> bool:
     """Return True for a recovery warn the cascade auto-handles itself.
 
-    Today the demotion is scoped to *non-tracked* projects: a recovery
-    warn on a tracked project is left actionable (the operator may want
-    to claim its queued work), but a warn on a stale / archived /
-    synthetic test project is system-internal noise the heartbeat sweep
-    is already retrying — counting it in the operator's "N things need
-    you" headline trains the operator to ignore the number (#2475).
+    A recovery warn on a stale / archived / synthetic project is
+    system-internal noise the heartbeat sweep is already retrying.
+    Counting it in the operator's "N things need you" headline trains
+    the operator to ignore the number (#2475/#2480). Trackedness is not
+    enough: watchdog churn can keep a dead tracked project looking
+    freshly touched, so callers may also pass the set of projects with
+    recent real ``done`` work.
     """
 
     if alert_type not in _RECOVERY_WATCHDOG_SESSION_PREFIXES:
         return False
-    if context.tracked_projects is None:
-        # Without a tracked-project set we cannot tell stale from live,
-        # so we keep the warn actionable rather than over-suppress.
+    if context.tracked_projects is None and context.recent_real_work_projects is None:
+        # Without any liveness facts we cannot tell stale from live, so
+        # keep the warn actionable rather than over-suppress.
         return False
     project = _recovery_watchdog_project(
         alert,
@@ -199,7 +249,7 @@ def _recovery_watchdog_warn_is_self_healing(
     )
     if not project:
         return False
-    return project not in context.tracked_projects
+    return _project_is_inactive_for_operator_count(project, context=context)
 
 
 def is_user_actionable_alert(
@@ -220,6 +270,8 @@ def is_user_actionable_alert(
     if _queue_without_motion_is_stale(alert, context=ctx):
         return False
     if _recovery_watchdog_warn_is_self_healing(alert, alert_type, context=ctx):
+        return False
+    if _worktree_state_is_stale(alert_type, context=ctx):
         return False
 
     return True

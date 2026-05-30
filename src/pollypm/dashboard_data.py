@@ -761,19 +761,68 @@ def _known_project_keys(config: PollyPMConfig) -> frozenset[str]:
     return frozenset((getattr(config, "projects", {}) or {}).keys())
 
 
-def _project_task_counts_for_alert_filter(
+_REAL_WORK_RECENCY_WINDOW = timedelta(days=7)
+_RECOVERY_ALERT_TYPES_FOR_LIVENESS = frozenset({
+    "plan_missing",
+    "worker_session_gap",
+    "missing_task_worker",
+})
+
+
+@dataclass(slots=True, frozen=True)
+class _AlertProjectTaskFacts:
+    project_task_counts: dict[str, dict[str, int]]
+    recent_real_work_projects: frozenset[str] | None
+
+
+def _status_key(task: object) -> str:
+    status = getattr(task, "work_status", "") or ""
+    status_value = getattr(status, "value", status)
+    return str(status_value or "")
+
+
+def _coerce_utc_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _alert_filter_needs_project_task_facts(open_alerts: list[object]) -> bool:
+    for alert in open_alerts:
+        session_name = str(getattr(alert, "session_name", "") or "")
+        if session_name.startswith("audit-queue_without_motion-"):
+            return True
+        alert_type = str(getattr(alert, "alert_type", "") or "")
+        if alert_type in _RECOVERY_ALERT_TYPES_FOR_LIVENESS:
+            return True
+        if alert_type.startswith("worktree_state:"):
+            return True
+    return False
+
+
+def _project_task_facts_for_alert_filter(
     config: PollyPMConfig,
     open_alerts: list[object],
-) -> dict[str, dict[str, int]]:
-    """Return per-project work-status counts only when alert policy needs them."""
+) -> _AlertProjectTaskFacts:
+    """Return per-project task facts only when alert policy needs them."""
 
-    if not any(
-        str(getattr(alert, "session_name", "") or "").startswith(
-            "audit-queue_without_motion-"
-        )
-        for alert in open_alerts
-    ):
-        return {}
+    if not _alert_filter_needs_project_task_facts(open_alerts):
+        return _AlertProjectTaskFacts({}, None)
     try:
         from pollypm.cockpit_pg_aggregates import (
             all_tasks_for_project,
@@ -782,25 +831,35 @@ def _project_task_counts_for_alert_filter(
 
         grouped = all_tasks_grouped(config)
         if grouped is None:
-            return {}
+            return _AlertProjectTaskFacts({}, None)
         counts_by_project: dict[str, dict[str, int]] = {}
+        recent_real_work: set[str] = set()
+        recent_cutoff = datetime.now(UTC) - _REAL_WORK_RECENCY_WINDOW
         for project_key in (getattr(config, "projects", {}) or {}):
             counts: dict[str, int] = {}
             for task in all_tasks_for_project(grouped, config, project_key):
-                status = getattr(task, "work_status", "") or ""
-                status_value = getattr(status, "value", status)
-                status_key = str(status_value or "")
+                status_key = _status_key(task)
                 if not status_key:
                     continue
                 counts[status_key] = counts.get(status_key, 0) + 1
+                if status_key == "done":
+                    stamped = _coerce_utc_datetime(
+                        getattr(task, "updated_at", None)
+                        or getattr(task, "created_at", None)
+                    )
+                    if stamped is None or stamped >= recent_cutoff:
+                        recent_real_work.add(project_key)
             counts_by_project[project_key] = counts
-        return counts_by_project
+        return _AlertProjectTaskFacts(
+            counts_by_project,
+            frozenset(recent_real_work),
+        )
     except Exception:  # noqa: BLE001
         logger.debug(
-            "dashboard_data: project task counts for alert filter failed",
+            "dashboard_data: project task facts for alert filter failed",
             exc_info=True,
         )
-        return {}
+        return _AlertProjectTaskFacts({}, None)
 
 
 def dashboard_actionable_alerts(
@@ -825,14 +884,16 @@ def dashboard_actionable_alerts(
                 exc_info=True,
             )
             user_waiting_task_ids = frozenset()
+    project_task_facts = _project_task_facts_for_alert_filter(
+        config,
+        open_alerts,
+    )
     context = AlertActionabilityContext(
         user_waiting_task_ids=frozenset(user_waiting_task_ids),
         known_projects=_known_project_keys(config),
         tracked_projects=_tracked_project_keys(config),
-        project_task_counts=_project_task_counts_for_alert_filter(
-            config,
-            open_alerts,
-        ),
+        recent_real_work_projects=project_task_facts.recent_real_work_projects,
+        project_task_counts=project_task_facts.project_task_counts,
     )
     return user_actionable_alerts(open_alerts, context=context)
 

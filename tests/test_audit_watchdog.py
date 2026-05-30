@@ -2926,6 +2926,158 @@ def test_operator_inbox_task_reuses_deduped_watchdog_task(
     assert payload["count"] == 5
 
 
+def test_reclaim_resolved_watchdog_notify_draft_archives_terminal_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    candidate = SimpleNamespace(
+        task_id="demo/99",
+        project="demo",
+        task_number=99,
+        work_status="draft",
+        created_by="audit_watchdog",
+        title="Watchdog handoff",
+        description="Follow-up for completed task demo/4.",
+        labels=["notify", "watchdog", "notify_message:123"],
+    )
+    source = SimpleNamespace(task_id="demo/4", work_status="done")
+
+    class _Service:
+        def __enter__(self) -> "_Service":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def get(self, task_id: str):
+            assert task_id == "demo/4"
+            return source
+
+        def archive_task(self, task_id: str, **_kwargs: object) -> None:
+            archived.append(task_id)
+
+    class _Store:
+        def close_message(self, message_id: int) -> None:
+            closed.append(message_id)
+
+    archived: list[str] = []
+    closed: list[int] = []
+    monkeypatch.setattr(aw, "_resolve_notify_config", lambda _path: None)
+    monkeypatch.setattr("pollypm.work.create_work_service", lambda **_kw: _Service())
+
+    counters = aw._reclaim_resolved_watchdog_notify_drafts(
+        project_key="demo",
+        project_path=None,
+        open_tasks=[candidate],
+        msg_store=_Store(),
+        config_path=None,
+    )
+
+    assert counters == {
+        "watchdog_notify_drafts_reclaimed": 1,
+        "watchdog_notify_draft_reclaim_failed": 0,
+    }
+    assert archived == ["demo/99"]
+    assert closed == [123]
+
+
+def test_reclaim_resolved_watchdog_notify_draft_keeps_live_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    candidate = SimpleNamespace(
+        task_id="demo/99",
+        project="demo",
+        task_number=99,
+        work_status="draft",
+        created_by="audit_watchdog",
+        title="Watchdog handoff",
+        description="Follow-up for queued task demo/4.",
+        labels=["notify", "watchdog", "notify_message:123"],
+    )
+    source = SimpleNamespace(task_id="demo/4", work_status="queued")
+
+    class _Service:
+        def __enter__(self) -> "_Service":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def get(self, task_id: str):
+            assert task_id == "demo/4"
+            return source
+
+        def archive_task(self, task_id: str, **_kwargs: object) -> None:
+            archived.append(task_id)
+
+    archived: list[str] = []
+    monkeypatch.setattr(aw, "_resolve_notify_config", lambda _path: None)
+    monkeypatch.setattr("pollypm.work.create_work_service", lambda **_kw: _Service())
+
+    counters = aw._reclaim_resolved_watchdog_notify_drafts(
+        project_key="demo",
+        project_path=None,
+        open_tasks=[candidate],
+        msg_store=SimpleNamespace(),
+        config_path=None,
+    )
+
+    assert counters == {
+        "watchdog_notify_drafts_reclaimed": 0,
+        "watchdog_notify_draft_reclaim_failed": 0,
+    }
+    assert archived == []
+
+
+def test_reclaim_queue_without_motion_draft_when_queue_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    candidate = SimpleNamespace(
+        task_id="demo/99",
+        project="demo",
+        task_number=99,
+        work_status="draft",
+        created_by="audit_watchdog",
+        title=(
+            "Project demo has 1 queued task(s) but no claim / execution / "
+            "status-change activity for the entire scan window."
+        ),
+        description="",
+        labels=["notify", "watchdog"],
+    )
+
+    class _Service:
+        def __enter__(self) -> "_Service":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def archive_task(self, task_id: str, **_kwargs: object) -> None:
+            archived.append(task_id)
+
+    archived: list[str] = []
+    monkeypatch.setattr(aw, "_resolve_notify_config", lambda _path: None)
+    monkeypatch.setattr("pollypm.work.create_work_service", lambda **_kw: _Service())
+
+    counters = aw._reclaim_resolved_watchdog_notify_drafts(
+        project_key="demo",
+        project_path=None,
+        open_tasks=[candidate],
+        msg_store=SimpleNamespace(),
+        config_path=None,
+    )
+
+    assert counters["watchdog_notify_drafts_reclaimed"] == 1
+    assert counters["watchdog_notify_draft_reclaim_failed"] == 0
+    assert archived == ["demo/99"]
+
+
 def test_classify_on_hold_reason_defaults_to_architect() -> None:
     """Untagged or unknown-tag reason routes to architect-actionable."""
     from pollypm.audit.watchdog import (

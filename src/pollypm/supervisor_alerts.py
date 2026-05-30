@@ -285,8 +285,8 @@ def _update_alerts_snapshot_stall(
                 subject=f"{session_name} asked a question",
                 body=_question_body,
                 suggested_action=(
-                    "Open the worker pane and answer, or `pm send "
-                    f"{session_name} \"<answer>\"`."
+                    "Open the chat surface in the web UI and answer the "
+                    "decision card."
                 ),
             )
         )

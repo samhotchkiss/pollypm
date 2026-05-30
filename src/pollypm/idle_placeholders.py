@@ -209,6 +209,49 @@ _QUESTION_PATTERNS: tuple[str, ...] = (
 )
 
 
+def pane_shows_interactive_ask_user_question(pane_text: str) -> str | None:
+    """Return the pending AskUserQuestion prompt rendered as a TUI form.
+
+    Claude's interactive ``AskUserQuestion`` surface does not always end
+    at the empty ``❯`` prompt. It can park on a checkbox/radio menu with
+    a submit control, re-rendering the same pane indefinitely. Treat
+    that shape as an unanswered operator question so heartbeat can route
+    it to the same action-required path as prose questions.
+    """
+    if not pane_text:
+        return None
+    option_glyphs = ("☐", "☑", "○", "◉")
+    if "Submit" not in pane_text or not any(glyph in pane_text for glyph in option_glyphs):
+        return None
+
+    candidates: list[str] = []
+    for raw_line in pane_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if (
+            "bypass permissions" in lower
+            or "shift+tab to cycle" in lower
+            or "ctrl+t to" in lower
+            or line.startswith("⏵⏵")  # ⏵⏵
+        ):
+            continue
+        if set(line) <= {"─", "━", "╭", "╮", "╰", "╯", "│", "┆", " "}:  # box
+            continue
+        if "Submit" in line and any(glyph in line for glyph in option_glyphs):
+            break
+        if "?" in line and not line.startswith(("❯", "›")):
+            candidates.append(line.lstrip("⏺").strip())
+
+    if not candidates:
+        return None
+    question = candidates[-1]
+    if len(question) > 280:
+        return "…" + question[-279:]
+    return question
+
+
 def pane_ends_with_unanswered_question(pane_text: str) -> str | None:
     """Return the agent's question text iff the pane ends awaiting one.
 
@@ -235,6 +278,9 @@ def pane_ends_with_unanswered_question(pane_text: str) -> str | None:
     """
     if not pane_text:
         return None
+    ask_user_question = pane_shows_interactive_ask_user_question(pane_text)
+    if ask_user_question:
+        return ask_user_question
     if not pane_shows_claude_empty_prompt(pane_text):
         return None
 
@@ -308,6 +354,7 @@ __all__ = [
     "pane_shows_codex_idle_placeholder",
     "pane_shows_claude_empty_prompt",
     "pane_shows_no_tasks_available",
+    "pane_shows_interactive_ask_user_question",
     "pane_is_idle_placeholder",
     "pane_ends_with_unanswered_question",
 ]

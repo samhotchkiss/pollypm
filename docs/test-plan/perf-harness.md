@@ -22,10 +22,25 @@ commands. It does not import from `src/pollypm`. Mutating scenarios (`claim`,
 accidentally alter daemon state.
 
 The seed scripts generate isolated workspaces, normalized transcript fixtures,
-and SQL seed files for isolated Postgres schemas. Applying the SQL requires
-`--execute` plus `POLLYPM_PERF_PG_DSN` or `--dsn`; the scripts refuse the
-ambient `localhost:5432/pollypm` DSN. `make perf-mscale` seeds M-scale, runs the
-HTTP scenarios, and tears the schema/workspace down via a shell trap.
+and SQL seed files for isolated Postgres schemas. Applying the SQL directly
+requires `--execute` plus `POLLYPM_PERF_PG_DSN` or `--dsn`; the scripts refuse
+the ambient `localhost:5432/pollypm` DSN and generated configs pin
+`search_path` to the fixture schema before `public`.
+
+`make perf-mscale` is the one-command gate. It creates/uses the perf database
+(`POLLYPM_PERF_DB`, default `pollypm_perf`) and schema
+(`POLLYPM_PERF_SCHEMA`, default `pollypm_perf_m`), applies workspace and
+Postgres migrations, seeds M-scale, starts an isolated `pm serve` on an
+ephemeral non-8765 loopback port, measures
+`dashboard,sessions,messages,task-list,task-detail,inbox`, then stops the server
+and drops the schema/workspace. Override the measured scenarios with
+`POLLYPM_PERF_SCENARIOS`, sample count with `POLLYPM_PERF_SAMPLES`, or pass a
+URL-style isolated DSN via `POLLYPM_PERF_PG_DSN`.
+
+The M-scale gate warms `/api/v1/dashboard` once before the measured warm
+samples. That keeps the steady-state p95 gate separate from the known cold
+first-hit snapshot cost seen after a fresh server start; the harness does not
+optimize that product/runtime cold path.
 
 Named scenarios:
 

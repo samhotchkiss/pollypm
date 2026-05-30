@@ -117,6 +117,8 @@ The current event families are:
 | `account.failover.failed` | supervisor hard recovery when every failover candidate fails launch | `session`, `failure_type`, `from`, `reason`, `last_error` |
 | `audit.finding` | audit watchdog findings | `rule`, `message`, `recommendation`, plus rule-specific data |
 | `audit.finding_dismissed` | `pm audit dismiss-finding` false-positive resolution | `rule`, `reason`, `source`, `scope` |
+| `audit.stuck_draft_terminated` | stuck-draft terminator when one subject crosses the repeat threshold | `rule`, `prior_finding_count`, `threshold`, `recommendation` |
+| `audit.stuck_draft_reclaimed` | stuck-draft terminator after it cancels a watchdog-owned draft | `rule`, `prior_finding_count`, `threshold`, `action`, `created_by`, `reason` |
 | `agent.injection.flagged` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |
 | `agent.refusal` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |
 | `worker.session_reaped` | worker marker reaper | `window_name`, `marker_path`, `reason` |
@@ -162,6 +164,11 @@ an alert keyed by `(rule, project, subject)`.
 Several auto-unstick rules can dispatch a structured brief to the project's
 architect. Dispatch is throttled for 30 minutes by reading prior
 `watchdog.escalation_dispatched` events from the audit log itself.
+After three prior `stuck_draft` findings for the same subject, the watchdog
+emits `audit.stuck_draft_terminated` and suppresses further findings for that
+subject. If the underlying task is still a draft and was created by
+`audit_watchdog` or by a legacy empty creator, the terminator also cancels it
+and emits `audit.stuck_draft_reclaimed`.
 
 When a finding is a real false positive rather than stale state, record the
 terminal judgment with `pm audit dismiss-finding <rule> <project> --reason

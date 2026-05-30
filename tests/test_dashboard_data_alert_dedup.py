@@ -90,6 +90,100 @@ def test_actionable_alert_filter_drops_stale_watchdog_queue_alerts() -> None:
     assert is_user_actionable_alert(live_alert, context=live_context)
 
 
+def test_actionable_count_excludes_recovery_warns_on_untracked_projects() -> None:
+    """#2475 — the operator-Home "N things need you" headline must count
+    only operator-actionable items. System-internal recovery watchdog
+    warns (``plan_missing`` / ``worker_session_gap`` /
+    ``missing_task_worker``) firing on stale / archived / synthetic test
+    projects are recovery signals the heartbeat cascade auto-handles, so
+    they're excluded from the count. The same warns on a tracked project
+    stay actionable, and a genuine operator-decision alert is never
+    demoted.
+    """
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        count_user_actionable_alerts,
+        is_user_actionable_alert,
+        user_actionable_alerts,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset(
+            {"polly_remote", "pm_test_alpha", "ghost", "queuestorm-beta"}
+        ),
+        tracked_projects=frozenset({"polly_remote"}),
+    )
+
+    # Operator-actionable: a genuine decision alert on a tracked project.
+    operator_decision = SimpleNamespace(
+        session_name="architect-polly_remote",
+        alert_type="worker_question",
+        message="Worker needs a scope call on polly_remote/14.",
+    )
+    # Operator-actionable: recovery warn, but on a TRACKED project — the
+    # operator may legitimately want to claim its queued work.
+    tracked_gap = SimpleNamespace(
+        session_name="worker_session_gap-polly_remote",
+        alert_type="worker_session_gap",
+        message="Project polly_remote has 3 queued tasks but no workers.",
+    )
+
+    # System-internal recovery noise on stale / test projects — excluded.
+    stale_plan_missing = SimpleNamespace(
+        session_name="plan_gate-pm_test_alpha",
+        alert_type="plan_missing",
+        message="Project pm_test_alpha has queued tasks but no plan.",
+    )
+    stale_worker_gap = SimpleNamespace(
+        session_name="worker_session_gap-ghost",
+        alert_type="worker_session_gap",
+        message="Project ghost has 2 queued tasks but no workers.",
+    )
+    stale_missing_worker = SimpleNamespace(
+        session_name="missing_task_worker-queuestorm-beta/7",
+        alert_type="missing_task_worker",
+        message="Task queuestorm-beta/7 is in_progress but its worker died.",
+    )
+
+    alerts = [
+        operator_decision,
+        tracked_gap,
+        stale_plan_missing,
+        stale_worker_gap,
+        stale_missing_worker,
+    ]
+
+    # Only the two tracked/operator-actionable items survive the filter.
+    assert is_user_actionable_alert(operator_decision, context=context)
+    assert is_user_actionable_alert(tracked_gap, context=context)
+    assert not is_user_actionable_alert(stale_plan_missing, context=context)
+    assert not is_user_actionable_alert(stale_worker_gap, context=context)
+    assert not is_user_actionable_alert(stale_missing_worker, context=context)
+
+    surviving = user_actionable_alerts(alerts, context=context)
+    assert surviving == [operator_decision, tracked_gap]
+    assert count_user_actionable_alerts(alerts, context=context) == 2
+
+
+def test_recovery_warn_stays_actionable_without_tracked_set() -> None:
+    """#2475 guard: with no ``tracked_projects`` set we can't tell stale
+    from live, so a recovery warn is left actionable rather than
+    over-suppressed (fail-open, not fail-closed)."""
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    warn = SimpleNamespace(
+        session_name="plan_gate-ghost",
+        alert_type="plan_missing",
+        message="Project ghost has queued tasks but no plan.",
+    )
+    # No tracked_projects provided.
+    assert is_user_actionable_alert(warn, context=AlertActionabilityContext())
+    assert is_user_actionable_alert(warn)
+
+
 def test_session_description_skips_claude_tui_bottom_bar(tmp_path) -> None:
     """The polly-dashboard "Now" section was rendering every idle
     session as ``"⏵⏵ bypass permissions on (shift+tab to cycle)"`` —

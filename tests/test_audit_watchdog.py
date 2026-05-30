@@ -822,6 +822,181 @@ def test_stuck_draft_terminator_counts_central_findings_when_project_log_misses(
     assert len(terminator_rows) == 1
 
 
+def test_stuck_draft_backfill_reclaims_prior_terminated_watchdog_draft(
+    now: datetime,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2458: a pre-existing terminator row must still reclaim a draft.
+
+    #2457 reclaimed only on the first termination edge. Backlog drafts
+    that were already terminated before that code landed never crossed
+    the edge again, so they stayed in draft forever.
+    """
+    from pollypm.audit.log import emit as audit_emit
+
+    project = "demo"
+    project_path = tmp_path / project
+    (project_path / ".pollypm").mkdir(parents=True)
+    subject = f"{project}/42"
+    prior_count = STUCK_DRAFT_TERMINATOR_THRESHOLD + 2
+
+    audit_emit(
+        event=EVENT_STUCK_DRAFT_TERMINATED,
+        project=project,
+        subject=subject,
+        actor="audit_watchdog",
+        status="warn",
+        metadata={
+            "rule": RULE_STUCK_DRAFT,
+            "prior_finding_count": prior_count,
+            "threshold": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        },
+        project_path=project_path,
+    )
+
+    class _Status:
+        value = "draft"
+
+    class _Task:
+        task_number = 42
+        work_status = _Status()
+        created_by = None
+
+        def __init__(self, project_key: str = project) -> None:
+            self.project = project_key
+
+    emitted: list[dict[str, object]] = []
+    cancel_calls: list[tuple[str, str, str]] = []
+    factory_calls: list[dict[str, object]] = []
+
+    def _record(**kwargs: object) -> None:
+        emitted.append(kwargs)
+
+    class _Service:
+        def __enter__(self) -> "_Service":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def get(self, task_id: str) -> _Task:
+            assert task_id == subject
+            return _Task()
+
+        def cancel(self, task_id: str, actor: str, reason: str) -> _Task:
+            cancel_calls.append((task_id, actor, reason))
+            return _Task()
+
+    def _factory(**kwargs: object) -> _Service:
+        factory_calls.append(kwargs)
+        return _Service()
+
+    monkeypatch.setattr("pollypm.audit.log.emit", _record)
+    monkeypatch.setattr("pollypm.work.create_work_service", _factory)
+
+    findings = scan_project(
+        project,
+        project_path=project_path,
+        now=now,
+        open_tasks=[_Task()],
+    )
+
+    assert findings == []
+    assert factory_calls == [
+        {"project_path": project_path, "project_key": project},
+    ]
+    assert len(cancel_calls) == 1
+    task_id, actor, reason = cancel_calls[0]
+    assert task_id == subject
+    assert actor == "audit_watchdog"
+    assert str(prior_count) in reason
+    assert [event["event"] for event in emitted] == [
+        EVENT_STUCK_DRAFT_RECLAIMED,
+    ]
+    assert emitted[0]["metadata"] == {
+        "rule": RULE_STUCK_DRAFT,
+        "prior_finding_count": prior_count,
+        "threshold": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        "action": "cancelled",
+        "created_by": None,
+        "reason": reason,
+    }
+
+
+def test_stuck_draft_backfill_preserves_human_owned_prior_terminated_draft(
+    now: datetime,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.audit.log import emit as audit_emit
+
+    project = "demo"
+    project_path = tmp_path / project
+    (project_path / ".pollypm").mkdir(parents=True)
+    subject = f"{project}/43"
+
+    audit_emit(
+        event=EVENT_STUCK_DRAFT_TERMINATED,
+        project=project,
+        subject=subject,
+        actor="audit_watchdog",
+        status="warn",
+        metadata={
+            "rule": RULE_STUCK_DRAFT,
+            "prior_finding_count": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+            "threshold": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+        },
+        project_path=project_path,
+    )
+
+    class _Status:
+        value = "draft"
+
+    class _Task:
+        task_number = 43
+        work_status = _Status()
+        created_by = "samhotchkiss"
+
+        def __init__(self, project_key: str = project) -> None:
+            self.project = project_key
+
+    emitted: list[dict[str, object]] = []
+    cancel_calls: list[tuple[str, str, str]] = []
+
+    class _Service:
+        def __enter__(self) -> "_Service":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def get(self, task_id: str) -> _Task:
+            assert task_id == subject
+            return _Task()
+
+        def cancel(self, task_id: str, actor: str, reason: str) -> _Task:
+            cancel_calls.append((task_id, actor, reason))
+            return _Task()
+
+    monkeypatch.setattr("pollypm.audit.log.emit", lambda **kw: emitted.append(kw))
+    monkeypatch.setattr(
+        "pollypm.work.create_work_service",
+        lambda **_: _Service(),
+    )
+
+    findings = scan_project(
+        project,
+        project_path=project_path,
+        now=now,
+        open_tasks=[_Task()],
+    )
+
+    assert findings == []
+    assert cancel_calls == []
+    assert emitted == []
+
+
 def test_stuck_draft_event_path_cross_checks_open_tasks_status(now: datetime) -> None:
     """#1869: when ``open_tasks`` is supplied, the event-based fallback
     must not fire for tasks that are no longer in draft state.

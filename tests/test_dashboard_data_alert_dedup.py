@@ -11,6 +11,7 @@ for non-faults the user already sees as yellow.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from pollypm.dashboard_data import _stuck_alert_already_user_waiting
@@ -182,6 +183,134 @@ def test_recovery_warn_stays_actionable_without_tracked_set() -> None:
     # No tracked_projects provided.
     assert is_user_actionable_alert(warn, context=AlertActionabilityContext())
     assert is_user_actionable_alert(warn)
+
+
+def test_recovery_warn_demotes_tracked_but_dormant_project() -> None:
+    """#2480 — trackedness is not a liveness signal.
+
+    A dead project can remain ``tracked=True`` while watchdog churn keeps
+    touching its tasks. Recovery/hygiene warns on such projects should
+    not inflate the operator "needs you" headline unless the project has
+    recent real completed work.
+    """
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"polly_remote", "savethenovel"}),
+        tracked_projects=frozenset({"polly_remote", "savethenovel"}),
+        recent_real_work_projects=frozenset({"savethenovel"}),
+    )
+
+    dormant_recovery_warn = SimpleNamespace(
+        session_name="worker_session_gap-polly_remote",
+        alert_type="worker_session_gap",
+        message="Project polly_remote has 3 queued tasks but no workers.",
+    )
+    active_recovery_warn = SimpleNamespace(
+        session_name="worker_session_gap-savethenovel",
+        alert_type="worker_session_gap",
+        message="Project savethenovel has 2 queued tasks but no workers.",
+    )
+    operator_decision = SimpleNamespace(
+        session_name="architect-polly_remote",
+        alert_type="worker_question",
+        message="Worker needs a scope call.",
+    )
+
+    assert not is_user_actionable_alert(dormant_recovery_warn, context=context)
+    assert is_user_actionable_alert(active_recovery_warn, context=context)
+    assert is_user_actionable_alert(operator_decision, context=context)
+
+
+def test_queue_without_motion_demotes_tracked_project_without_recent_real_work() -> None:
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"polly_remote"}),
+        tracked_projects=frozenset({"polly_remote"}),
+        recent_real_work_projects=frozenset(),
+        project_task_counts={"polly_remote": {"queued": 12}},
+    )
+    qwm_alert = SimpleNamespace(
+        session_name="audit-queue_without_motion-polly_remote-polly_remote",
+        alert_type="audit_watchdog",
+        message="Project polly_remote has 12 queued task(s) but no motion.",
+    )
+
+    assert not is_user_actionable_alert(qwm_alert, context=context)
+
+
+def test_worktree_state_demotes_tracked_project_without_recent_real_work() -> None:
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"polly_remote"}),
+        tracked_projects=frozenset({"polly_remote"}),
+        recent_real_work_projects=frozenset(),
+    )
+    warn = SimpleNamespace(
+        session_name="worker-polly_remote-9",
+        alert_type="worktree_state:polly_remote/9:dirty_stale",
+        message="Worker worktree has stale dirty changes.",
+    )
+
+    assert not is_user_actionable_alert(warn, context=context)
+
+
+def test_alert_filter_task_facts_use_recent_done_for_liveness(monkeypatch) -> None:
+    from pollypm import dashboard_data
+
+    now = datetime.now(UTC)
+    grouped = {
+        "active": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=1),
+            )
+        ],
+        "dormant": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=14),
+            ),
+            SimpleNamespace(
+                work_status="queued",
+                updated_at=now,
+            ),
+        ],
+    }
+    config = SimpleNamespace(projects={"active": object(), "dormant": object()})
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_grouped",
+        lambda _config: grouped,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_for_project",
+        lambda data, _config, key: data[key],
+    )
+
+    facts = dashboard_data._project_task_facts_for_alert_filter(
+        config,
+        [
+            SimpleNamespace(
+                session_name="worker_session_gap-active",
+                alert_type="worker_session_gap",
+            )
+        ],
+    )
+
+    assert facts.recent_real_work_projects == frozenset({"active"})
+    assert facts.project_task_counts["dormant"]["queued"] == 1
 
 
 def test_session_description_skips_claude_tui_bottom_bar(tmp_path) -> None:

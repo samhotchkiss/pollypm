@@ -20,6 +20,16 @@ from .shared import (
 
 logger = logging.getLogger(__name__)
 
+_PANE_PATTERN_LIVE_TASK_STATUSES = (
+    "draft",
+    "queued",
+    "in_progress",
+    "rework",
+    "blocked",
+    "on_hold",
+    "review",
+)
+
 
 def _resolve_sweep_target(
     *,
@@ -597,6 +607,7 @@ def _pane_text_classify_body(
     alerts_raised = 0
     alerts_cleared = 0
     inbox_items_emitted = 0
+    inbox_items_resolved = 0
     context_audit_events_emitted = 0
     capture_failures = 0
     pm_turn_transitions = 0  # #1633 — active → ended PM turn flips this tick.
@@ -758,6 +769,18 @@ def _pane_text_classify_body(
                         "pane_text_classify: clear_alert failed for %s/%s",
                         session_name, alert_type, exc_info=True,
                     )
+                if rule_name == "ask_user_decision" and work_service is not None:
+                    inbox_items_resolved += _resolve_pane_pattern_inbox_items(
+                        work_service=work_service,
+                        session_name=session_name,
+                        rule_name=rule_name,
+                        project_key=_pane_pattern_project_key(
+                            services=services,
+                            handle=handle,
+                            session_name=session_name,
+                        ),
+                        msg_store=msg_store,
+                    )
 
     return {
         "outcome": "swept",
@@ -765,6 +788,7 @@ def _pane_text_classify_body(
         "alerts_raised": alerts_raised,
         "alerts_cleared": alerts_cleared,
         "inbox_items_emitted": inbox_items_emitted,
+        "inbox_items_resolved": inbox_items_resolved,
         "context_audit_events_emitted": context_audit_events_emitted,
         "capture_failures": capture_failures,
         "match_counts": match_counts,
@@ -869,6 +893,113 @@ def _pane_pattern_project_key(
     return "inbox"
 
 
+def _open_pane_pattern_inbox_tasks(
+    *,
+    work_service: Any,
+    dedupe_label: str,
+    target_project: str,
+) -> list[Any]:
+    list_fn = getattr(work_service, "list_tasks", None)
+    if not callable(list_fn):
+        return []
+
+    matches: list[Any] = []
+    seen_task_ids: set[str] = set()
+    for status in _PANE_PATTERN_LIVE_TASK_STATUSES:
+        try:
+            tasks = list_fn(work_status=status, project=target_project)
+        except TypeError:
+            tasks = list_fn(work_status=status)
+        for task in tasks or []:
+            labels = {str(label) for label in (getattr(task, "labels", None) or [])}
+            if dedupe_label not in labels:
+                continue
+            task_project = str(getattr(task, "project", "") or "")
+            if task_project and task_project != target_project:
+                continue
+            task_id = str(getattr(task, "task_id", "") or "")
+            if task_id and task_id in seen_task_ids:
+                continue
+            if task_id:
+                seen_task_ids.add(task_id)
+            matches.append(task)
+    return matches
+
+
+def _resolve_pane_pattern_inbox_items(
+    *,
+    work_service: Any,
+    session_name: str,
+    rule_name: str,
+    project_key: str,
+    msg_store: Any = None,
+) -> int:
+    if rule_name != "ask_user_decision":
+        return 0
+
+    archive_fn = getattr(work_service, "archive_task", None)
+    if not callable(archive_fn):
+        logger.debug(
+            "pane_text_classify: archive_task unavailable for resolved %s/%s",
+            session_name, rule_name,
+        )
+        return 0
+
+    dedupe_label = f"pane_pattern:{rule_name}:{session_name}"
+    target_project = project_key
+    try:
+        candidates = _open_pane_pattern_inbox_tasks(
+            work_service=work_service,
+            dedupe_label=dedupe_label,
+            target_project=target_project,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "pane_text_classify: resolved inbox scan failed for %s",
+            dedupe_label, exc_info=True,
+        )
+        return 0
+
+    resolved = 0
+    for task in candidates:
+        task_id = str(getattr(task, "task_id", "") or "")
+        if not task_id:
+            continue
+        try:
+            archive_fn(task_id, actor="pane_text_classify", strict=False)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "pane_text_classify: resolved inbox archive failed for %s",
+                task_id, exc_info=True,
+            )
+            continue
+        resolved += 1
+        if msg_store is not None:
+            try:
+                msg_store.append_event(
+                    scope=session_name,
+                    sender=session_name,
+                    subject="pane.classify.inbox_resolved",
+                    payload={
+                        "message": (
+                            f"resolved inbox task {task_id} after "
+                            f"rule '{rule_name}' cleared"
+                        ),
+                        "task_id": task_id,
+                        "rule": rule_name,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "pane_text_classify: inbox_resolved audit append failed "
+                    "for %s/%s",
+                    session_name,
+                    rule_name,
+                    exc_info=True,
+                )
+    return resolved
+
+
 def _emit_pane_pattern_inbox_item(
     *,
     work_service: Any,
@@ -884,19 +1015,12 @@ def _emit_pane_pattern_inbox_item(
     target_project = project_key if rule_name == "ask_user_decision" else "inbox"
 
     try:
-        list_fn = getattr(work_service, "list_tasks", None)
-        if callable(list_fn):
-            for status in ("queued", "in_progress", "draft", "review"):
-                try:
-                    tasks = list_fn(
-                        work_status=status, project=target_project,
-                    )
-                except TypeError:
-                    tasks = list_fn(work_status=status)
-                for task in tasks or []:
-                    labels = getattr(task, "labels", None) or []
-                    if dedupe_label in labels:
-                        return False
+        if _open_pane_pattern_inbox_tasks(
+            work_service=work_service,
+            dedupe_label=dedupe_label,
+            target_project=target_project,
+        ):
+            return False
     except Exception:  # noqa: BLE001
         logger.debug(
             "pane_text_classify: dedupe scan failed for %s",

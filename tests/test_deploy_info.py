@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pollypm.deploy_info as deploy_info
@@ -12,6 +13,22 @@ from pollypm.deploy_info import RuntimeBuildInfo, assess_deploy_staleness
 def _write(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_commit(repo: Path, message: str) -> str:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
 
 
 def test_assess_deploy_staleness_detects_copied_package_drift(tmp_path: Path) -> None:
@@ -113,13 +130,17 @@ def test_runtime_build_info_reads_embedded_served_git_sha(
     assert info.served_git_commit_time == "2026-05-29T12:00:00+00:00"
 
 
-def test_runtime_code_fingerprint_prefers_imported_package_git_head(
+def test_runtime_code_fingerprint_tracks_imported_package_tree_commit(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    package_path = tmp_path / "checkout" / "src" / "pollypm"
-    _write(package_path / "__init__.py", "")
     checkout = tmp_path / "checkout"
+    package_path = checkout / "src" / "pollypm"
+    _write(package_path / "__init__.py", "")
+    _git(checkout, "init")
+    _git(checkout, "config", "user.email", "codex@example.invalid")
+    _git(checkout, "config", "user.name", "Codex")
+    first_source_sha = _git_commit(checkout, "initial package")
 
     monkeypatch.setattr(
         deploy_info,
@@ -131,15 +152,29 @@ def test_runtime_code_fingerprint_prefers_imported_package_git_head(
         "_distribution_info",
         lambda _package_name: ("1", tmp_path / "pollypm-1.dist-info", None),
     )
-    monkeypatch.setattr(deploy_info, "_git_root", lambda path: checkout)
-    monkeypatch.setattr(deploy_info, "_git_head", lambda path: "abc123")
 
     fingerprint = deploy_info.runtime_code_fingerprint()
 
     assert fingerprint is not None
-    assert fingerprint.kind == "served_git_sha"
-    assert fingerprint.value == "abc123"
+    assert fingerprint.kind == "served_package_git_sha"
+    assert fingerprint.value == first_source_sha
     assert fingerprint.source_checkout == str(checkout)
+
+    _write(checkout / "docs" / "journal.md", "docs-only\n")
+    _git_commit(checkout, "docs only")
+
+    docs_fingerprint = deploy_info.runtime_code_fingerprint()
+
+    assert docs_fingerprint is not None
+    assert docs_fingerprint.value == first_source_sha
+
+    _write(package_path / "feature.py", "VALUE = 'new'\n")
+    second_source_sha = _git_commit(checkout, "package change")
+
+    source_fingerprint = deploy_info.runtime_code_fingerprint()
+
+    assert source_fingerprint is not None
+    assert source_fingerprint.value == second_source_sha
 
 
 def test_runtime_code_fingerprint_uses_embedded_sha_without_git_root(

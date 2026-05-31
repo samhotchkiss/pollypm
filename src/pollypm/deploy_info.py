@@ -163,6 +163,20 @@ def _git_head_time(path: Path | None) -> str | None:
     return _git_value(path, ["show", "-s", "--format=%cI", "HEAD"])
 
 
+def _git_latest_commit_for_path(git_root: Path, path: Path | None) -> str | None:
+    if path is None:
+        return None
+    root = _safe_resolve(git_root)
+    target = _safe_resolve(path)
+    if not _path_is_relative_to(target, root):
+        return None
+    rel = target.relative_to(root).as_posix() or "."
+    rc, out = _run_git(root, ["log", "-1", "--format=%H", "--", rel])
+    if rc != 0 or not out:
+        return None
+    return out
+
+
 def _iso_from_mtime(mtime: float) -> str:
     return datetime.fromtimestamp(mtime, tz=UTC).isoformat().replace("+00:00", "Z")
 
@@ -413,10 +427,11 @@ def runtime_code_fingerprint(
 
     This intentionally avoids :func:`runtime_build_info`'s package-tree
     mtime scan so long-lived processes can call it periodically. The
-    preferred signal is the git HEAD of the imported package path, which
-    covers editable installs. Non-editable installs fall back to the
-    embedded build SHA written into shipped packages, then to a package
-    directory mtime token as a last resort.
+    preferred signal is the latest git commit that touched the imported
+    package tree, which covers editable installs without forcing a
+    long-lived daemon to re-exec for docs-only commits. Non-editable
+    installs fall back to the embedded build SHA written into shipped
+    packages, then to a package directory mtime token as a last resort.
     """
 
     package_path, package_file = _package_location(import_name)
@@ -431,10 +446,10 @@ def runtime_code_fingerprint(
 
     served_git_root = _git_root(package_path)
     if served_git_root is not None:
-        served_git_sha = _git_head(served_git_root)
+        served_git_sha = _git_latest_commit_for_path(served_git_root, package_path)
         if served_git_sha:
             return RuntimeCodeFingerprint(
-                kind="served_git_sha",
+                kind="served_package_git_sha",
                 value=served_git_sha,
                 package_path=str(package_path) if package_path else None,
                 source_checkout=str(served_git_root),
@@ -452,10 +467,11 @@ def runtime_code_fingerprint(
     if direct_url_editable is True and direct_url_source is not None:
         source_root = _git_root(direct_url_source)
         if source_root is not None:
-            source_sha = _git_head(source_root)
+            source_package_root = _source_package_root(source_root, package_name)
+            source_sha = _git_latest_commit_for_path(source_root, source_package_root)
             if source_sha:
                 return RuntimeCodeFingerprint(
-                    kind="editable_source_git_sha",
+                    kind="editable_source_package_git_sha",
                     value=source_sha,
                     package_path=str(package_path) if package_path else None,
                     source_checkout=str(source_root),

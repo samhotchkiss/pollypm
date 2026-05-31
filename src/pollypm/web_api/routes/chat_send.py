@@ -85,6 +85,9 @@ from pollypm.audit.log import EVENT_CHAT_SEND_FORCE_BYPASS, emit as audit_emit
 from pollypm.tmux.client import DeadPaneError, TmuxClient
 from pollypm.web_api.chat import (
     ChatSurface,
+    MessageEnvelope,
+    MessageType,
+    capture_envelopes,
     find_chat_surface,
 )
 from pollypm.web_api.errors import APIError
@@ -1122,6 +1125,39 @@ def _find_ask_user_envelope(
     return None
 
 
+def _find_live_capture_ask_user_envelope(
+    tmux: Any,
+    *,
+    session_name: str,
+    target: str,
+    actor_fallback: str,
+    answer_to: str,
+) -> dict[str, Any] | None:
+    """Locate a live capture-sourced ask_user envelope matching ``answer_to``."""
+
+    if not _is_capture_answer_id(answer_to):
+        return None
+    envelopes = capture_envelopes(
+        tmux,
+        session_name=session_name,
+        target=target,
+        actor_fallback=actor_fallback,
+    )
+    for envelope in reversed(envelopes):
+        if envelope.type == MessageType.ASK_USER and envelope.id == answer_to:
+            return _capture_envelope_event(envelope)
+    return None
+
+
+def _capture_envelope_event(envelope: MessageEnvelope) -> dict[str, Any]:
+    metadata = dict(envelope.metadata or {})
+    return {
+        "event_type": "capture_ask_user",
+        "id": envelope.id,
+        "metadata": metadata,
+    }
+
+
 def _is_capture_answer_id(answer_to: str | None) -> bool:
     return isinstance(answer_to, str) and answer_to.startswith("cap_")
 
@@ -1561,6 +1597,7 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
     if needs_transcript:
         events_path, resolution = _resolve_session_events(surface, project_root)
     ask_envelope: dict[str, Any] | None = None
+    ask_envelope_from_capture = False
     ask_exempt_ids: set[str] = set()
     transcript_unavailable_detail: str | None = None
     if body.answer_to is not None:
@@ -1586,6 +1623,15 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
             raw_id = _event_message_id(ask_envelope)
             if isinstance(raw_id, str) and raw_id:
                 ask_exempt_ids.add(raw_id)
+        elif _is_capture_answer_id(body.answer_to):
+            ask_envelope = _find_live_capture_ask_user_envelope(
+                tmux,
+                session_name=session_name,
+                target=target,
+                actor_fallback=surface.persona or "agent",
+                answer_to=body.answer_to,
+            )
+            ask_envelope_from_capture = ask_envelope is not None
 
     # 3. Safety gates (§4.1, §4.3) — use the exact session transcript
     # (Codex review block 3).
@@ -1601,7 +1647,7 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
                 exempt_tool_ids=ask_exempt_ids,
             )
     else:
-        if resolution == "absent_but_others_exist":
+        if resolution == "absent_but_others_exist" and not ask_envelope_from_capture:
             # Strict and loose both require an exact transcript
             # mapping. Other transcripts exist for the project but
             # none fingerprints to this surface — the operator is

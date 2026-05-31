@@ -220,7 +220,7 @@ Pull a window of messages from a single session's transcript.
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
 | `include_subagents` | `false` | When `true`, each `subagent_result` envelope's `metadata.subagent_transcript` is populated by parsing the raw Claude JSONL the parent `task-notification.output-file` points at. Paths outside the project/workspace transcript allowlist are silently skipped. Capped per envelope. (#2052) |
 | `include_thinking` | `false` | When `true`, Anthropic extended-thinking blocks are emitted as `type=thinking` envelopes alongside the normal turns. Default `false` preserves the historical envelope contract so existing clients see no new types unless they opt in. See §4 type catalog and #2082. |
-| `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
+| `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale, plus a live AskUserQuestion capture probe for the newest page), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
 
 > Note: `thinking` envelopes are gated behind `?include_thinking=true`.
 > Clients that do not pass the flag will not see `type="thinking"`
@@ -362,7 +362,7 @@ It does **not** bypass pane/window validation: `409 pane_invalid`,
 | 503 | `tmux_unavailable` | tmux binary not found or unresponsive (`FileNotFoundError`, `TimeoutExpired`, `CalledProcessError`). |
 | 503 | `send_failed` | tmux `send_keys` raised a generic error (paste-buffer fail, `OSError` post-validation). |
 | 503 | `service_unavailable` | Worker session lookup failed (work-service outage). Only emitted for worker `session_name`s. |
-| 400 | `answer_to_missing` | `answer_to` id was not found in the session's recent transcript. |
+| 400 | `answer_to_missing` | `answer_to` id was not found in the session's recent transcript or live capture. |
 | 400 | `selections_no_question` | `answer_to` references a message that isn't an `ask_user` envelope. |
 | 400 | `selections_invalid` | One or more selections don't match the question's option labels. Response message includes the valid options. |
 | 400 | `invalid_request` | Catch-all for body-shape problems: missing `text` when `answer_to` is unset; `answer_to` set but no `selections`/`text`/`notes` supplied; etc. The message body identifies the specific problem. |
@@ -649,7 +649,9 @@ pane, list them via `tmux list-panes -t <window>` on the daemon host.
 ### 5.5 Answering `AskUserQuestion`
 
 The agent emitted an `ask_user` envelope (§4). In Claude Code's UI,
-the user clicks a button; in tmux, the user types the option label.
+the user clicks a button; in tmux, PollyPM either types the option
+label for JSONL-sourced questions or drives the visible TUI picker for
+capture-sourced `cap_*` questions.
 
 ```json
 {
@@ -667,20 +669,23 @@ Translation rules:
 - Multi-select `selections: ["a", "b"]` → typed as newline-separated
   labels. If your install needs a different delimiter, fall back to
   plain `text`.
+- For a live capture-sourced AskUserQuestion (`answer_to` starts
+  `cap_`), selections are translated to the option numbers/tabs needed
+  by Claude Code's visible TUI form, then submitted with Enter.
 
 If a selection label doesn't exactly match any option, the API returns
 `400 selections_invalid` with the valid labels in the response body.
 
-**AskUserQuestion answer format.** The shipped `_build_answer_text`
-(chat_send.py) joins selected option labels with newlines. If `notes`
-is provided, it's appended after another newline. The trailing newline
-is controlled by `press_enter` (default true). Example:
+**AskUserQuestion answer format.** For JSONL-sourced questions, the
+shipped `_build_answer_text` (chat_send.py) joins selected option
+labels with newlines. If `notes` is provided, it's appended after
+another newline. The trailing newline is controlled by `press_enter`
+(default true). Example:
 `selections=["A", "B"]`, `notes="extra context"`, `press_enter=true`
-produces stdin = `"A\nB\nextra context\n"`. If Claude Code's actual
-stdin parser turns out to expect something different (e.g., option
-index instead of label), file a follow-up issue rather than blocking;
-clients can also send freeform `text` instead of structured
-`selections` to test other formats.
+produces stdin = `"A\nB\nextra context\n"`. For `cap_*` questions,
+`_build_capture_answer_text` maps labels to the visible option numbers
+and tabs to Submit. Clients can also send freeform `text` instead of
+structured `selections` to test other formats.
 
 ```
 # Answer an ask_user message with a selection (positional text="" required):
@@ -699,10 +704,13 @@ always included in the GET response (phase 1 has no
 silently if the user might wonder why the conversation "jumps" —
 render at least a horizontal rule.
 
-### 5.7 Stale JSONL → tmux capture fallback
+### 5.7 Live tmux capture fallback
 
 The JSONL exists but hasn't been written for >60s and the tmux pane is
-live — usually means Claude Code hasn't flushed mid-stream.
+live — usually means Claude Code hasn't flushed mid-stream. The same
+capture path is also used when the newest default `source=auto` page
+sees a live AskUserQuestion form in the pane before the corresponding
+`tool_use` has flushed to JSONL.
 
 **Behavior (under `source=auto`):** fall back to
 `tmux capture-pane -p -S -3000`. Each captured line becomes one
@@ -712,7 +720,9 @@ synthetic (`cap_<hash>`), stable across reads.
 Source-mode behavior:
 
 - `source=auto` (default): JSONL archive first, capture-pane fallback
-  on stale/missing. Fail-soft — returns empty `messages` if both fail.
+  on stale/missing, and for the newest page when a live AskUserQuestion
+  menu is visible but not yet flushed to JSONL. Fail-soft — returns
+  empty `messages` if both fail.
 - `source=jsonl` (explicit): JSONL only. Returns `404 archive_missing`
   if absent, `503 archive_unreadable` on read failure.
 - `source=capture` (explicit): tmux capture only. Returns
@@ -767,9 +777,10 @@ ingestor used for Claude:
 - The route's source selection in
   `chat_messages.py::_load_envelopes` is **provider-agnostic**. It
   prefers the JSONL archive under `source=auto` and only falls
-  through to `tmux capture-pane` when the archive is stale or
-  unreadable (the §5.7 staleness rule). There is no `provider ==
-  "codex"` short-circuit.
+  through to `tmux capture-pane` when the archive is stale/unreadable
+  or when the live AskUserQuestion probe finds an answerable menu (the
+  §5.7 fallback rule). There is no `provider == "codex"`
+  short-circuit.
 - The capture-pane fallback is therefore a freshness safety net for
   **any** provider whose ingestor lags the live pane — not a
   provider-specific code path.

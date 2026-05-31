@@ -77,6 +77,8 @@ class FakeTmuxClient:
     send_side_effect: Exception | None = None
     send_calls: list[tuple[str, str, bool]] = []
     send_enter_delays: list[float] = []
+    captures_by_target: dict[str, str] = {}
+    capture_calls: list[tuple[str, int]] = []
     list_panes_side_effect: Exception | None = None
     list_windows_side_effect: Exception | None = None
 
@@ -91,6 +93,10 @@ class FakeTmuxClient:
         # Tests register panes by either window target ("session:window")
         # or session, depending on the call shape; check both.
         return list(self.panes_by_target.get(target, []))
+
+    def capture_pane(self, target: str, lines: int = 3000) -> str:
+        self.capture_calls.append((target, lines))
+        return self.captures_by_target.get(target, "")
 
     def send_keys(
         self,
@@ -113,6 +119,8 @@ def _reset_fake_tmux():
     FakeTmuxClient.send_side_effect = None
     FakeTmuxClient.send_calls = []
     FakeTmuxClient.send_enter_delays = []
+    FakeTmuxClient.captures_by_target = {}
+    FakeTmuxClient.capture_calls = []
     FakeTmuxClient.list_panes_side_effect = None
     FakeTmuxClient.list_windows_side_effect = None
     yield
@@ -1108,6 +1116,38 @@ def _ask_user_event(
     }
 
 
+LIVE_ASK_USER_PANE = """\
+Ready to choose.
+──────────────────────────────────────────────────────────────────────────────
+←  ☐ Pick one  ✔ Submit  →
+
+Which option should I use?
+
+❯ 1. alpha
+  2. bravo
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+
+
+def _capture_ask_user_id(session_name: str, pane_text: str) -> str:
+    class OneShotCapture:
+        def capture_pane(self, target: str, lines: int = 3000) -> str:  # noqa: ARG002
+            return pane_text
+
+    envelopes = chat_send_routes.capture_envelopes(
+        OneShotCapture(),
+        session_name=session_name,
+        target="x",
+    )
+    ask = [env for env in envelopes if env.type == chat_send_routes.MessageType.ASK_USER]
+    assert len(ask) == 1
+    return ask[0].id
+
+
 def test_answer_to_selections_happy_path(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -1783,6 +1823,73 @@ def test_answer_to_capture_id_still_blocks_unrelated_open_tool(
 
     assert response.status_code == 409, response.json()
     assert response.json()["error"]["code"] == "unsafe_mid_tool"
+
+
+def test_answer_to_live_capture_id_works_before_tool_use_flush(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """M5/#2518 — answer a visible AskUserQuestion not yet flushed to JSONL."""
+
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(project_root, "session-live-ask", [
+        {"event_type": "assistant_turn", "payload": {"text": "I need a choice"}},
+    ], cwd=workspace_root)
+    target = "pollypm-test-storage-closet:pm-operator"
+    patched_tmux.captures_by_target[target] = LIVE_ASK_USER_PANE
+    answer_to = _capture_ask_user_id("operator", LIVE_ASK_USER_PANE)
+
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"answer_to": answer_to, "selections": ["bravo"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.json()
+    assert patched_tmux.send_calls == [(target, "2\t", True)]
+    assert patched_tmux.capture_calls == [(target, 3000)]
+
+
+def test_answer_to_live_capture_id_still_blocks_unrelated_open_tool(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(project_root, "session-live-ask-with-tool", [
+        {"event_type": "user_turn", "payload": {"text": "do work"}},
+        {
+            "event_type": "tool_call",
+            "payload": {
+                "type": "tool_use",
+                "id": "toolu_bash_open",
+                "name": "Bash",
+                "input": {"command": "sleep 5"},
+            },
+        },
+    ], cwd=workspace_root)
+    target = "pollypm-test-storage-closet:pm-operator"
+    patched_tmux.captures_by_target[target] = LIVE_ASK_USER_PANE
+    answer_to = _capture_ask_user_id("operator", LIVE_ASK_USER_PANE)
+
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"answer_to": answer_to, "selections": ["alpha"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 409, response.json()
+    assert response.json()["error"]["code"] == "unsafe_mid_tool"
+    assert patched_tmux.send_calls == []
 
 
 # ---------------------------------------------------------------------------

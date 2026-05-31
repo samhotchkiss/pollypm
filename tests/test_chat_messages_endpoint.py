@@ -1524,6 +1524,57 @@ def test_messages_endpoint_source_auto_prefers_jsonl(
     assert body["messages"][0]["id"] == "a"
 
 
+def test_messages_endpoint_source_auto_prefers_live_ask_user_capture(
+    client,
+    auth_headers,
+    patch_registry,
+    patch_parser,
+    patch_capture,
+    monkeypatch,
+    tmp_path,
+):
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "is_archive_stale",
+        lambda path, **kw: False,
+    )
+    patch_registry([_surface(
+        "architect_demo", SurfaceType.ARCHITECT, persona="Sage",
+        project="demo", transcript_path=archive, present=True,
+    )])
+    patch_parser({archive: [
+        _env("msg_text", actor="Sage", text="I need a choice."),
+    ]})
+    patch_capture([
+        _env("cap_text", actor="Sage", text="I need a choice."),
+        _env(
+            "cap_live_ask",
+            actor="Sage",
+            type_=MessageType.ASK_USER,
+            text="Which option?",
+            metadata={
+                "from_capture": True,
+                "questions": [{
+                    "question": "Which option?",
+                    "options": [{"label": "alpha"}, {"label": "bravo"}],
+                }],
+            },
+        ),
+    ])
+
+    body = client.get(
+        "/api/v1/chat/architect_demo/messages?source=auto&direction=desc",
+        headers=auth_headers,
+    ).json()
+
+    assert body["transcript_source"] == "capture"
+    assert body["messages"][0]["id"] == "cap_live_ask"
+    assert body["messages"][0]["type"] == "ask_user"
+    assert body["messages"][0]["metadata"]["questions"][0]["options"][1]["label"] == "bravo"
+
+
 def test_messages_endpoint_source_auto_falls_back_when_stale(
     client, auth_headers, patch_registry, patch_capture, monkeypatch, tmp_path,
 ):

@@ -424,10 +424,9 @@ async def get_dashboard_endpoint(
             hint="Drop ?project= to fetch the whole-system snapshot.",
         )
 
-    snapshot = await _get_dashboard_snapshot_cache(request).get_or_refresh(
-        config,
-        _load_dashboard_snapshot,
-    )
+    snapshot_cache = _get_dashboard_snapshot_cache(request)
+    sync_refresh_expected = snapshot_cache.requires_sync_refresh(config)
+    snapshot = await snapshot_cache.get_or_refresh(config, _load_dashboard_snapshot)
 
     # Projects view — list_projects is the authoritative cockpit row
     # builder; reuse it so the rollups derived below match the project
@@ -509,13 +508,23 @@ async def get_dashboard_endpoint(
     )
     # The full snapshot is intentionally stale-while-refresh. Alert counts are
     # volatile enough that an old-high value can alarm the Home headline, so
-    # refresh that one cheap counter only when we are serving an aged snapshot.
+    # refresh that one cheap counter when serving an aged snapshot or after a
+    # fully cold/max-stale rebuild. Updating ``data.alert_count`` keeps the
+    # just-refreshed cache from flapping back on immediate warm hits (#2504).
     snapshot_age = time.monotonic() - snapshot.refreshed_at_monotonic
     fresh_alert_count = (
         _fresh_dashboard_alert_count(config)
-        if snapshot_age > 2.0
+        if sync_refresh_expected or snapshot_age > 2.0
         else None
     )
+    if fresh_alert_count is not None:
+        try:
+            data.alert_count = int(fresh_alert_count)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "dashboard: failed to normalize cached alert_count",
+                exc_info=True,
+            )
 
     rollups = DashboardRollups(
         tracked_count=tracked_count,

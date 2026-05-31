@@ -185,6 +185,14 @@ def client(app) -> TestClient:
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def patch_fresh_alert_count(monkeypatch: pytest.MonkeyPatch):
+    """Keep dashboard endpoint tests isolated from live alert storage."""
+    monkeypatch.setattr(
+        dashboard_routes, "_fresh_dashboard_alert_count", lambda _config: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stub helpers
 # ---------------------------------------------------------------------------
@@ -433,6 +441,40 @@ def test_dashboard_cache_hit_skips_repeated_expensive_loads(
     assert second.status_code == 200, second.text
     assert second.json()["tokens"]["total"] == 42
     assert calls == {"list": 1, "gather": 1}
+
+
+def test_dashboard_cold_refresh_normalizes_cached_alert_count(
+    client, auth_headers, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"gather": 0, "fresh": 0}
+
+    monkeypatch.setattr(
+        dashboard_routes,
+        "list_projects",
+        lambda _config, *, operator_facing=False: [_api_project("myproj")],
+    )
+
+    def fake_gather(_config):
+        calls["gather"] += 1
+        return _make_data(alert_count=32)
+
+    def fake_fresh(_config):
+        calls["fresh"] += 1
+        return 3
+
+    monkeypatch.setattr(dashboard_routes, "_gather_dashboard", fake_gather)
+    monkeypatch.setattr(
+        dashboard_routes, "_fresh_dashboard_alert_count", fake_fresh,
+    )
+
+    first = client.get("/api/v1/dashboard", headers=auth_headers)
+    second = client.get("/api/v1/dashboard", headers=auth_headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["rollups"]["alert_count"] == 3
+    assert second.json()["rollups"]["alert_count"] == 3
+    assert calls == {"gather": 1, "fresh": 1}
 
 
 def test_dashboard_stale_cache_returns_while_refresh_runs(

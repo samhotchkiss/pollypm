@@ -47,6 +47,16 @@ class DashboardSnapshotCache:
             self._snapshots.clear()
             self._refreshing.clear()
 
+    def requires_sync_refresh(self, config: Any) -> bool:
+        """Return True when ``get_or_refresh`` would block on a reload."""
+        key = id(config)
+        with self._lock:
+            snapshot = self._snapshots.get(key)
+            if snapshot is None:
+                return True
+            age = time.monotonic() - snapshot.refreshed_at_monotonic
+            return age > self._max_stale_seconds
+
     async def get_or_refresh(
         self,
         config: Any,

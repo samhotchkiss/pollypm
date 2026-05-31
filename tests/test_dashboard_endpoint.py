@@ -477,6 +477,67 @@ def test_dashboard_cold_refresh_normalizes_cached_alert_count(
     assert calls == {"gather": 1, "fresh": 1}
 
 
+def test_dashboard_background_refresh_caches_normalized_alert_count(
+    app, client, auth_headers, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app.state.dashboard_snapshot_cache = dashboard_routes.DashboardSnapshotCache(
+        stale_after_seconds=0.01,
+        max_stale_seconds=5.0,
+    )
+    calls = {"gather": 0, "fresh": 0}
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+
+    monkeypatch.setattr(
+        dashboard_routes,
+        "list_projects",
+        lambda _config, *, operator_facing=False: [_api_project("myproj")],
+    )
+
+    def fake_gather(_config):
+        calls["gather"] += 1
+        if calls["gather"] == 1:
+            return _make_data(alert_count=3, total_tokens=1)
+        refresh_started.set()
+        assert release_refresh.wait(2.0)
+        return _make_data(alert_count=31, total_tokens=2)
+
+    def fake_fresh(_config):
+        calls["fresh"] += 1
+        return 3
+
+    monkeypatch.setattr(dashboard_routes, "_gather_dashboard", fake_gather)
+    monkeypatch.setattr(
+        dashboard_routes, "_fresh_dashboard_alert_count", fake_fresh,
+    )
+
+    first = client.get("/api/v1/dashboard", headers=auth_headers)
+    assert first.status_code == 200, first.text
+    assert first.json()["rollups"]["alert_count"] == 3
+
+    time.sleep(0.03)
+    second = client.get("/api/v1/dashboard", headers=auth_headers)
+    assert second.status_code == 200, second.text
+    assert second.json()["tokens"]["total"] == 1
+    assert second.json()["rollups"]["alert_count"] == 3
+    assert refresh_started.wait(1.0)
+
+    release_refresh.set()
+    deadline = time.monotonic() + 1.0
+    body = second.json()
+    while time.monotonic() < deadline:
+        third = client.get("/api/v1/dashboard", headers=auth_headers)
+        assert third.status_code == 200, third.text
+        body = third.json()
+        if body["tokens"]["total"] == 2:
+            break
+        time.sleep(0.02)
+
+    assert body["tokens"]["total"] == 2
+    assert body["rollups"]["alert_count"] == 3
+    assert calls == {"gather": 2, "fresh": 2}
+
+
 def test_dashboard_stale_cache_returns_while_refresh_runs(
     app, client, auth_headers, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

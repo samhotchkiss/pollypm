@@ -317,6 +317,38 @@ def _call_dashboard_source_pair(
     return results["projects"], results["data"]
 
 
+def _fresh_dashboard_alert_count(config: Any) -> int | None:
+    """Return a fresh alert count so stale dashboard snapshots cannot alarm high."""
+
+    try:
+        from pollypm.dashboard_data import count_dashboard_alerts
+
+        return count_dashboard_alerts(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "dashboard: fresh alert-count refresh failed; using cached value",
+            exc_info=True,
+        )
+        return None
+
+
+def _normalize_dashboard_alert_count(config: Any, data: Any) -> int | None:
+    """Write the liveness-filtered alert count onto dashboard data."""
+
+    fresh_alert_count = _fresh_dashboard_alert_count(config)
+    if fresh_alert_count is None:
+        return None
+    try:
+        data.alert_count = int(fresh_alert_count)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "dashboard: failed to normalize cached alert_count",
+            exc_info=True,
+        )
+        return None
+    return int(fresh_alert_count)
+
+
 def _load_dashboard_snapshot(config: Any) -> DashboardSnapshot:
     """Run the expensive dashboard load once and normalize errors."""
 
@@ -339,27 +371,13 @@ def _load_dashboard_snapshot(config: Any) -> DashboardSnapshot:
             hint="Retry shortly; check `pm doctor` for pg pool health.",
         ) from data_result
 
+    _normalize_dashboard_alert_count(config, data_result)
     return DashboardSnapshot(
         generated_at=datetime.now(timezone.utc),
         projects=tuple(projects_result),
         data=data_result,
         refreshed_at_monotonic=time.monotonic(),
     )
-
-
-def _fresh_dashboard_alert_count(config: Any) -> int | None:
-    """Return a fresh alert count so stale dashboard snapshots cannot alarm high."""
-
-    try:
-        from pollypm.dashboard_data import count_dashboard_alerts
-
-        return count_dashboard_alerts(config)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "dashboard: fresh alert-count refresh failed; using cached value",
-            exc_info=True,
-        )
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +443,6 @@ async def get_dashboard_endpoint(
         )
 
     snapshot_cache = _get_dashboard_snapshot_cache(request)
-    sync_refresh_expected = snapshot_cache.requires_sync_refresh(config)
     snapshot = await snapshot_cache.get_or_refresh(config, _load_dashboard_snapshot)
 
     # Projects view — list_projects is the authoritative cockpit row
@@ -506,25 +523,16 @@ async def get_dashboard_endpoint(
     pending_plan_reviews = sum(
         1 for p in projects_view if p.pending_plan_review
     )
-    # The full snapshot is intentionally stale-while-refresh. Alert counts are
-    # volatile enough that an old-high value can alarm the Home headline, so
-    # refresh that one cheap counter when serving an aged snapshot or after a
-    # fully cold/max-stale rebuild. Updating ``data.alert_count`` keeps the
-    # just-refreshed cache from flapping back on immediate warm hits (#2504).
+    # The full snapshot is intentionally stale-while-refresh. The loader
+    # normalizes alert_count before any sync/background refresh is cached; for
+    # older snapshots, refresh that one cheap counter and write it through so
+    # the Home headline does not hold an old-high value (#2504).
     snapshot_age = time.monotonic() - snapshot.refreshed_at_monotonic
     fresh_alert_count = (
-        _fresh_dashboard_alert_count(config)
-        if sync_refresh_expected or snapshot_age > 2.0
+        _normalize_dashboard_alert_count(config, data)
+        if snapshot_age > 2.0
         else None
     )
-    if fresh_alert_count is not None:
-        try:
-            data.alert_count = int(fresh_alert_count)
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "dashboard: failed to normalize cached alert_count",
-                exc_info=True,
-            )
 
     rollups = DashboardRollups(
         tracked_count=tracked_count,

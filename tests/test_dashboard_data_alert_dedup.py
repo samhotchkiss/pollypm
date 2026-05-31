@@ -763,6 +763,167 @@ def test_briefing_pluralizes_counts_correctly() -> None:
     assert "(ies)" not in out2
 
 
+def test_briefing_splits_bookkeeping_commits_from_product_progress() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing, CommitInfo
+
+    out = _build_dashboard_briefing(
+        commits=[
+            CommitInfo("h1", "journal(48h): cycle 42", "a", 0.0, "pollypm"),
+            CommitInfo("h2", "ledger: sync loop", "a", 0.0, "pollypm"),
+            CommitInfo("h3", "fix(chat): clean PM transcript", "a", 0.0, "savethenovel"),
+        ],
+        completed=[],
+        inbox_count=0,
+        recent_messages=[],
+        recovery_count_24h=0,
+    )
+
+    assert "Progress: 1 product commit (+2 bookkeeping commits) across 1 project." in out
+    assert "3 commits across" not in out
+
+
+def test_briefing_decomposes_remaining_inbox_projects() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing, InboxPreview
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=5,
+        recent_messages=[
+            InboxPreview(
+                sender="polly",
+                title="Project savethenovel has 1 queued task but no claim / execution.",
+                project="Save the Novel",
+                task_id="savethenovel/1",
+                age_seconds=3600,
+                project_key="savethenovel",
+            ),
+            InboxPreview(
+                sender="polly",
+                title="Russell needs a decision",
+                project="russell",
+                task_id="russell/2",
+                age_seconds=22 * 3600,
+                project_key="russell",
+            ),
+            InboxPreview(
+                sender="polly",
+                title="Russell still needs a decision",
+                project="russell",
+                task_id="russell/3",
+                age_seconds=20 * 3600,
+                project_key="russell",
+            ),
+            InboxPreview(
+                sender="polly",
+                title="Russell follow-up",
+                project="russell",
+                task_id="russell/4",
+                age_seconds=18 * 3600,
+                project_key="russell",
+            ),
+            InboxPreview(
+                sender="polly",
+                title="Itsalive deploy check",
+                project="itsalive",
+                task_id="itsalive/5",
+                age_seconds=3600,
+                project_key="itsalive",
+            ),
+        ],
+        recovery_count_24h=0,
+    )
+
+    assert "First up: Save the Novel has queued work without an active claim." in out
+    assert "Remaining: russell (3, idle 22h), itsalive (1, idle 1h)." in out
+
+
+def test_briefing_flags_capacity_and_recovery_strain() -> None:
+    from pollypm.dashboard_data import (
+        _build_dashboard_briefing,
+        AccountQuotaUsage,
+    )
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=0,
+        recent_messages=[],
+        recovery_count_24h=76,
+        account_usages=[
+            AccountQuotaUsage(
+                account_name="claude_main",
+                provider="Anthropic",
+                email="sam@example.com",
+                used_pct=96,
+                summary="4% left",
+                severity="critical",
+                limit_label="weekly limit",
+            )
+        ],
+    )
+
+    assert "Health note: Anthropic is near its weekly limit; 76 recoveries in 24h." in out
+
+
+def test_recent_pm_chat_messages_surface_persona_jsonl_line(
+    monkeypatch, tmp_path,
+) -> None:
+    from pollypm.dashboard_data import _recent_pm_chat_messages
+    from pollypm.web_api.chat import MessageEnvelope, MessageRole, MessageType, SurfaceType
+
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("placeholder")
+    project = SimpleNamespace(
+        tracked=True,
+        path="/Users/sam/dev/savethenovel",
+        display_label=lambda: "Save the Novel",
+    )
+    config = SimpleNamespace(projects={"savethenovel": project})
+    surface = SimpleNamespace(
+        surface_type=SurfaceType.ARCHITECT,
+        project="savethenovel",
+        transcript_path=archive,
+        persona="Sage",
+        session_name="architect_savethenovel",
+    )
+    monkeypatch.setattr(
+        "pollypm.web_api.chat.enumerate_chat_surfaces",
+        lambda *_args, **_kwargs: [surface],
+    )
+    monkeypatch.setattr(
+        "pollypm.web_api.chat.parse_events_jsonl_tail",
+        lambda *_args, **_kwargs: [
+            MessageEnvelope(
+                id="tool",
+                ts="2026-05-30T10:00:00Z",
+                role=MessageRole.TOOL,
+                actor="tool",
+                type=MessageType.TOOL_RESULT,
+                text="Bash(cd /tmp && cat x)",
+            ),
+            MessageEnvelope(
+                id="sage",
+                ts="2026-05-30T10:01:00Z",
+                role=MessageRole.ASSISTANT,
+                actor="Sage",
+                type=MessageType.TEXT,
+                text="I have the next outline ready for your review.",
+            ),
+        ],
+    )
+
+    rows = _recent_pm_chat_messages(config)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.sender == "Sage"
+    assert row.project == "Save the Novel"
+    assert row.task_id == "savethenovel:pm-chat"
+    assert row.title == "I have the next outline ready for your review."
+    assert "Bash(" not in row.title
+
+
 def test_briefing_all_handled_when_no_activity() -> None:
     from pollypm.dashboard_data import _build_dashboard_briefing
 

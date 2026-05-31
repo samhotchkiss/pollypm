@@ -299,7 +299,7 @@ def _call_dashboard_source_pair(
         threading.Thread(
             target=_run,
             name="dashboard-list-projects",
-            args=("projects", lambda: list_projects(config)),
+            args=("projects", lambda: list_projects(config, operator_facing=True)),
             daemon=True,
         ),
         threading.Thread(

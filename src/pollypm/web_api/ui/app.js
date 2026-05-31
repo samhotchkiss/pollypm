@@ -59,6 +59,7 @@
     selectedProject: null,
     projectFilter: "",
     projectSort: "urgency",
+    showTestProjects: false,
     surfaces: [],
     taskSurfaces: [],
     surfaceLoadError: null,
@@ -421,6 +422,9 @@
 
   function projectListPath() {
     const params = new URLSearchParams();
+    if (!state.showTestProjects) {
+      params.set("operator", "true");
+    }
     if (state.projectFilter.trim()) {
       params.set("q", state.projectFilter.trim());
     }
@@ -762,6 +766,14 @@
     return parts.join(" · ") || "no open work";
   }
 
+  function projectAttentionCount(project) {
+    const blocked = countFor(project, "blocked") + countFor(project, "on_hold");
+    const review = countFor(project, "review");
+    const inbox = Number(project.open_inbox_count) || 0;
+    const plan = project.pending_plan_review ? 1 : 0;
+    return blocked + review + inbox + plan;
+  }
+
   function formatShortTime(value) {
     const parsed = Date.parse(value);
     if (!Number.isFinite(parsed)) return String(value || "");
@@ -848,6 +860,30 @@
       }));
       return;
     }
+    const attentionProjects = sortProjects(
+      state.projects.filter((project) => projectAttentionCount(project) > 0),
+    );
+    const attentionTotal = attentionProjects.reduce(
+      (sum, project) => sum + projectAttentionCount(project),
+      0,
+    );
+    const triageText = attentionTotal > 0
+      ? attentionTotal + " " + plural(attentionTotal, "item")
+        + (attentionTotal === 1 ? " needs you - " : " need you - ")
+        + attentionProjects.slice(0, 3).map((project) => (
+          project.name || project.key
+        )).join(", ")
+      : "All handled - nothing needs you";
+    const triage = el("li", {
+      class: "project-triage " + (attentionTotal > 0 ? "attention" : "clear"),
+    }, [
+      el("span", { class: "project-name", text: triageText }),
+    ]);
+    if (attentionProjects[0]) {
+      triage.addEventListener("click", () => selectProject(attentionProjects[0].key));
+    }
+    list.appendChild(triage);
+
     const filter = state.projectFilter.trim().toLowerCase();
     const projects = sortProjects(
       filter
@@ -1170,7 +1206,11 @@
     const planReviews = numeric(rollups.pending_plan_reviews);
     const inbox = numeric(rollups.open_inbox_count);
     const alerts = numeric(rollups.alert_count);
-    const total = planReviews + inbox + alerts;
+    const total = planReviews + inbox;
+    const alertNote = alerts > 0
+      ? " " + alerts + " " + plural(alerts, "background alert")
+        + " being watched."
+      : "";
     if (total === 0) {
       const sweeps = numeric(rollups.sweep_count_24h);
       const recoveries = numeric(rollups.recovery_count_24h);
@@ -1178,7 +1218,8 @@
         ? "24h: " + sweeps + " "
           + plural(sweeps, "sweep") + " / " + recoveries + " "
           + plural(recoveries, "recovery", "recoveries") + "."
-        : "No inbox items, plan reviews, or alerts waiting.";
+          + alertNote
+        : "No inbox items or plan reviews waiting." + alertNote;
       return {
         title: "All handled - Polly's got it",
         detail: proof,
@@ -1191,7 +1232,7 @@
         title: total + " " + plural(total, "thing") + " "
           + (total === 1 ? "needs" : "need") + " you",
         detail: planReviews + " "
-          + plural(planReviews, "plan review") + " waiting.",
+          + plural(planReviews, "plan review") + " waiting." + alertNote,
         actionLabel: "Open plan reviews",
         target: "plan-review",
       };
@@ -1201,18 +1242,11 @@
         title: total + " " + plural(total, "thing") + " "
           + (total === 1 ? "needs" : "need") + " you",
         detail: inbox + " "
-          + plural(inbox, "inbox item") + " waiting.",
+          + plural(inbox, "inbox item") + " waiting." + alertNote,
         actionLabel: "Open inbox",
         target: "inbox",
       };
     }
-    return {
-      title: total + " " + plural(total, "thing") + " "
-        + (total === 1 ? "needs" : "need") + " you",
-      detail: alerts + " " + plural(alerts, "alert") + " waiting.",
-      actionLabel: "Open alerts",
-      target: "alerts",
-    };
   }
 
   function runDashboardStatusAction(status) {
@@ -3255,19 +3289,19 @@
     }
     if (typeof rollups.alert_count === "number") {
       cards.push(buildCard(
-        "alerts",
+        "watching",
         rollups.alert_count,
-        rollups.alert_count > 0 ? "rollup-blocked" : "",
+        rollups.alert_count > 0 ? "rollup-working" : "",
         // alert_count is intentionally global per DashboardRollups
         // docstring — never appears in scoped_fields, so no tag.
         false,
         dashboardCardAction({
-          label: "alerts",
+          label: "watching",
           value: rollups.alert_count,
           target: "alerts",
-          detail: "Opens the current alert list.",
+          detail: "Opens background alerts and recovery notes.",
         }, data),
-        "Open alerts",
+        "Open background alerts",
       ));
     }
 
@@ -3797,6 +3831,15 @@
         state.projectSort = sort.value || "urgency";
         renderProjects();
         loadSurfaces();
+      });
+    }
+    const showTests = $("project-show-tests");
+    if (showTests) {
+      showTests.checked = state.showTestProjects;
+      showTests.addEventListener("change", () => {
+        state.showTestProjects = Boolean(showTests.checked);
+        loadSurfaces();
+        pollDashboard();
       });
     }
   }

@@ -77,8 +77,21 @@ def list_projects_endpoint(
         Literal["name", "inbox_desc", "recent", "recent_desc", "urgency"] | None,
         Query(description="Sort projects by name, inbox count, recency, or urgency."),
     ] = None,
+    operator: Annotated[
+        bool,
+        Query(
+            description=(
+                "When true, hides synthetic seed/test projects from "
+                "operator-facing cockpit rails."
+            ),
+        ),
+    ] = False,
 ) -> ProjectListResponse:
-    items = list_projects(config, tracked_only=bool(tracked))
+    items = list_projects(
+        config,
+        tracked_only=bool(tracked),
+        operator_facing=operator,
+    )
     needle = (q or search or "").strip().lower()
     if needle:
         items = [

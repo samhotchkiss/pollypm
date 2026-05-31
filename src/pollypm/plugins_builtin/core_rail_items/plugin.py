@@ -335,7 +335,13 @@ def _classify_projects(ctx: RailContext) -> tuple[list[tuple[str, Any]], list[tu
             cache[project_key] = (db_mtime, git_mtime, is_active, has_working_task)
         return is_active, has_working_task
 
-    for project_key, project in getattr(config, "projects", {}).items():
+    projects = getattr(config, "projects", {}) or {}
+    from pollypm.project_liveness import real_operator_project_items
+
+    for project_key, project in real_operator_project_items(
+        projects,
+        default_tracked=False,
+    ):
         is_active, has_working_task = _project_activity(project_key, project)
         project_has_active_task[project_key] = has_working_task
         if is_active:
@@ -346,7 +352,12 @@ def _classify_projects(ctx: RailContext) -> tuple[list[tuple[str, Any]], list[tu
     # Evict stale cache entries.
     cache = getattr(router, "_project_activity_cache", None)
     if isinstance(cache, dict):
-        live_keys = set(getattr(config, "projects", {}).keys())
+        live_keys = {
+            key for key, _project in real_operator_project_items(
+                projects,
+                default_tracked=False,
+            )
+        }
         for stale_key in list(cache.keys()):
             if stale_key not in live_keys:
                 cache.pop(stale_key, None)

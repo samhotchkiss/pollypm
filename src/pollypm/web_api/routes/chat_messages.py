@@ -81,6 +81,8 @@ TAIL_READ_LIMIT_THRESHOLD = 200
 
 SourceMode = Literal["auto", "jsonl", "capture"]
 Direction = Literal["asc", "desc"]
+_PM_CHAT_SURFACE_TYPES = frozenset({SurfaceType.ARCHITECT, SurfaceType.ADVISOR})
+_PM_CHAT_DIALOGUE_TYPES = frozenset({MessageType.TEXT, MessageType.ASK_USER})
 
 
 def _is_worker_session(session_name: str) -> bool:
@@ -716,6 +718,10 @@ def _load_envelopes(
         )
         if _latest_envelope_is_open_ask_user(envelopes):
             return envelopes, "jsonl", archive
+        if _is_pm_chat_surface(surface):
+            return envelopes, "jsonl", archive
+    elif _is_pm_chat_surface(surface):
+        return [], None, None
 
     captured = _capture_for_surface(surface, actor_fallback=actor_fallback)
     if captured:
@@ -739,6 +745,46 @@ def _latest_envelope_is_open_ask_user(envelopes: list[MessageEnvelope]) -> bool:
         if envelope.role == MessageRole.ASSISTANT and envelope.type == MessageType.TEXT:
             return False
     return False
+
+
+def _is_pm_chat_surface(surface: ChatSurface) -> bool:
+    return surface.surface_type in _PM_CHAT_SURFACE_TYPES
+
+
+def _curate_pm_chat_envelopes(envelopes: list[MessageEnvelope]) -> list[MessageEnvelope]:
+    """Keep dialogue envelopes for persona chat surfaces.
+
+    JSONL carries whole text blocks and correct roles; tmux capture
+    does not. The PM chat view is the operator-facing conversation, so
+    tool calls/results and synthetic bookkeeping stay out of that feed.
+    """
+
+    curated: list[MessageEnvelope] = []
+    for envelope in envelopes:
+        if envelope.type not in _PM_CHAT_DIALOGUE_TYPES:
+            continue
+        if envelope.role not in {MessageRole.USER, MessageRole.ASSISTANT}:
+            continue
+        if not str(envelope.text or "").strip():
+            continue
+        curated.append(envelope)
+    return curated
+
+
+def _idle_pm_chat_greeting(surface: ChatSurface) -> MessageEnvelope:
+    persona = surface.persona or "Polly"
+    text = f"{persona} is standing by. Nothing needs you yet."
+    if surface.project:
+        text = f"{persona} is standing by on {surface.project}. Nothing needs you yet."
+    return MessageEnvelope(
+        id=f"idle_{surface.session_name}",
+        ts="",
+        role=MessageRole.ASSISTANT,
+        actor=persona,
+        type=MessageType.TEXT,
+        text=text,
+        metadata={"synthetic": True, "reason": "idle_persona_greeting"},
+    )
 
 
 def _capture_for_surface(
@@ -1230,6 +1276,17 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         tail_hint=tail_hint,
         include_thinking=include_thinking,
     )
+    if (
+        _is_pm_chat_surface(surface)
+        and source != "capture"
+        and not include_subagents
+        and not include_thinking
+    ):
+        envelopes = _curate_pm_chat_envelopes(envelopes)
+        if not envelopes:
+            envelopes = [_idle_pm_chat_greeting(surface)]
+            if transcript_source is None:
+                transcript_source = "idle_greeting"
 
     post_process: Any = None
     if include_subagents:

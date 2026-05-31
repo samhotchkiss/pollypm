@@ -144,6 +144,24 @@ aside#dashboard-rail {
   gap: 6px;
   padding: 0 12px 8px;
 }
+.rail-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  min-height: 31px;
+  padding: 0 8px;
+  border: 1px solid var(--border-line);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+.rail-toggle input {
+  margin: 0;
+}
 
 .surface-filter-wrap {
   display: flex;
@@ -205,6 +223,18 @@ aside#dashboard-rail {
   color: var(--text-muted);
   cursor: default;
   font-style: italic;
+}
+.project-list li.project-triage {
+  background: transparent;
+  border-color: var(--border-line);
+  cursor: default;
+}
+.project-list li.project-triage.attention {
+  border-color: var(--waiting);
+  cursor: pointer;
+}
+.project-list li.project-triage.clear .project-name {
+  color: var(--text-muted);
 }
 .project-name {
   color: var(--text-heading);

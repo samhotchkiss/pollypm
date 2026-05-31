@@ -23,6 +23,7 @@ can stub the router / hint widget without spinning up Textual.
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 from pollypm.cockpit_ui import FooterStateSnapshot, PollyCockpitApp
 
@@ -312,6 +313,48 @@ def test_resolve_footer_state_returns_snapshot_with_expected_counts(
     assert snapshot.inbox_count == 11
     # Stub store reports no heartbeat → no alert chunk.
     assert snapshot.alert is None
+
+
+def test_resolve_footer_state_filters_synthetic_projects_and_agents(
+    monkeypatch,
+) -> None:
+    real_project = SimpleNamespace(
+        tracked=True,
+        path="/Users/sam/dev/savethenovel",
+    )
+    synthetic_project = SimpleNamespace(
+        tracked=True,
+        path="/Users/sam/dev/pm-test-01wave-1779715196",
+    )
+    paused_project = SimpleNamespace(
+        tracked=False,
+        path="/Users/sam/dev/real-paused",
+    )
+    projects = {
+        "savethenovel": real_project,
+        "real-paused": paused_project,
+        "pm-test-01wave-1779715196": synthetic_project,
+    }
+    sessions = {
+        "architect_savethenovel": SimpleNamespace(project="savethenovel"),
+        "architect_paused": SimpleNamespace(project="real-paused"),
+        "architect_pm_test": SimpleNamespace(project="pm-test-01wave-1779715196"),
+        "operator": SimpleNamespace(project=None),
+    }
+    app, _hint = _build_app(
+        projects=projects,
+        sessions=sessions,
+        inbox_count=0,
+        hint_width=120,
+        monkeypatch=monkeypatch,
+        seed_footer_state=False,
+    )
+
+    snapshot = app._resolve_footer_state()
+
+    assert isinstance(snapshot, FooterStateSnapshot)
+    assert snapshot.project_count == 2
+    assert snapshot.agent_count == 3
 
 
 def test_resolve_footer_state_bypasses_state_cache(monkeypatch) -> None:

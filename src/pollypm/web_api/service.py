@@ -303,7 +303,12 @@ def list_active_worker_sessions(
 # ---------------------------------------------------------------------------
 
 
-def list_projects(config: PollyPMConfig, *, tracked_only: bool = False) -> list[APIProject]:
+def list_projects(
+    config: PollyPMConfig,
+    *,
+    tracked_only: bool = False,
+    operator_facing: bool = False,
+) -> list[APIProject]:
     """Return every registered project as an :class:`APIProject`.
 
     Counts and flags are computed against the work-service so the
@@ -315,7 +320,15 @@ def list_projects(config: PollyPMConfig, *, tracked_only: bool = False) -> list[
     out: list[APIProject] = []
     snapshots = _project_task_snapshots(config)
     inbox_counts = _project_inbox_counts(config) if snapshots is not None else None
-    for key, project in config.projects.items():
+    project_items = tuple(config.projects.items())
+    if operator_facing:
+        from pollypm.project_liveness import real_operator_project_items
+
+        project_items = real_operator_project_items(
+            config.projects,
+            default_tracked=False,
+        )
+    for key, project in project_items:
         if tracked_only and not project.tracked:
             continue
         if snapshots is not None:

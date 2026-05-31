@@ -45,13 +45,36 @@ Uses (does not own): `SessionService`, providers, runtimes, work service, worktr
 |---|---|---|---|
 | 0. Research | architect | ReAct loop: grep, read, list_files, web_search. Gather context before opinions. Budgeted (default 10 min). | Context artifact |
 | 1. Discover | architect | Read spec + context. Ask clarifying questions via chat task only if truly under-specified. | Understanding artifact |
-| 2. Decompose (tree-of-plans) | architect | Generate **2–3 alternative decompositions**, each a plugin/microservice breakdown. | Candidate decompositions |
+| 2. Decompose (tree-of-plans) | architect | Generate **2–3 alternative decompositions**, each a plugin/microservice breakdown. Live-surface plans include a terminal ship-and-verify module. | Candidate decompositions |
 | 3. Test strategy | architect | For each module: user-level test (Playwright for web, tmux for CLI/TUI). Unit tests assumed, not sufficient. | Test matrix per candidate |
 | 4. Magic | architect | Dedicated pass: "how do we go 2× above a vanilla implementation?" Opinionated, pushing. | Magic list per candidate |
 | 5. **Critic panel** | 5 critic personas, parallel | Each critic evaluates all candidates. Structured JSON output. Short-lived worker sessions. | Structured critiques |
 | 6. Synthesize | architect | Pick best candidate, integrate critic objections as mitigations, produce Risk Ledger and narrative session log. | Plan + Risk Ledger + Session Log |
 | 7. **User approval** | user | Plan presented with Risk Ledger. User approves, adjusts, or aborts. | Go/no-go |
-| 8. Emit | architect | Creates N tasks in work service via `implement_module` flow, with acceptance criteria + test spec + dependency links. | Backlog |
+| 8. Emit | architect | Creates N tasks in work service via `implement_module` flow, with acceptance criteria + test spec + dependency links. Live-surface work emits the ship-and-verify task last and links every build module as a blocker. | Backlog |
+
+### Live-surface shipping contract
+
+If a request is successful only when a change is visible on a deployed
+URL/app/site, planning does not stop at build modules. Every candidate and
+approved plan includes a final `Ship and verify live` task, or a
+project-specific equivalent, after the build tasks.
+
+The ship task is blocked by all build tasks. During emit, the architect creates
+the build tasks first, creates the ship task last, and records dependency links
+with `pm task link <build_task_id> <ship_task_id> --kind blocks`.
+
+The ship task acceptance criteria must cover:
+
+- Integrating completed task branches into the project's main/canonical branch
+  through the established project workflow, or opening and merging a PR if that
+  is the project norm.
+- Running the documented deploy route from project docs, scripts, or config.
+- Re-fetching the live URL and asserting a concrete marker such as an asset
+  path, DOM text, title, non-blank body, or project-specific verifier output.
+
+When deploy setup is unknown, the plan includes a small discover-deploy task
+before the ship task; it must not silently omit the live-verification step.
 
 ## 4. The critic panel
 

@@ -39,6 +39,9 @@ from pathlib import Path
 import pytest
 
 from pollypm.plugins_builtin.project_planning import plugin as _planning_plugin
+from pollypm.plugins_builtin.project_planning.tree_of_plans import (
+    decompose_stage_prompt,
+)
 from pollypm.work.pg_service import PgWorkService
 from pollypm.work.service_support import (
     InvalidTransitionError,
@@ -440,6 +443,11 @@ def test_architect_prompt_includes_stage_transitions_block() -> None:
     assert "Everything else goes to `docs/downtime-backlog.md`" in text
     assert "single source of truth" in text
     assert "Copy module names, acceptance criteria, and user-level test descriptions" in text
+    assert "<live_surface_shipping>" in text
+    assert "Ship and verify live" in text
+    assert "pm task link <build_task_id> <ship_task_id> --kind blocks" in text
+    assert "Build-task done/review is not goal done" in text
+    assert "fetching the URL" in text
     # Mentions every work stage by name so the agent can match its
     # current node to an instruction.
     for stage in (
@@ -464,3 +472,15 @@ def test_architect_prompt_handoff_matches_plan_review_node() -> None:
     assert "plan_review → user_approval" in handoff
     assert "stage 6 →\nuser_approval" not in handoff
     assert "still run `pm task done`" in handoff
+
+
+def test_decompose_prompt_requires_live_surface_ship_module() -> None:
+    """Live-site goals must decompose through integration, deploy, and
+    live verification, not just build modules stranded on task branches."""
+    text = decompose_stage_prompt()
+    assert "## Live-surface shipping" in text
+    assert "Ship and verify live" in text
+    assert "depends on every build module" in text
+    assert "branch integration" in text
+    assert "established deploy command" in text
+    assert "live fetch/marker check" in text

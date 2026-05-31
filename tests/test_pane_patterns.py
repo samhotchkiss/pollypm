@@ -189,6 +189,36 @@ Both are reasonable; let's discuss in the meeting.
 """
 
 
+ASK_USER_DECISION_POSITIVE = """
+⏺ I need one product direction before I queue imagery work.
+
+What medium should the imagery be?
+
+☐ Imagery medium
+  ○ Bespoke SVG illustration
+  ○ Photography
+←  ☐ Imagery medium  ☐ Hero treatment  ✔ Submit  →
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+
+ASK_USER_DECISION_PROSE_NEGATIVE = """
+The issue says the pane shows the `✔ Submit` tab-bar /
+`Enter to select · Tab/Arrow keys to navigate · Esc to cancel` footer.
+This is prose in a bug report, not a live menu.
+"""
+
+ASK_USER_DECISION_STALE_NEGATIVE = """
+What medium should the imagery be?
+
+☐ Imagery medium
+  ○ Bespoke SVG illustration
+  ○ Photography
+✔ Submit
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+⏺ Continuing after the answered prompt.
+"""
+
+
 THEME_TRUST_POSITIVE = """
 ╭──────────────────────────────────────────────╮
 │  Select a theme                              │
@@ -320,6 +350,21 @@ class TestClassifyPane:
         # only cue ("and tell Claude" / "esc to interrupt" / etc.).
         assert "permission_prompt" not in classify_pane(
             PERMISSION_PROMPT_BARE_MENU_NEGATIVE,
+        )
+
+    def test_ask_user_decision_positive(self) -> None:
+        assert "ask_user_decision" in classify_pane(
+            ASK_USER_DECISION_POSITIVE,
+        )
+
+    def test_ask_user_decision_prose_negative(self) -> None:
+        assert "ask_user_decision" not in classify_pane(
+            ASK_USER_DECISION_PROSE_NEGATIVE,
+        )
+
+    def test_ask_user_decision_stale_negative(self) -> None:
+        assert "ask_user_decision" not in classify_pane(
+            ASK_USER_DECISION_STALE_NEGATIVE,
         )
 
     def test_theme_trust_modal_positive_theme(self) -> None:
@@ -517,6 +562,43 @@ class TestPaneClassifyHandler:
         # must not duplicate it.
         result2 = pane_text_classify_handler({})
         # Alert is already open; counter only ticks on first-fire.
+        assert result2["alerts_raised"] == 0
+        assert result2["inbox_items_emitted"] == 0
+        assert svc.sent == []
+
+    def test_ask_user_decision_emits_user_routed_project_inbox_task(
+        self, tmp_path, monkeypatch, pg_work_service,
+    ) -> None:
+        from pollypm.inbox.kind import InboxItemKind
+
+        store = StateStore(tmp_path / "state.db")
+        work = pg_work_service
+        svc = FakeSessionService(
+            handles=[FakeHandle("task-demo-7")],
+            captures={"task-demo-7": ASK_USER_DECISION_POSITIVE},
+        )
+        _patch_resolver(monkeypatch, tmp_path, svc, store, work_service=work)
+
+        result = pane_text_classify_handler({})
+
+        assert result["outcome"] == "swept"
+        assert result["alerts_raised"] == 1
+        assert result["match_counts"]["ask_user_decision"] == 1
+        assert result["inbox_items_emitted"] == 1
+
+        tasks = work.list_tasks(project="demo", work_status="draft")
+        task = next(
+            task for task in tasks
+            if "pane_pattern:ask_user_decision:task-demo-7"
+            in (getattr(task, "labels", None) or [])
+        )
+        assert task.kind is InboxItemKind.PM_QUESTION_UNANSWERED
+        assert task.roles["requester"] == "user"
+        assert task.roles["actor"] == "task-demo-7"
+        assert task.title == "demo PM is waiting on a decision from you"
+        assert "did not parse the options" in task.description
+
+        result2 = pane_text_classify_handler({})
         assert result2["alerts_raised"] == 0
         assert result2["inbox_items_emitted"] == 0
         assert svc.sent == []

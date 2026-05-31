@@ -1166,6 +1166,81 @@ def _read_events_limited_tail(
     return events
 
 
+def _audit_obj_at_or_before_since(obj: dict[str, Any], since: str) -> bool:
+    """Return true when ``obj`` proves older rows can be skipped."""
+    ts = str(obj.get("ts", ""))
+    return bool(ts) and ts <= since
+
+
+def _trim_events_to_limit(
+    events: list[AuditEvent],
+    *,
+    limit: int | None,
+) -> list[AuditEvent]:
+    events.sort(key=lambda e: e.ts)
+    if limit is not None and limit >= 0:
+        return events[-limit:] if limit else []
+    return events
+
+
+def _read_events_since_tail(
+    live: Path,
+    project: str,
+    *,
+    since: str,
+    limit: int | None,
+    event: str | None,
+) -> list[AuditEvent]:
+    """Read rows newer than ``since`` without scanning full audit history.
+
+    Watchdog callers query small recent windows every few minutes. A
+    forward full-corpus scan makes that cadence proportional to all audit
+    history and can transiently materialize hundreds of MB. Audit writers
+    append chronological JSONL, so the live file can be read newest-first
+    and stopped as soon as the first row at or before ``since`` appears.
+    Gzipped rotations are streamed forward so recent archives remain
+    visible without building an in-memory copy of the archive.
+    """
+    if limit == 0:
+        return []
+
+    events: list[AuditEvent] = []
+    for path in _walk_log_chain(live):
+        stop_chain = False
+        if path.suffix == ".gz":
+            saw_cutoff = False
+            for obj in _iter_log_lines(path):
+                if _audit_obj_at_or_before_since(obj, since):
+                    saw_cutoff = True
+                    continue
+                if not _audit_obj_matches(
+                    obj, project=project, since=since, event=event,
+                ):
+                    continue
+                events.append(AuditEvent.from_dict(obj))
+            if saw_cutoff:
+                stop_chain = True
+        else:
+            for obj in _iter_live_log_lines_reverse(path):
+                if _audit_obj_at_or_before_since(obj, since):
+                    stop_chain = True
+                    break
+                if not _audit_obj_matches(
+                    obj, project=project, since=since, event=event,
+                ):
+                    continue
+                events.append(AuditEvent.from_dict(obj))
+                if limit is not None and limit >= 0 and len(events) >= limit:
+                    return _trim_events_to_limit(events, limit=limit)
+
+        if limit is not None and limit >= 0 and len(events) >= limit:
+            return _trim_events_to_limit(events, limit=limit)
+        if stop_chain:
+            break
+
+    return _trim_events_to_limit(events, limit=limit)
+
+
 def read_events(
     project: str,
     *,
@@ -1204,15 +1279,21 @@ def read_events(
 
     Returns a list (not a generator) because typical callers want
     to count / slice / re-iterate. Limited tail reads skip the
-    full-history scan when no ``since`` filter is present; other
-    shapes keep the chronological full scan so rotated logs and
-    dedupe windows remain authoritative.
+    full-history scan when no ``since`` filter is present. ``since``
+    reads use a bounded newest-first live tail plus streaming archive
+    fallback so recurring watchdog sweeps stay proportional to their
+    lookback window rather than total audit history.
     """
     per_project = project_log_path(project_path)
     if per_project is not None and per_project.exists():
         live = per_project
     else:
         live = central_log_path(project)
+
+    if since is not None:
+        return _read_events_since_tail(
+            live, project, since=since, limit=limit, event=event,
+        )
 
     if limit is not None and limit >= 0 and since is None:
         return _read_events_limited_tail(

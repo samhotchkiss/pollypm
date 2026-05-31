@@ -48,6 +48,7 @@ from pollypm.audit.watchdog import (
     RULE_LEGACY_DB_SHADOW,
     RULE_ORPHAN_MARKER,
     RULE_PLAN_MISSING_ALERT_CHURN,
+    RULE_PLAN_MISSING_QUEUE_STALLED,
     RULE_PLAN_REVIEW_MISSING,
     RULE_QUEUE_WITHOUT_MOTION,
     RULE_REJECTION_LOOP,
@@ -120,6 +121,7 @@ class _StubTask:
     description: str | None = None
     labels: tuple[str, ...] = ()
     kind: str | None = None
+    flow_template_id: str | None = None
 
     @property
     def work_status(self) -> _StubStatus:
@@ -150,6 +152,7 @@ def test_existing_rules_carry_expected_tiers(now: datetime) -> None:
         RULE_TASK_PROGRESS_STALE: TIER_2,
         RULE_TASK_ON_HOLD_STALE: TIER_2,
         RULE_WORKER_SESSION_DEAD_LOOP: TIER_2,
+        RULE_PLAN_MISSING_QUEUE_STALLED: TIER_2,
         # Observe-only canaries.
         RULE_ORPHAN_MARKER: TIER_TERMINAL,
         RULE_PLAN_MISSING_ALERT_CHURN: TIER_TERMINAL,
@@ -721,6 +724,92 @@ def test_queue_without_motion_disabled_when_probe_flag_off(
         run_safety_net_probes=False,
     )
     assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
+
+
+def test_plan_missing_queue_stall_routes_to_architect(
+    now: datetime,
+) -> None:
+    cfg = WatchdogConfig(plan_missing_queue_stall_seconds=600)
+    queued = _StubTask(
+        project="demo",
+        task_number=4,
+        work_status_str="queued",
+        executions=[],
+        updated_at=now - timedelta(hours=2),
+        flow_template_id="implement_module",
+        roles={"worker": "worker"},
+    )
+    events = [
+        AuditEvent(
+            ts=(now - timedelta(minutes=10)).isoformat(),
+            project="demo",
+            event="auto_claim_skipped_plan_missing",
+            subject="demo/4",
+            actor="auto_claim_sweep",
+            status="warn",
+            metadata={"task_id": "demo/4"},
+        ),
+    ]
+
+    findings = scan_events(
+        events, now=now, config=cfg, open_tasks=[queued], project="demo",
+    )
+
+    matched = [
+        f for f in findings if f.rule == RULE_PLAN_MISSING_QUEUE_STALLED
+    ]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.tier == TIER_2
+    assert f.evidence["queued_subjects"] == ["demo/4"]
+    assert f.evidence["auto_claim_skip_count"] == 1
+    assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
+
+
+def test_plan_missing_queue_stall_silent_when_planning_task_active(
+    now: datetime,
+) -> None:
+    cfg = WatchdogConfig(plan_missing_queue_stall_seconds=600)
+    queued = _StubTask(
+        project="demo",
+        task_number=4,
+        work_status_str="queued",
+        executions=[],
+        updated_at=now - timedelta(hours=2),
+        flow_template_id="implement_module",
+    )
+    plan_task = _StubTask(
+        project="demo",
+        task_number=9,
+        work_status_str="in_progress",
+        executions=[],
+        updated_at=now - timedelta(minutes=5),
+        flow_template_id="plan_project",
+        roles={"architect": "architect"},
+    )
+    events = [
+        AuditEvent(
+            ts=(now - timedelta(minutes=10)).isoformat(),
+            project="demo",
+            event="auto_claim_skipped_plan_missing",
+            subject="demo/4",
+            actor="auto_claim_sweep",
+            status="warn",
+            metadata={"task_id": "demo/4"},
+        ),
+    ]
+
+    findings = scan_events(
+        events,
+        now=now,
+        config=cfg,
+        open_tasks=[queued, plan_task],
+        project="demo",
+    )
+
+    assert not any(
+        f.rule == RULE_PLAN_MISSING_QUEUE_STALLED for f in findings
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1487,6 +1576,18 @@ def _representative_findings_for_lint() -> list[Finding]:
                 "window_seconds": REJECTION_LOOP_WINDOW_SECONDS,
             },
         ),
+        Finding(
+            rule=RULE_PLAN_MISSING_QUEUE_STALLED,
+            tier=TIER_2,
+            project="demo",
+            subject="demo",
+            metadata={"skip_count": 2, "threshold_seconds": 1800},
+            evidence={
+                "queued_subjects": ["demo/6"],
+                "auto_claim_skip_count": 2,
+                "threshold_seconds": 1800,
+            },
+        ),
     ]
 
 
@@ -1792,3 +1893,43 @@ def test_integration_rejection_loop_dispatches_via_architect(
     # The structural-loop framing must mention generating hypotheses
     # fresh — the issue's evidence-not-hypotheses principle.
     assert "fresh from the evidence" in brief
+
+
+def test_integration_plan_missing_queue_stall_dispatches_via_architect(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence_mod
+
+    sent: list[tuple[str, str]] = []
+
+    def _stub_send(target: str, brief: str) -> bool:
+        sent.append((target, brief))
+        return True
+
+    monkeypatch.setattr(cadence_mod, "_send_brief_to_architect", _stub_send)
+
+    finding = Finding(
+        rule=RULE_PLAN_MISSING_QUEUE_STALLED,
+        tier=TIER_2,
+        project="demo",
+        subject="demo",
+        evidence={
+            "queued_subjects": ["demo/4"],
+            "auto_claim_skip_count": 3,
+            "threshold_seconds": 1800,
+        },
+    )
+    outcome = cadence_mod._maybe_dispatch_to_architect(
+        finding,
+        project_path=None,
+        storage_closet_name="pollypm-storage-closet",
+        now=now,
+    )
+
+    assert outcome == "dispatched"
+    assert len(sent) == 1
+    target, brief = sent[0]
+    assert target == "pollypm-storage-closet:architect-demo"
+    assert "plan_missing_queue_stalled" in brief
+    assert "demo/4" in brief
+    assert "make the queue claimable" in brief

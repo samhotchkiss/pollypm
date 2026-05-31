@@ -111,6 +111,7 @@ __all__ = [
     "RULE_PLAN_REVIEW_BYPASSED_APPROVAL",
     "RULE_LEGACY_DB_SHADOW",
     "RULE_PLAN_MISSING_ALERT_CHURN",
+    "RULE_PLAN_MISSING_QUEUE_STALLED",
     "RULE_REJECTION_LOOP",
     "RULE_STATE_DB_MISSING",
     "RULE_QUEUE_WITHOUT_MOTION",
@@ -226,6 +227,11 @@ RULE_LEGACY_DB_SHADOW = "legacy_db_shadow"
 # in the cockpit. Threshold defaults to >=3 clear events on the same
 # ``plan_gate-<project>`` scope inside ``plan_missing_churn_window_seconds``.
 RULE_PLAN_MISSING_ALERT_CHURN = "plan_missing_alert_churn"
+# #2503 — plan-gated queued implementation work must not silently rot
+# after auto-claim proves the queue cannot dispatch it. This is distinct
+# from the alert-churn canary above: the alert can be stable while the
+# architect still thinks it handed work to an executable queue.
+RULE_PLAN_MISSING_QUEUE_STALLED = "plan_missing_queue_stalled"
 # #1546 — heartbeat-cascade foundation. Three new rules:
 #
 # * ``rejection_loop`` — fires when a task accumulates K=3+ consecutive
@@ -433,6 +439,10 @@ class WatchdogConfig:
     # place, never closes-and-reopens).
     plan_missing_churn_window_seconds: int = 600
     plan_missing_churn_threshold: int = 3
+    # #2503 — when auto-claim keeps skipping queued implementation work
+    # because the approved-plan gate is closed, route structured evidence
+    # to the architect instead of waiting for a human hand-claim.
+    plan_missing_queue_stall_seconds: int = QUEUE_MOTION_THRESHOLD_SECONDS
     # #1546 — rejection-loop detector. K=3 consecutive rejections at
     # the same review node inside W=2h with clustered reject reasons.
     rejection_loop_threshold: int = REJECTION_LOOP_THRESHOLD
@@ -3150,6 +3160,7 @@ _QUEUE_MOTION_EVENTS: frozenset[str] = frozenset({
     "execution.completed",
     EVENT_WORKER_HEARTBEAT,
 })
+_AUTO_CLAIM_PLAN_MISSING_EVENT = "auto_claim_skipped_plan_missing"
 
 
 _QUEUE_WITHOUT_MOTION_TITLE_RE = re.compile(
@@ -3181,6 +3192,61 @@ def _task_label_set(task: Any) -> set[str]:
     except TypeError:
         return set()
     return out
+
+
+def _task_flow_template(task: Any) -> str:
+    return _task_scalar_value(task, "flow_template_id")
+
+
+def _task_subject(task: Any) -> str:
+    project = _task_scalar_value(task, "project")
+    task_number = getattr(task, "task_number", None)
+    if project and task_number is not None:
+        return f"{project}/{task_number}"
+    return _task_scalar_value(task, "task_id")
+
+
+def _open_plan_project_exists(
+    tasks: Sequence[Any],
+    *,
+    project_key: str,
+) -> bool:
+    for task in tasks:
+        if _task_scalar_value(task, "project") != project_key:
+            continue
+        if _task_flow_template(task) != "plan_project":
+            continue
+        if _task_status_value(task) in _TERMINAL_TASK_STATES:
+            continue
+        return True
+    return False
+
+
+def _plan_gate_blocks_task(task: Any) -> bool:
+    try:
+        from pollypm.plan_presence import task_bypasses_plan_gate
+
+        return not task_bypasses_plan_gate(task)
+    except Exception:  # noqa: BLE001
+        flow_id = _task_flow_template(task)
+        if flow_id in {"plan_project", "critique_flow"}:
+            return False
+        return "bypass_plan_gate" not in _task_label_set(task)
+
+
+def _plan_missing_skip_events(ctx: ProbeContext) -> list[AuditEvent]:
+    events: list[AuditEvent] = []
+    for ev in ctx.events or ():
+        if ev.event != _AUTO_CLAIM_PLAN_MISSING_EVENT:
+            continue
+        if ev.project and ev.project != ctx.project_key:
+            continue
+        events.append(ev)
+    return events
+
+
+def _has_plan_missing_auto_claim_skip(ctx: ProbeContext) -> bool:
+    return bool(_plan_missing_skip_events(ctx))
 
 
 def _is_unactioned_queue_without_motion_task(
@@ -3239,6 +3305,8 @@ def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
     timestamp so the prompt builder can hand structured signal upward.
     """
     if ctx.project_key in QUEUE_WITHOUT_MOTION_SUPPRESSED_PROJECTS:
+        return []
+    if _has_plan_missing_auto_claim_skip(ctx):
         return []
 
     cutoff = ctx.now - timedelta(
@@ -3332,6 +3400,93 @@ def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
 
 # Register the one shipped probe on import.
 register_safety_net_probe(_queue_without_motion_probe)
+
+
+def _plan_missing_queue_stalled_probe(ctx: ProbeContext) -> list[Finding]:
+    """Specific safety net for queued work blocked by the plan gate (#2503)."""
+    skip_events = _plan_missing_skip_events(ctx)
+    if not skip_events:
+        return []
+    if _open_plan_project_exists(ctx.open_tasks or (), project_key=ctx.project_key):
+        return []
+
+    cutoff = ctx.now - timedelta(
+        seconds=ctx.config.plan_missing_queue_stall_seconds,
+    )
+    queued_subjects: list[str] = []
+    stale_subjects: list[str] = []
+    queued_last_updated: dict[str, str] = {}
+    for task in ctx.open_tasks or ():
+        if _task_status_value(task) != "queued":
+            continue
+        if _task_scalar_value(task, "project") != ctx.project_key:
+            continue
+        if not _plan_gate_blocks_task(task):
+            continue
+        subject = _task_subject(task)
+        if not subject:
+            continue
+        queued_subjects.append(subject)
+        stamp = _coerce_datetime(
+            getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+        )
+        if stamp is not None:
+            queued_last_updated[subject] = stamp.isoformat()
+            if stamp <= cutoff:
+                stale_subjects.append(subject)
+
+    if not queued_subjects:
+        return []
+
+    skip_times = [
+        parsed for ev in skip_events
+        if (parsed := _parse_iso(ev.ts)) is not None
+    ]
+    first_skip = min(skip_times).isoformat() if skip_times else None
+    last_skip = max(skip_times).isoformat() if skip_times else None
+    has_old_skip = any(ts <= cutoff for ts in skip_times)
+    if not stale_subjects and not has_old_skip:
+        return []
+
+    subjects_for_evidence = stale_subjects or queued_subjects
+    return [Finding(
+        rule=RULE_PLAN_MISSING_QUEUE_STALLED,
+        tier=TIER_2,
+        project=ctx.project_key,
+        subject=ctx.project_key,
+        message=(
+            f"Project {ctx.project_key} has {len(queued_subjects)} queued "
+            "implementation task(s) that auto-claim skipped because the "
+            "approved plan is missing."
+        ),
+        recommendation=(
+            f"Dispatch the architect to start or resume planning for "
+            f"{ctx.project_key}; do not report worker handoff until the "
+            "plan gate is open or the tasks carry an explicit bypass."
+        ),
+        metadata={
+            "queued_count": len(queued_subjects),
+            "stale_queued_count": len(stale_subjects),
+            "first_skip_at": first_skip,
+            "last_skip_at": last_skip,
+            "skip_count": len(skip_events),
+            "threshold_seconds": ctx.config.plan_missing_queue_stall_seconds,
+            "detected_via": "probe",
+        },
+        evidence={
+            "queued_subjects": list(subjects_for_evidence),
+            "all_queued_subjects": list(queued_subjects),
+            "queued_last_updated": dict(queued_last_updated),
+            "auto_claim_skip_event": _AUTO_CLAIM_PLAN_MISSING_EVENT,
+            "auto_claim_skip_count": len(skip_events),
+            "first_skip_at": first_skip,
+            "last_skip_at": last_skip,
+            "threshold_seconds": ctx.config.plan_missing_queue_stall_seconds,
+        },
+    )]
+
+
+register_safety_net_probe(_plan_missing_queue_stalled_probe)
 
 
 # ---------------------------------------------------------------------------
@@ -4960,6 +5115,47 @@ def _brief_worker_session_dead_loop(
     return lines
 
 
+def _brief_plan_missing_queue_stalled(
+    finding: Finding,
+    meta: dict,
+) -> list[str]:
+    """Brief body for plan-gated queued work that cannot auto-claim."""
+    evidence = finding.evidence or {}
+    queued = evidence.get("queued_subjects") or []
+    first_skip = evidence.get("first_skip_at") or meta.get("first_skip_at")
+    last_skip = evidence.get("last_skip_at") or meta.get("last_skip_at")
+    threshold = evidence.get("threshold_seconds") or meta.get("threshold_seconds")
+    skip_count = evidence.get("auto_claim_skip_count") or meta.get("skip_count")
+    lines: list[str] = []
+    lines.append("Stuck for: plan-gate auto-claim stall")
+    lines.append("Observed evidence:")
+    if queued:
+        lines.append(f"- Queued implementation task(s): {', '.join(map(str, queued))}")
+    if skip_count:
+        lines.append(
+            f"- Auto-claim skipped on missing approved plan {skip_count} time(s)."
+        )
+    if first_skip or last_skip:
+        lines.append(f"- First skip: {first_skip or 'unknown'}")
+        lines.append(f"- Last skip: {last_skip or 'unknown'}")
+    if threshold:
+        lines.append(f"- Stall threshold: {threshold} seconds")
+    lines.append("")
+    lines.append(
+        "ACTION REQUIRED: make the queue claimable before reporting handoff. "
+        f"Start or resume planning for {finding.project} with "
+        f"`pm project plan {finding.project}` if no active plan_project task "
+        "exists. If the tasks are intentionally emergency work, update them "
+        "with the explicit `bypass_plan_gate` label and cite why."
+    )
+    lines.append(
+        "End this turn after the state-changing command has succeeded. "
+        "Do not reply that you are standing by while worker auto-claim is "
+        "still skipping on plan_missing."
+    )
+    return lines
+
+
 def _brief_fallback(finding: Finding) -> list[str]:
     """Generic brief body for rules without a tailored template.
 
@@ -5064,6 +5260,8 @@ def format_unstick_brief(
         lines.extend(_brief_rejection_loop(finding, meta))
     elif finding.rule == RULE_WORKER_SESSION_DEAD_LOOP:
         lines.extend(_brief_worker_session_dead_loop(finding, subject, meta))
+    elif finding.rule == RULE_PLAN_MISSING_QUEUE_STALLED:
+        lines.extend(_brief_plan_missing_queue_stalled(finding, meta))
     else:
         lines.extend(_brief_fallback(finding))
     body = "\n".join(lines)

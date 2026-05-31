@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
@@ -1028,6 +1029,56 @@ class TestWorkerLaunchBundleAccountFilter:
                 status="auth-broken",
                 reason="legacy hyphen form",
             )
+
+        manager = SessionManager(
+            mock_tmux,
+            mock_svc,
+            tmp_project,
+            config=config,
+            session_service=MagicMock(),
+        )
+
+        worktree_path = tmp_project / ".pollypm" / "worktrees" / "proj-1"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        (_cmd, _prov, account_name, _fresh, _home) = manager._worker_launch_bundle(
+            worktree_path=worktree_path,
+            agent_name="claude_main",
+            window_name="task-proj-1",
+            project="proj",
+        )
+
+        assert account_name == "claude_backup"
+
+    def test_worker_launch_bundle_skips_low_remaining_primary(
+        self, monkeypatch, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        """Known-low usage is treated like a soft failover condition for
+        fresh worker launches, so a task does not pin to a nearly
+        exhausted account when a healthier failover account exists."""
+        primary_home = tmp_path / "claude-main-home"
+        fallback_home = tmp_path / "claude-backup-home"
+        config = self._multi_account_config(
+            tmp_project, primary_home=primary_home, fallback_home=fallback_home,
+        )
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_accounts.get_account_runtime",
+            lambda _name: None,
+        )
+
+        def fake_usage(name: str):
+            remaining = 5 if name == "claude_main" else 80
+            return SimpleNamespace(
+                health="healthy",
+                usage_summary=f"{remaining}% left this week",
+                remaining_pct=remaining,
+                used_pct=100 - remaining,
+            )
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_accounts.get_account_usage",
+            fake_usage,
+        )
 
         manager = SessionManager(
             mock_tmux,

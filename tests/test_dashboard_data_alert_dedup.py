@@ -970,6 +970,58 @@ def test_briefing_surfaces_recovery_narration() -> None:
     assert "Saved:" not in out
 
 
+def test_briefing_merges_same_task_unstick_recovery_narrations() -> None:
+    from pollypm.dashboard_data import (
+        _build_dashboard_briefing,
+        _recovery_audit_narrations_from_events,
+    )
+
+    events = [
+        SimpleNamespace(
+            event="watchdog.escalation_dispatched",
+            metadata={
+                "finding_type": "task_review_stale",
+                "subject": "itsalive/55",
+            },
+            subject="itsalive/55",
+            project="itsalive",
+            status="warn",
+        ),
+        SimpleNamespace(
+            event="watchdog.escalation_dispatched",
+            metadata={
+                "finding_type": "task_rework_stale",
+                "subject": "itsalive/55",
+            },
+            subject="itsalive/55",
+            project="itsalive",
+            status="warn",
+        ),
+    ]
+
+    summaries = _recovery_audit_narrations_from_events(
+        events,
+        limit=3,
+        recent_real_work_projects=frozenset({"itsalive"}),
+    )
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=0,
+        recent_messages=[],
+        recovery_count_24h=2,
+        recovery_summaries=summaries,
+    )
+
+    assert summaries == [
+        "I sent unstick briefs for stale review and rework on task 55 in itsalive "
+        "so the project could keep moving.",
+    ]
+    assert out.count("task 55") == 1
+    assert "stale review and rework" in out
+    assert "task rework stale" not in out
+
+
 def test_briefing_first_up_skips_dormant_projects() -> None:
     from pollypm.dashboard_data import _build_dashboard_briefing, InboxPreview
 

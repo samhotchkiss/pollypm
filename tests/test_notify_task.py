@@ -161,6 +161,20 @@ class TestIsNotifyInboxTask:
                 f"title-prefix {prefix_title!r} should be filtered as a notify"
             )
 
+    def test_orphan_worktree_notice_is_notify_only(self) -> None:
+        """#2520: old orphan-worktree audit rows are maintenance FYI, not inbox work."""
+        task = _make_task(
+            title="Orphan worktree branch: russell/58",
+            labels=[
+                "audit:worktree_state",
+                "worktree_audit:russell/58:orphan_branch",
+            ],
+            flow_template_id="chat",
+            roles={"requester": "user", "actor": "worker-russell-58"},
+        )
+        assert is_notify_inbox_task(task) is True
+        assert is_notify_only_inbox_entry(task) is True
+
     def test_real_worker_assigned_task_surfaced(self) -> None:
         """The negative case: a real worker-assigned implementation task
         must still surface. ``roles.operator`` is a worker-shaped role,

@@ -963,6 +963,9 @@ _BOOKKEEPING_COMMIT_RE = re.compile(
     r"^(?:journal|ledger|chore)(?:\(|:)|^journal\(48h\):",
     re.IGNORECASE,
 )
+_BRIEFING_MAINTENANCE_TITLE_PREFIXES = (
+    "Orphan worktree branch:",
+)
 
 
 def _human_project_label(value: str) -> str:
@@ -998,6 +1001,16 @@ def _briefing_message_project_key(message: object) -> str | None:
     return None
 
 
+def _briefing_message_is_operator_relevant(message: object) -> bool:
+    title = str(getattr(message, "title", "") or "").strip()
+    if any(
+        title.startswith(prefix)
+        for prefix in _BRIEFING_MAINTENANCE_TITLE_PREFIXES
+    ):
+        return False
+    return True
+
+
 def _project_is_live_for_briefing(
     project_key: str | None,
     recent_real_work_projects: frozenset[str] | None,
@@ -1015,6 +1028,8 @@ def _first_briefing_message(
     recent_real_work_projects: frozenset[str] | None,
 ) -> InboxPreview | None:
     for message in recent_messages:
+        if not _briefing_message_is_operator_relevant(message):
+            continue
         if _project_is_live_for_briefing(
             _briefing_message_project_key(message),
             recent_real_work_projects,
@@ -1092,6 +1107,8 @@ def _remaining_inbox_line(
     groups: dict[str, tuple[int, float]] = {}
     for message in recent_messages:
         if getattr(message, "task_id", None) == first_task_id:
+            continue
+        if not _briefing_message_is_operator_relevant(message):
             continue
         if not _project_is_live_for_briefing(
             _briefing_message_project_key(message),
@@ -1353,6 +1370,7 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         inbox_tasks_for_project,
         inbox_tasks_grouped,
     )
+    from pollypm.notify_task import is_notify_only_inbox_entry
 
     now = datetime.now(UTC)
     seen_task_ids: set[str] = set()
@@ -1381,6 +1399,8 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         project_label: str,
         project_key: str | None,
     ) -> None:
+        if is_notify_only_inbox_entry(task):
+            return
         if task.task_id in seen_task_ids:
             return
         seen_task_ids.add(task.task_id)

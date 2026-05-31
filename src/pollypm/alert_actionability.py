@@ -172,6 +172,10 @@ def _worktree_state_is_stale(
     *,
     context: AlertActionabilityContext,
 ) -> bool:
+    # Orphan worktree cleanup is mechanical GC; the audit handler
+    # self-heals terminal rows and leaves non-terminal rows as FYI logs.
+    if alert_type.endswith(":orphan_branch"):
+        return True
     project = _worktree_state_project(
         alert_type,
         known_projects=context.known_projects or context.tracked_projects,

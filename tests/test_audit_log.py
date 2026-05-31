@@ -69,7 +69,11 @@ def test_emit_writes_to_central_tail(tmp_path: Path) -> None:
 
     central = central_log_path("demo")
     assert central.exists(), "central tail should be created on first emit"
-    lines = [l for l in central.read_text(encoding="utf-8").splitlines() if l.strip()]
+    lines = [
+        line
+        for line in central.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     assert len(lines) == 1
     record = json.loads(lines[0])
     assert record["event"] == EVENT_TASK_CREATED
@@ -129,9 +133,13 @@ def test_emit_appends_multiple_events_in_order(tmp_path: Path) -> None:
         )
 
     central = central_log_path("multi")
-    lines = [l for l in central.read_text(encoding="utf-8").splitlines() if l.strip()]
+    lines = [
+        line
+        for line in central.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     assert len(lines) == 5
-    decoded = [json.loads(l) for l in lines]
+    decoded = [json.loads(line) for line in lines]
     assert [r["metadata"]["i"] for r in decoded] == [0, 1, 2, 3, 4]
     # All distinct timestamps OR equal-but-ordered — either way, the
     # append order is preserved.
@@ -448,7 +456,9 @@ def test_rotation_fires_when_size_exceeds_threshold(
     # original 20-event payload.
     assert audit_path.exists()
     live_lines = [
-        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+        line
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
     assert len(live_lines) < 20
 
@@ -503,9 +513,9 @@ def test_rotation_archives_contain_pre_rotation_events(
 
     # Plus whatever is in the live file currently.
     live_subjects = [
-        json.loads(l)["subject"]
-        for l in audit_path.read_text(encoding="utf-8").splitlines()
-        if l.strip()
+        json.loads(line)["subject"]
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
     # With retention=50 no archive can have been pruned, so every
     # subject we emitted must appear somewhere (archives + live).
@@ -560,10 +570,12 @@ def test_rotation_retention_prunes_old_archives(
         project_path=project_root,
     )
     final_lines = [
-        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+        line
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
     assert any(
-        json.loads(l)["subject"] == "retproj/final" for l in final_lines
+        json.loads(line)["subject"] == "retproj/final" for line in final_lines
     ), "post-rotation append must still land in the live file"
 
 
@@ -609,9 +621,11 @@ def test_rotation_failure_does_not_break_append(
     )
 
     lines = [
-        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+        line
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
-    subjects = [json.loads(l)["subject"] for l in lines]
+    subjects = [json.loads(line)["subject"] for line in lines]
     assert "failproj/after-failure" in subjects, (
         "audit append must succeed even when rotation fails"
     )
@@ -647,7 +661,9 @@ def test_rotation_disabled_via_env(
     )
     # All 20 lines should be in the live file because nothing rotated.
     lines = [
-        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+        line
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
     assert len(lines) == 20
 
@@ -771,6 +787,78 @@ def test_read_events_limit_uses_live_tail_without_full_scan(
         "tailfast/198",
         "tailfast/199",
     ]
+
+
+def test_read_events_since_uses_live_tail_without_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Watchdog sweeps query recent windows with ``since``.
+
+    That path must not walk a large live audit log from the head just to
+    discard old rows. It should read newest-first and stop at the first
+    row outside the requested window.
+    """
+    import pollypm.audit.log as log_mod
+
+    project_root = tmp_path / "sincefast"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    rows = []
+    for i in range(500):
+        rows.append(json.dumps({
+            "schema": SCHEMA_VERSION,
+            "ts": f"2026-05-30T00:{i // 60:02d}:{i % 60:02d}+00:00",
+            "project": "sincefast",
+            "event": "task.status_changed",
+            "subject": f"sincefast/old-{i}",
+            "actor": "test",
+            "status": "ok",
+            "metadata": {"padding": "x" * 64},
+        }))
+    for i in range(3):
+        rows.append(json.dumps({
+            "schema": SCHEMA_VERSION,
+            "ts": f"2026-05-31T10:00:0{i}+00:00",
+            "project": "sincefast",
+            "event": "task.status_changed",
+            "subject": f"sincefast/recent-{i}",
+            "actor": "test",
+            "status": "ok",
+            "metadata": {},
+        }))
+    audit_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def fail_forward_scan(_path):
+        raise AssertionError("since read should not scan from file head")
+
+    decode_calls = 0
+    original_decode = log_mod._decode_audit_line
+
+    def counting_decode(raw):
+        nonlocal decode_calls
+        decode_calls += 1
+        return original_decode(raw)
+
+    monkeypatch.setattr(log_mod, "_TAIL_READ_CHUNK_BYTES", 256)
+    monkeypatch.setattr(log_mod, "_iter_log_lines", fail_forward_scan)
+    monkeypatch.setattr(log_mod, "_decode_audit_line", counting_decode)
+
+    events = log_mod.read_events(
+        "sincefast",
+        project_path=project_root,
+        since="2026-05-31T09:59:59+00:00",
+    )
+
+    assert [event.subject for event in events] == [
+        "sincefast/recent-0",
+        "sincefast/recent-1",
+        "sincefast/recent-2",
+    ]
+    assert decode_calls < 20, (
+        "since reads should stop at the recent-window boundary, not "
+        "decode the full historical corpus"
+    )
 
 
 def test_read_events_chains_live_and_gz_in_chronological_order(

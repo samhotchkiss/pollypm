@@ -29,16 +29,20 @@ errors after logging a warning.
 
 ## Rotation And Retention
 
-There is no automatic rotation for audit JSONL files today. The
-[log rotation work in PR #1384](https://github.com/samhotchkiss/pollypm/pull/1384)
-covers `~/.pollypm/*.log` process logs such as `errors.log`,
-`cockpit_debug.log`, `rail_daemon.log`, and `phantom_client.log`; it does not
-cover `~/.pollypm/audit/*.jsonl` or `<project>/.pollypm/audit.jsonl`.
+Audit JSONL files rotate automatically during writes. Before appending, the
+writer checks the live file against the `[audit] rotate_size_mb` threshold
+(default `50`) and gzips oversized files to timestamped siblings such as
+`audit.jsonl.<epoch>.gz`. The next event starts a fresh live file. Rotation is
+best-effort: a failed rotate logs and the append still proceeds.
+
+The `[audit] retention_count` setting controls how many gzipped rotations are
+kept beside each audit file (default `4`). Older archives beyond the cap are
+pruned oldest-first. Set `[audit] disable_rotation = true` only as a temporary
+incident-debugging escape hatch; otherwise the audit corpus can grow without a
+bound.
 
 The `[events] audit_retention_days` setting applies to database `messages`
-rows categorized as audit events, not to these JSONL files. Until a dedicated
-audit-log rotation pass lands, operators should archive or truncate audit JSONL
-files manually after preserving any incident window they still need.
+rows categorized as audit events, not to these JSONL files.
 
 ## Event Schema
 
@@ -144,9 +148,14 @@ current work-service factory and DB-resolution model.
 
 The audit watchdog is registered by the built-in core recurring plugin as
 `audit.watchdog` on an `@every 5m` schedule. The handler emits a
-`heartbeat.tick`, reads each known project's audit log, runs pure detectors in
-`pollypm.audit.watchdog`, emits `audit.finding` for every finding, and upserts
-an alert keyed by `(rule, project, subject)`.
+`heartbeat.tick`, reads a bounded recent window from each known project's audit
+log, runs pure detectors in `pollypm.audit.watchdog`, emits `audit.finding` for
+every finding, and upserts an alert keyed by `(rule, project, subject)`.
+
+`read_events(..., since=...)` tails the live JSONL newest-first and stops once
+the requested window boundary is reached. Rotated `.gz` archives remain visible
+to the reader for dedupe windows, but they are streamed rather than loaded into
+one large in-memory list.
 
 | Rule | Detects | Default threshold | Operator response |
 |---|---|---|---|
@@ -264,8 +273,11 @@ gzip -c ~/.pollypm/audit/<project>.jsonl > ~/Desktop/<project>-audit.jsonl.gz
 : > ~/.pollypm/audit/<project>.jsonl
 ```
 
-Prefer truncation over deletion when a process may be tailing the file. No
-clear subcommand exists under `pm audit` today.
+Prefer truncation over deletion when a process may be tailing the file. Manual
+archival is rarely needed now that `[audit] rotate_size_mb` and
+`retention_count` bound the live corpus; use it only when you need to preserve
+or export a specific incident window. No clear subcommand exists under
+`pm audit` today.
 
 ## Contributor Surface
 

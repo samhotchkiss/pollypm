@@ -94,6 +94,10 @@ def _acquire_lifetime_lock(lock_path: Path) -> int | None:
     except OSError as exc:
         logger.warning("rail_daemon: could not open lock file %s: %s", lock_path, exc)
         return None
+    try:
+        os.set_inheritable(fd, False)
+    except OSError:
+        pass
 
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -128,6 +132,10 @@ _LIFETIME_LOCK_FD: int | None = None
 _SIGTERM_WATCHDOG_GRACE: float = 2.0
 
 
+class _ReexecFailed(RuntimeError):
+    """Raised when a stale-code re-exec could not replace this process."""
+
+
 def _claim_pid_file(pid_path: Path) -> bool:
     """Atomically write our PID iff no live daemon already holds the file.
 
@@ -157,6 +165,12 @@ def _claim_pid_file(pid_path: Path) -> bool:
 
     if pid_path.exists():
         existing = _read_existing_pid()
+        if existing == os.getpid():
+            # ``os.execv`` preserves the PID. A daemon that re-execed
+            # itself for a code bump starts with its own PID already in
+            # the file; accepting that claim avoids a false duplicate
+            # while the lifetime flock still prevents any second daemon.
+            return True
         if existing <= 0:
             # Another daemon may have won O_EXCL and not written its PID
             # bytes yet. Give that tiny critical section a chance to
@@ -198,6 +212,102 @@ def _claim_pid_file(pid_path: Path) -> bool:
     finally:
         os.close(fd)
     return True
+
+
+def _current_runtime_code_fingerprint():
+    """Return the current import-code fingerprint, or ``None`` if unknown."""
+    try:
+        from pollypm.deploy_info import runtime_code_fingerprint
+
+        return runtime_code_fingerprint()
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "rail_daemon: runtime code fingerprint check failed",
+            exc_info=True,
+        )
+        return None
+
+
+def _fingerprint_display(fingerprint: object | None) -> str:
+    if fingerprint is None:
+        return "unknown"
+    display = getattr(fingerprint, "display", None)
+    if callable(display):
+        try:
+            return str(display())
+        except Exception:  # noqa: BLE001
+            pass
+    kind = getattr(fingerprint, "kind", "unknown")
+    value = getattr(fingerprint, "value", "")
+    if isinstance(value, str) and "sha" in str(kind) and len(value) > 12:
+        value = value[:12]
+    return f"{kind}={value}"
+
+
+def _runtime_code_changed(
+    boot_fingerprint: object | None,
+    current_fingerprint: object | None,
+) -> bool:
+    """True when comparable runtime-code fingerprints differ."""
+    if boot_fingerprint is None or current_fingerprint is None:
+        return False
+    boot_kind = getattr(boot_fingerprint, "kind", None)
+    current_kind = getattr(current_fingerprint, "kind", None)
+    if boot_kind != current_kind:
+        logger.debug(
+            "rail_daemon: code fingerprint kind changed (%s -> %s); "
+            "skipping re-exec until the signal is comparable",
+            boot_kind, current_kind,
+        )
+        return False
+    boot_token = getattr(boot_fingerprint, "token", None)
+    current_token = getattr(current_fingerprint, "token", None)
+    if boot_token is None:
+        boot_token = f"{boot_kind}:{getattr(boot_fingerprint, 'value', '')}"
+    if current_token is None:
+        current_token = f"{current_kind}:{getattr(current_fingerprint, 'value', '')}"
+    return str(boot_token) != str(current_token)
+
+
+def _reexec_argv() -> list[str]:
+    argv = list(sys.argv)
+    if not argv:
+        argv = ["-m", "pollypm.rail_daemon"]
+    return [sys.executable, *argv]
+
+
+def _reexec_for_runtime_code_change(
+    rail: object,
+    *,
+    boot_fingerprint: object | None,
+    current_fingerprint: object | None,
+) -> None:
+    """Stop the rail and replace this process with a fresh interpreter."""
+    logger.warning(
+        "rail_daemon: runtime code changed (%s -> %s); "
+        "stopping rail and re-execing",
+        _fingerprint_display(boot_fingerprint),
+        _fingerprint_display(current_fingerprint),
+    )
+    try:
+        stop = getattr(rail, "stop", None)
+        if callable(stop):
+            stop()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "rail_daemon: rail.stop() raised before code-refresh re-exec; "
+            "continuing with exec so the next boot can recover orphaned jobs",
+        )
+
+    argv = _reexec_argv()
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as exc:
+        logger.exception(
+            "rail_daemon: re-exec failed after runtime code change; "
+            "exiting so the external supervisor can revive a fresh daemon",
+        )
+        raise _ReexecFailed(str(exc)) from exc
 
 
 def _pid_alive(pid: int) -> bool:
@@ -325,6 +435,7 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
         logger.error("rail_daemon: supervisor has no core_rail attribute")
         pid_path.unlink(missing_ok=True)
         return 2
+    boot_fingerprint = _current_runtime_code_fingerprint()
 
     stopping = {"flag": False, "deadline": 0.0}
 
@@ -429,8 +540,9 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     _crash_loop_file(pollypm_home).unlink(missing_ok=True)
 
     logger.info(
-        "rail_daemon: started (pid=%d, poll=%.1fs) — heartbeat rail live",
-        os.getpid(), poll_interval,
+        "rail_daemon: started (pid=%d, poll=%.1fs, code=%s) — "
+        "heartbeat rail live",
+        os.getpid(), poll_interval, _fingerprint_display(boot_fingerprint),
     )
 
     # The rail's internal ticker thread does the work; we just keep
@@ -443,6 +555,16 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     while not stopping["flag"]:
         slice_s = min(0.5, max(0.0, deadline - time.monotonic()))
         if slice_s <= 0:
+            current_fingerprint = _current_runtime_code_fingerprint()
+            if _runtime_code_changed(boot_fingerprint, current_fingerprint):
+                try:
+                    _reexec_for_runtime_code_change(
+                        rail,
+                        boot_fingerprint=boot_fingerprint,
+                        current_fingerprint=current_fingerprint,
+                    )
+                except _ReexecFailed:
+                    return 4
             deadline = time.monotonic() + poll_interval
             continue
         time.sleep(slice_s)

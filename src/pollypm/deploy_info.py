@@ -84,6 +84,26 @@ class DeployStaleness:
     data: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeCodeFingerprint:
+    """Small runtime-code identity token for long-lived process re-exec checks."""
+
+    kind: str
+    value: str
+    package_path: str | None = None
+    source_checkout: str | None = None
+
+    @property
+    def token(self) -> str:
+        return f"{self.kind}:{self.value}"
+
+    def display(self) -> str:
+        value = self.value
+        if "sha" in self.kind and len(value) > 12:
+            value = value[:12]
+        return f"{self.kind}={value}"
+
+
 def _safe_resolve(path: Path) -> Path:
     try:
         return path.resolve()
@@ -382,6 +402,88 @@ def runtime_build_info(
             "stale_reason": reason,
         }
     )
+
+
+def runtime_code_fingerprint(
+    *,
+    package_name: str = PACKAGE_NAME,
+    import_name: str = PACKAGE_IMPORT_NAME,
+) -> RuntimeCodeFingerprint | None:
+    """Return a cheap identity token for the code this process imports.
+
+    This intentionally avoids :func:`runtime_build_info`'s package-tree
+    mtime scan so long-lived processes can call it periodically. The
+    preferred signal is the git HEAD of the imported package path, which
+    covers editable installs. Non-editable installs fall back to the
+    embedded build SHA written into shipped packages, then to a package
+    directory mtime token as a last resort.
+    """
+
+    package_path, package_file = _package_location(import_name)
+    package_version, _dist_info_path, direct_url = _distribution_info(package_name)
+    (
+        _direct_url_text,
+        direct_url_editable,
+        _direct_url_vcs,
+        direct_url_vcs_commit_id,
+        direct_url_source,
+    ) = _direct_url_fields(direct_url)
+
+    served_git_root = _git_root(package_path)
+    if served_git_root is not None:
+        served_git_sha = _git_head(served_git_root)
+        if served_git_sha:
+            return RuntimeCodeFingerprint(
+                kind="served_git_sha",
+                value=served_git_sha,
+                package_path=str(package_path) if package_path else None,
+                source_checkout=str(served_git_root),
+            )
+
+    embedded_build_info = _embedded_build_info(package_path)
+    embedded_sha = embedded_build_info.get("git_sha")
+    if embedded_sha:
+        return RuntimeCodeFingerprint(
+            kind="embedded_git_sha",
+            value=embedded_sha,
+            package_path=str(package_path) if package_path else None,
+        )
+
+    if direct_url_editable is True and direct_url_source is not None:
+        source_root = _git_root(direct_url_source)
+        if source_root is not None:
+            source_sha = _git_head(source_root)
+            if source_sha:
+                return RuntimeCodeFingerprint(
+                    kind="editable_source_git_sha",
+                    value=source_sha,
+                    package_path=str(package_path) if package_path else None,
+                    source_checkout=str(source_root),
+                )
+
+    if direct_url_vcs_commit_id:
+        return RuntimeCodeFingerprint(
+            kind="direct_url_vcs_commit_id",
+            value=direct_url_vcs_commit_id,
+            package_path=str(package_path) if package_path else None,
+        )
+
+    for candidate in (package_path, package_file):
+        if candidate is None:
+            continue
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        return RuntimeCodeFingerprint(
+            kind="package_mtime_ns",
+            value=f"{candidate}:{stat.st_mtime_ns}",
+            package_path=str(package_path) if package_path else None,
+        )
+
+    if package_version:
+        return RuntimeCodeFingerprint(kind="version", value=package_version)
+    return None
 
 
 @cache

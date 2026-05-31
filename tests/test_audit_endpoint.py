@@ -265,6 +265,7 @@ def test_activity_endpoint_narrates_recovery_events(
                 project="polly_remote",
                 event="recovery.spawn",
                 subject="architect_polly_remote",
+                ts=datetime.now(timezone.utc).isoformat(),
                 actor="supervisor",
                 metadata={
                     "failure_type": "capacity_exhausted",
@@ -292,6 +293,117 @@ def test_activity_endpoint_narrates_recovery_events(
     )
     assert "architect_polly_remote" not in event["summary"]
     assert "capacity_exhausted" not in event["summary"]
+
+
+def test_activity_endpoint_defaults_to_recent_window(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Activity is a recent feed, not an all-time audit dump."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(
+                subject="myproj/old",
+                ts=(now - timedelta(days=3)).isoformat(),
+            ),
+            _make_event(
+                subject="myproj/fresh",
+                ts=(now - timedelta(minutes=5)).isoformat(),
+            ),
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={"project": "myproj", "limit": 10},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    subjects = [e["subject"] for e in response.json()["events"]]
+    assert subjects == ["myproj/fresh"]
+
+
+def test_activity_endpoint_groups_repeated_watchdog_escalations(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Repeated stuck-draft escalation rows collapse into one calm row."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(
+                event="watchdog.escalation_dispatched",
+                subject=f"myproj/{number}",
+                ts=(now - timedelta(minutes=number)).isoformat(),
+                metadata={"rule": "stuck_draft"},
+            )
+            for number in range(1, 4)
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={"project": "myproj", "since": "24h", "limit": 10},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    events = response.json()["events"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["event"] == "watchdog.escalation_dispatched"
+    assert event["summary"] == "I sent unstick briefs for 3 stuck drafts in myproj."
+    assert event["metadata"]["activity_group"]["count"] == 3
+
+
+def test_activity_endpoint_keeps_cross_project_signal_when_one_project_is_noisy(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """A single target's volume must not hide recent rows from other projects."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(
+                event="task.created",
+                subject=f"myproj/{number}",
+                ts=(now - timedelta(seconds=number)).isoformat(),
+            )
+            for number in range(30, 0, -1)
+        ],
+    )
+    _write_jsonl(
+        _central_log(audit_home, "otherproj"),
+        [
+            _make_event(
+                project="otherproj",
+                event="task.created",
+                subject="otherproj/1",
+                ts=(now - timedelta(minutes=1)).isoformat(),
+            )
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={"since": "24h", "limit": 5},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    subjects = [e["subject"] for e in response.json()["events"]]
+    assert "otherproj/1" in subjects
 
 
 def test_grep_regex_pattern_filters_lines(

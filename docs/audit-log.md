@@ -157,6 +157,12 @@ the requested window boundary is reached. Rotated `.gz` archives remain visible
 to the reader for dedupe windows, but they are streamed rather than loaded into
 one large in-memory list.
 
+The cadence path also narrows the read to event names consumed by the watchdog
+detectors and caps each per-project scan at `scan_event_limit` events (default
+`10000`). This keeps a bursty audit tail from making the long-lived daemon hold
+allocator arenas after one sweep; in an event storm the newest matching rows win
+and the next cadence tick gets another bounded slice.
+
 | Rule | Detects | Default threshold | Operator response |
 |---|---|---|---|
 | `orphan_marker` | `marker.created` without matching `marker.released` and without a terminal task transition. | `window_seconds=1800` | Inspect the worker pane; resume it or transition/cancel the task so cleanup can release the marker. |

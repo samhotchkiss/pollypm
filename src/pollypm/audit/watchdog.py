@@ -452,6 +452,11 @@ class WatchdogConfig:
     # for this many seconds fires a tier-2 finding routed to the
     # operator leg.
     queue_motion_threshold_seconds: int = QUEUE_MOTION_THRESHOLD_SECONDS
+    # Hard ceiling for the audit-event objects materialized by one
+    # project scan. Detector reads are time-windowed first; this caps
+    # pathological bursts inside that window so the long-lived daemon
+    # cannot retain allocator arenas after a huge sweep.
+    scan_event_limit: int = 10_000
 
 
 @dataclass(slots=True, frozen=True)
@@ -3162,6 +3167,21 @@ _QUEUE_MOTION_EVENTS: frozenset[str] = frozenset({
     EVENT_WORKER_HEARTBEAT,
 })
 _AUTO_CLAIM_PLAN_MISSING_EVENT = "auto_claim_skipped_plan_missing"
+_WATCHDOG_SCAN_EVENT_NAMES: frozenset[str] = frozenset({
+    EVENT_MARKER_CREATED,
+    EVENT_MARKER_RELEASED,
+    EVENT_MARKER_LEAKED,
+    EVENT_TASK_CREATED,
+    EVENT_TASK_STATUS_CHANGED,
+    EVENT_WORKER_HEARTBEAT,
+    EVENT_WORKER_SESSION_REAPED,
+    EVENT_AUDIT_FINDING,
+    EVENT_AUDIT_FINDING_DISMISSED,
+    EVENT_STUCK_DRAFT_TERMINATED,
+    EVENT_STUCK_DRAFT_RECLAIMED,
+    _AUTO_CLAIM_PLAN_MISSING_EVENT,
+    *_QUEUE_MOTION_EVENTS,
+})
 
 
 _QUEUE_WITHOUT_MOTION_TITLE_RE = re.compile(
@@ -3741,6 +3761,7 @@ def _merge_central_stuck_draft_signals(
     project: str,
     since: str,
     project_path: Path | str | None,
+    limit: int | None,
 ) -> list[AuditEvent]:
     """Merge durable central stuck_draft signal rows into project readback.
 
@@ -3766,6 +3787,7 @@ def _merge_central_stuck_draft_signals(
                 project,
                 since=since,
                 event=event_name,
+                limit=limit,
                 project_path=None,
             )
         except Exception:  # noqa: BLE001
@@ -3900,9 +3922,12 @@ def scan_project(
     since = (
         resolved_now - timedelta(seconds=config.window_seconds * 2)
     ).isoformat()
+    scan_event_limit = max(1, int(config.scan_event_limit))
     events = read_events(
         project,
         since=since,
+        limit=scan_event_limit,
+        event_names=_WATCHDOG_SCAN_EVENT_NAMES,
         project_path=project_path,
     )
     events = _merge_central_stuck_draft_signals(
@@ -3910,6 +3935,7 @@ def scan_project(
         project=project,
         since=since,
         project_path=project_path,
+        limit=scan_event_limit,
     )
     backfill_reclaims = _stuck_draft_reclaim_backfill_candidates(
         events,
@@ -4298,6 +4324,7 @@ def was_recently_dispatched(
             project,
             since=cutoff,
             event=EVENT_WATCHDOG_ESCALATION_DISPATCHED,
+            limit=1000,
             project_path=project_path,
         )
     except Exception:  # noqa: BLE001 — never block dispatch on read failure
@@ -4394,6 +4421,7 @@ def was_recently_operator_dispatched(
             project,
             since=cutoff,
             event=EVENT_WATCHDOG_OPERATOR_DISPATCHED,
+            limit=1000,
             project_path=project_path,
         )
     except Exception:  # noqa: BLE001

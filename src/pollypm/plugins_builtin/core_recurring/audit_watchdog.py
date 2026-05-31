@@ -327,6 +327,7 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
         "progress_stale_seconds",
         "on_hold_stale_seconds",
         "rework_stale_seconds",
+        "scan_event_limit",
     ):
         raw = payload.get(field_name)
         if raw is None:

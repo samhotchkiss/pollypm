@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1142,6 +1144,131 @@ def _worktree_audit_handle_dirty_stale(
     return 0, 0
 
 
+_TERMINAL_TASK_STATUS_VALUES = frozenset({"done", "cancelled"})
+_TASK_WORKTREE_BRANCH_PREFIXES = ("task/",)
+
+
+def _status_value(value: object) -> str:
+    return str(getattr(value, "value", value) or "").strip().lower()
+
+
+def _worktree_audit_task_is_terminal(work: Any, task_id: str) -> bool:
+    try:
+        task = work.get(task_id)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worktree.state_audit: could not read task %s for orphan cleanup",
+            task_id,
+            exc_info=True,
+        )
+        return False
+    return _status_value(getattr(task, "work_status", None)) in _TERMINAL_TASK_STATUS_VALUES
+
+
+def _git_for_worktree_cleanup(
+    repo_root: Path,
+    *args: str,
+    timeout: int = 300,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _remove_orphan_task_worktree(
+    *,
+    repo_root: Path,
+    wt_path: Path,
+    branch: str | None,
+) -> bool:
+    """Remove a terminal task's leftover git worktree and branch."""
+    if not wt_path.exists():
+        return True
+    result = _git_for_worktree_cleanup(
+        repo_root, "worktree", "remove", "--force", str(wt_path),
+    )
+    if result.returncode != 0 and "locked" in (result.stderr or "").lower():
+        _git_for_worktree_cleanup(repo_root, "worktree", "unlock", str(wt_path))
+        result = _git_for_worktree_cleanup(
+            repo_root, "worktree", "remove", "--force", str(wt_path),
+        )
+    if result.returncode != 0:
+        logger.warning(
+            "worktree.state_audit: failed to remove orphan task worktree %s: %s",
+            wt_path,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    _git_for_worktree_cleanup(repo_root, "worktree", "prune", timeout=60)
+    if branch and branch.startswith(_TASK_WORKTREE_BRANCH_PREFIXES):
+        _git_for_worktree_cleanup(repo_root, "branch", "-D", branch, timeout=60)
+    return True
+
+
+def _mark_orphan_worker_session_ended(work: Any, sess: Any) -> None:
+    marker = getattr(work, "mark_worker_session_ended", None)
+    if not callable(marker):
+        return
+    try:
+        marker(
+            task_project=sess.task_project,
+            task_number=int(sess.task_number),
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worktree.state_audit: mark_worker_session_ended failed for %s/%s",
+            getattr(sess, "task_project", ""),
+            getattr(sess, "task_number", ""),
+            exc_info=True,
+        )
+
+
+def _close_orphan_branch_inbox_tasks(
+    work: Any,
+    *,
+    project: str,
+    dedupe_label: str,
+) -> int:
+    closed = 0
+    cancel = getattr(work, "cancel", None)
+    if not callable(cancel):
+        return closed
+    try:
+        candidates = []
+        for status in ("draft", "queued", "in_progress"):
+            candidates.extend(work.list_tasks(project=project, work_status=status))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worktree.state_audit: orphan inbox cleanup scan failed for %s",
+            dedupe_label,
+            exc_info=True,
+        )
+        return closed
+    for task in candidates:
+        labels = getattr(task, "labels", None) or ()
+        if dedupe_label not in labels:
+            continue
+        try:
+            cancel(
+                getattr(task, "task_id"),
+                "worktree.state_audit",
+                "routine orphan worktree cleanup auto-closed",
+            )
+            closed += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "worktree.state_audit: orphan inbox cleanup cancel failed for %s",
+                getattr(task, "task_id", dedupe_label),
+                exc_info=True,
+            )
+    return closed
+
+
 def _worktree_audit_handle_orphan_branch(
     *,
     classification,
@@ -1150,38 +1277,52 @@ def _worktree_audit_handle_orphan_branch(
     agent: str,
     session_key: str,
     task_id: str,
+    repo_root: Path,
     msg_store: Any,
     store: Any,
     work: Any,
-) -> tuple[int, int]:
-    """Raise the orphan-branch alert and emit the inbox task."""
+) -> tuple[int, int, int, int, int]:
+    """Self-heal terminal orphan worktrees; keep any remainder non-inbox."""
     age_days = float(classification.metadata.get("age_days", 0.0))
     alert_type = f"worktree_state:{task_id}:orphan_branch"
+    dedupe_label = f"worktree_audit:{task_id}:orphan_branch"
+    if _worktree_audit_task_is_terminal(work, task_id):
+        removed = _remove_orphan_task_worktree(
+            repo_root=repo_root,
+            wt_path=wt_path,
+            branch=classification.branch,
+        )
+        closed = _close_orphan_branch_inbox_tasks(
+            work,
+            project=sess.task_project,
+            dedupe_label=dedupe_label,
+        )
+        if removed:
+            _mark_orphan_worker_session_ended(work, sess)
+            try:
+                (msg_store or store).clear_alert(session_key, alert_type)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "worktree.state_audit: clear orphan alert failed for %s/%s",
+                    session_key,
+                    alert_type,
+                    exc_info=True,
+                )
+            return 0, 0, 1, 1, closed
+
     message = (
         f"{agent}: {wt_path} on local-only branch "
         f"{classification.branch or '(unknown)'} with no upstream "
         f"and no commit in ~{age_days:.1f}d (task {task_id}). "
-        f"Fix: push or archive the branch before the prune "
-        f"handler GCs it."
+        f"Maintenance: the prune handler will reap it once the task is terminal."
     )
     _raise_alert(msg_store or store, session_key, alert_type, "info", message)
-    body = (
-        f"Worker {agent}'s worktree for task {task_id} is on a "
-        f"local-only branch with no upstream and ~{age_days:.1f} "
-        f"days of inactivity.\n\n"
-        f"Path: {wt_path}\n\n"
-        f"Fix: push the branch, merge/abandon the task, or let "
-        f"the hourly `agent_worktree.prune` handler decide."
-    )
-    emitted = 1 if _emit_inbox_task(
+    closed = _close_orphan_branch_inbox_tasks(
         work,
-        subject=f"Orphan worktree branch: {task_id}",
-        body=body,
-        actor=agent,
-        dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
         project=sess.task_project,
-    ) else 0
-    return 1, emitted
+        dedupe_label=dedupe_label,
+    )
+    return 1, 0, 0, 0, closed
 
 
 def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1235,6 +1376,8 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
         alerts_raised = 0
         alerts_cleared = 0
         inbox_emitted = 0
+        worktrees_pruned = 0
+        inbox_closed = 0
         LOCK_ESCALATE_SECONDS = 5 * 60
         DIRTY_STALE_SECONDS = 60 * 60
         now_epoch = _time.time()
@@ -1341,19 +1484,25 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     alerts_cleared += cleared
 
                 elif state is WorktreeState.ORPHAN_BRANCH:
-                    raised, emitted = _worktree_audit_handle_orphan_branch(
-                        classification=classification,
-                        wt_path=wt_path,
-                        sess=sess,
-                        agent=agent,
-                        session_key=session_key,
-                        task_id=task_id,
-                        msg_store=msg_store,
-                        store=store,
-                        work=work,
+                    raised, emitted, cleared, pruned, closed = (
+                        _worktree_audit_handle_orphan_branch(
+                            classification=classification,
+                            wt_path=wt_path,
+                            sess=sess,
+                            agent=agent,
+                            session_key=session_key,
+                            task_id=task_id,
+                            repo_root=project_root,
+                            msg_store=msg_store,
+                            store=store,
+                            work=work,
+                        )
                     )
                     alerts_raised += raised
                     inbox_emitted += emitted
+                    alerts_cleared += cleared
+                    worktrees_pruned += pruned
+                    inbox_closed += closed
         finally:
             closer = getattr(work, "close", None)
             if callable(closer):
@@ -1370,6 +1519,8 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
             "alerts_raised": alerts_raised,
             "alerts_cleared": alerts_cleared,
             "inbox_emitted": inbox_emitted,
+            "worktrees_pruned": worktrees_pruned,
+            "inbox_closed": inbox_closed,
         }
 
 def _raise_alert(

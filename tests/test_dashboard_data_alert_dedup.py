@@ -266,6 +266,18 @@ def test_worktree_state_demotes_tracked_project_without_recent_real_work() -> No
     assert not is_user_actionable_alert(warn, context=context)
 
 
+def test_orphan_worktree_alert_is_not_user_actionable() -> None:
+    from pollypm.alert_actionability import is_user_actionable_alert
+
+    alert = SimpleNamespace(
+        session_name="worker-russell-58",
+        alert_type="worktree_state:russell/58:orphan_branch",
+        message="Worker worktree orphan branch cleanup.",
+    )
+
+    assert not is_user_actionable_alert(alert)
+
+
 def test_alert_filter_task_facts_use_recent_done_for_liveness(monkeypatch) -> None:
     from pollypm import dashboard_data
 
@@ -997,6 +1009,39 @@ def test_briefing_first_up_skips_dormant_projects() -> None:
     assert "First up: Save the Novel has queued work without an active claim." in out
     assert "no claim / execution" not in out
     assert "open Inbox and clear that first" in out
+
+
+def test_briefing_first_up_skips_orphan_worktree_maintenance() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing, InboxPreview
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=2,
+        recent_messages=[
+            InboxPreview(
+                sender="worker-russell-58",
+                title="Orphan worktree branch: russell/58",
+                project="Russell",
+                task_id="russell/58",
+                age_seconds=0.0,
+                project_key="russell",
+            ),
+            InboxPreview(
+                sender="polly",
+                title="Decision needed on launch copy",
+                project="Save the Novel",
+                task_id="savethenovel/91",
+                age_seconds=60.0,
+                project_key="savethenovel",
+            ),
+        ],
+        recovery_count_24h=0,
+    )
+
+    assert "Orphan worktree branch" not in out
+    assert "a task" not in out
+    assert "First up: Decision needed on launch copy." in out
 
 
 def test_briefing_uses_generic_inbox_line_when_only_dormant_items_exist() -> None:

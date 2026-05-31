@@ -69,14 +69,30 @@ def _make_repo(root: Path) -> Path:
     return root
 
 
-def _add_worktree(repo: Path, slug: str) -> Path:
+def _add_worktree(repo: Path, slug: str, *, branch: str | None = None) -> Path:
     """Add a git worktree under ``<repo>/.claude/worktrees/agent-<slug>``."""
     worktrees_dir = repo / ".claude" / "worktrees"
     worktrees_dir.mkdir(parents=True, exist_ok=True)
     wt_path = worktrees_dir / f"agent-{slug}"
-    branch = f"audit-{slug}"
+    branch = branch or f"audit-{slug}"
     _run("git", "-C", str(repo), "worktree", "add", "-b", branch, str(wt_path))
     return wt_path
+
+
+def _add_backdated_commit(wt: Path, filename: str = "old.txt") -> None:
+    (wt / filename).write_text("old\n")
+    _run("git", "-C", str(wt), "add", filename)
+    env = os.environ.copy()
+    old_date = "2020-01-01T00:00:00"
+    env["GIT_AUTHOR_DATE"] = old_date
+    env["GIT_COMMITTER_DATE"] = old_date
+    subprocess.run(
+        ["git", "-C", str(wt), "commit", "-m", "old", "--date", old_date],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -170,16 +186,7 @@ class TestClassifier:
         wt = _add_worktree(repo, "orphan")
         # No upstream, no remote. We need a commit older than 7 days —
         # use ``commit --date`` + ``GIT_COMMITTER_DATE`` to back-date.
-        (wt / "old.txt").write_text("old\n")
-        _run("git", "-C", str(wt), "add", "old.txt")
-        env = os.environ.copy()
-        old_date = "2020-01-01T00:00:00"
-        env["GIT_AUTHOR_DATE"] = old_date
-        env["GIT_COMMITTER_DATE"] = old_date
-        subprocess.run(
-            ["git", "-C", str(wt), "commit", "-m", "old", "--date", old_date],
-            check=True, env=env, capture_output=True, text=True,
-        )
+        _add_backdated_commit(wt)
 
         result = classify_worktree_state(wt)
         assert result.state is WorktreeState.ORPHAN_BRANCH
@@ -213,6 +220,13 @@ class _FakeSession:
     pane_id: str | None = None
     branch_name: str | None = None
     started_at: str = "2026-01-01T00:00:00Z"
+
+
+@dataclass
+class _FakeTask:
+    task_id: str
+    work_status: str
+    labels: tuple[str, ...] = ()
 
 
 class _FakeStore:
@@ -291,9 +305,13 @@ class _FakeWork:
         sessions: list[_FakeSession],
         *,
         existing_tasks: list[Any] | None = None,
+        tasks_by_id: dict[str, Any] | None = None,
     ) -> None:
         self._sessions = list(sessions)
         self.created: list[dict[str, Any]] = []
+        self.cancelled: list[tuple[str, str, str]] = []
+        self.ended_sessions: list[tuple[str, int, str]] = []
+        self._tasks_by_id = dict(tasks_by_id or {})
         # Stand-in for ``work.list_tasks`` results — keyed by status so
         # the dedupe scan can lookup draft / queued / in_progress rows.
         self._tasks_by_status: dict[str, list[Any]] = {}
@@ -303,6 +321,9 @@ class _FakeWork:
 
     def list_worker_sessions(self, *, active_only: bool = True):  # noqa: ARG002
         return list(self._sessions)
+
+    def get(self, task_id: str):
+        return self._tasks_by_id[task_id]
 
     def list_tasks(self, **kwargs: Any):
         status = kwargs.get("work_status")
@@ -319,6 +340,18 @@ class _FakeWork:
         # Mimic Task just enough — the handler doesn't read the result.
         return object()
 
+    def cancel(self, task_id: str, actor: str, reason: str):
+        self.cancelled.append((task_id, actor, reason))
+        task = self._tasks_by_id.get(task_id)
+        if task is not None:
+            setattr(task, "work_status", "cancelled")
+        return task or object()
+
+    def mark_worker_session_ended(
+        self, *, task_project: str, task_number: int, ended_at: str,
+    ) -> None:
+        self.ended_sessions.append((task_project, int(task_number), ended_at))
+
     def close(self) -> None:
         pass
 
@@ -329,6 +362,7 @@ def _invoke_handler_with_fakes(
     sessions: list[_FakeSession],
     project_root: Path,
     existing_tasks: list[Any] | None = None,
+    tasks_by_id: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], _FakeStore, _FakeWork]:
     """Run the handler with the work-service factory + ``_load_config_and_store``
     swapped for fakes. Returns (result, store, work) so assertions can
@@ -337,7 +371,11 @@ def _invoke_handler_with_fakes(
     from pollypm.plugins_builtin.core_recurring import sweeps as sweeps_module
 
     fake_store = _FakeStore()
-    fake_work = _FakeWork(sessions, existing_tasks=existing_tasks)
+    fake_work = _FakeWork(
+        sessions,
+        existing_tasks=existing_tasks,
+        tasks_by_id=tasks_by_id,
+    )
 
     @dataclass
     class _FakeProject:
@@ -526,6 +564,85 @@ class TestHandler:
         assert result["alerts_raised"] >= 1
         assert result["inbox_emitted"] == 0
         assert work.created == []
+
+    def test_terminal_orphan_branch_prunes_and_closes_prior_notification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#2520: terminal task worktree GC is self-healing, not inbox work."""
+        repo = _make_repo(tmp_path / "repo")
+        wt = _add_worktree(repo, "orphan_terminal", branch="task/demo-12")
+        _add_backdated_commit(wt)
+        assert classify_worktree_state(wt).state is WorktreeState.ORPHAN_BRANCH
+
+        sessions = [
+            _FakeSession(
+                task_project="demo", task_number=12,
+                agent_name="worker-demo-12", worktree_path=str(wt),
+            ),
+        ]
+        prior_notice = _FakeTask(
+            task_id="demo/99",
+            work_status="draft",
+            labels=(
+                "audit:worktree_state",
+                "worktree_audit:demo/12:orphan_branch",
+            ),
+        )
+        result, _store, work = _invoke_handler_with_fakes(
+            monkeypatch,
+            sessions=sessions,
+            project_root=repo,
+            existing_tasks=[prior_notice],
+            tasks_by_id={"demo/12": _FakeTask("demo/12", "done")},
+        )
+
+        assert result["classified"].get("orphan_branch") == 1
+        assert result["worktrees_pruned"] == 1
+        assert result["inbox_closed"] == 1
+        assert result["inbox_emitted"] == 0
+        assert work.created == []
+        assert work.cancelled == [
+            (
+                "demo/99",
+                "worktree.state_audit",
+                "routine orphan worktree cleanup auto-closed",
+            )
+        ]
+        assert [(project, number) for project, number, _ in work.ended_sessions] == [
+            ("demo", 12)
+        ]
+        assert not wt.exists()
+        branches = _run("git", "-C", str(repo), "branch").stdout
+        assert "task/demo-12" not in branches
+
+    def test_nonterminal_orphan_branch_stays_out_of_inbox(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _make_repo(tmp_path / "repo")
+        wt = _add_worktree(repo, "orphan_active")
+        _add_backdated_commit(wt)
+
+        sessions = [
+            _FakeSession(
+                task_project="demo", task_number=13,
+                agent_name="worker-demo-13", worktree_path=str(wt),
+            ),
+        ]
+        result, store, work = _invoke_handler_with_fakes(
+            monkeypatch,
+            sessions=sessions,
+            project_root=repo,
+            tasks_by_id={"demo/13": _FakeTask("demo/13", "in_progress")},
+        )
+
+        assert result["classified"].get("orphan_branch") == 1
+        assert result["alerts_raised"] == 1
+        assert result["inbox_emitted"] == 0
+        assert result["worktrees_pruned"] == 0
+        assert work.created == []
+        assert wt.exists()
+        key = ("worker-demo-13", "worktree_state:demo/13:orphan_branch")
+        assert store.alerts[key]["severity"] == "info"
 
     def test_clean_after_dirty_clears_existing_alert(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

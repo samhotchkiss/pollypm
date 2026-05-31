@@ -52,6 +52,7 @@ _NOTIFY_TITLE_PREFIXES: tuple[str, ...] = (
     "Project: ",
     "Queued:",
     "Heartbeat:",
+    "Orphan worktree branch:",
     "URGENT:",
     "Nth ",
     "Repeated stale",

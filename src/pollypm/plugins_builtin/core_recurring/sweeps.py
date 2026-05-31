@@ -728,6 +728,11 @@ def _pane_text_classify_body(
                         session_name=session_name,
                         rule_name=rule_name,
                         pane_text=pane_text,
+                        project_key=_pane_pattern_project_key(
+                            services=services,
+                            handle=handle,
+                            session_name=session_name,
+                        ),
                         state_store=state_store,
                         msg_store=msg_store,
                     )
@@ -802,24 +807,88 @@ def _emit_context_truncated_audit_event(
         return False
 
 
+def _pane_pattern_project_key(
+    *,
+    services: Any,
+    handle: Any,
+    session_name: str,
+) -> str:
+    """Best-effort project routing for pane-pattern inbox rows."""
+    try:
+        from pollypm.work.task_state import parse_task_window_name
+
+        parsed = parse_task_window_name(session_name)
+    except Exception:  # noqa: BLE001
+        parsed = None
+    if parsed is not None:
+        project_key, _task_number = parsed
+        if project_key:
+            return str(project_key)
+
+    config = getattr(services, "config", None)
+    sessions = getattr(config, "sessions", None) or {}
+    session_cfg = sessions.get(session_name)
+    if session_cfg is None:
+        window_name = getattr(handle, "window_name", "") or ""
+        session_cfg = next(
+            (
+                candidate for candidate in sessions.values()
+                if getattr(candidate, "window_name", None) == window_name
+                or getattr(candidate, "name", None) == session_name
+            ),
+            None,
+        )
+    if session_cfg is not None:
+        project_key = str(getattr(session_cfg, "project", "") or "")
+        if project_key:
+            return project_key
+
+    projects = getattr(config, "projects", None) or {}
+    cwd = getattr(handle, "cwd", "") or ""
+    if cwd:
+        try:
+            cwd_path = Path(cwd).resolve()
+        except (OSError, RuntimeError):
+            cwd_path = Path(cwd)
+        for key, project in projects.items():
+            project_path_raw = getattr(project, "path", None)
+            if project_path_raw is None:
+                continue
+            try:
+                project_path = Path(project_path_raw).resolve()
+            except (OSError, RuntimeError):
+                project_path = Path(project_path_raw)
+            try:
+                cwd_path.relative_to(project_path)
+            except ValueError:
+                continue
+            return str(key)
+
+    return "inbox"
+
+
 def _emit_pane_pattern_inbox_item(
     *,
     work_service: Any,
     session_name: str,
     rule_name: str,
     pane_text: str,
+    project_key: str = "inbox",
     state_store: Any = None,
     msg_store: Any = None,
 ) -> bool:
     """Create a user-visible inbox task for a matched pane pattern."""
     dedupe_label = f"pane_pattern:{rule_name}:{session_name}"
+    target_project = project_key if rule_name == "ask_user_decision" else "inbox"
 
     try:
         list_fn = getattr(work_service, "list_tasks", None)
         if callable(list_fn):
             for status in ("queued", "in_progress", "draft", "review"):
                 try:
-                    tasks = list_fn(work_status=status, project="inbox")
+                    tasks = list_fn(
+                        work_status=status, project=target_project,
+                    )
                 except TypeError:
                     tasks = list_fn(work_status=status)
                 for task in tasks or []:
@@ -840,6 +909,11 @@ def _emit_pane_pattern_inbox_item(
         "permission_prompt": (
             f"Session '{session_name}' is waiting on a permission "
             f"prompt — approval needed"
+        ),
+        "ask_user_decision": (
+            f"{target_project} PM is waiting on a decision from you"
+            if target_project != "inbox"
+            else f"Session '{session_name}' is waiting on a decision from you"
         ),
     }
     title = title_map.get(
@@ -873,10 +947,18 @@ def _emit_pane_pattern_inbox_item(
             "the prompt, or",
             f"- Auto-accept: `pm send {session_name} 1`.",
         ])
+    elif rule_name == "ask_user_decision":
+        body_parts.extend([
+            "- Open the agent session from the cockpit or chat surface "
+            "and answer the interactive decision prompt.",
+            "- This is a visibility backstop: PollyPM detected the "
+            "AskUserQuestion chrome, but did not parse the options for "
+            "in-UI answering.",
+        ])
     body_parts.extend([
         "",
         f"Alert type: `pane:{rule_name}`. This inbox item was emitted "
-        "by the pane-text classifier (issue #250).",
+        "by the pane-text classifier (issues #250/#2493).",
     ])
     body = "\n".join(body_parts)
 
@@ -886,22 +968,35 @@ def _emit_pane_pattern_inbox_item(
         f"session:{session_name}",
         dedupe_label,
     ]
+    if rule_name == "ask_user_decision":
+        labels.append("ask_user_decision")
+
+    is_ask_user_decision = rule_name == "ask_user_decision"
 
     try:
-        # Pane-pattern findings (zombie sessions, idle prompts, …) go
-        # to Polly to recover, not to the user. Activity-event tier on
-        # the user-facing surface.
+        # Most pane-pattern findings go to Polly to recover. The
+        # AskUserQuestion backstop is different: it is explicitly a
+        # human decision visibility row when structured option capture
+        # failed, so it is routed to the user inbox.
         inbox_task = work_service.create(
             title=title,
             description=body,
             type="task",
-            project="inbox",
+            project=target_project,
             flow_template="chat",
-            roles={"requester": session_name, "operator": "polly"},
+            roles=(
+                {"requester": "user", "actor": session_name}
+                if is_ask_user_decision
+                else {"requester": session_name, "operator": "polly"}
+            ),
             priority="normal",
             created_by=session_name,
             labels=labels,
-            kind=InboxItemKind.ACTIVITY_EVENT.value,
+            kind=(
+                InboxItemKind.PM_QUESTION_UNANSWERED.value
+                if is_ask_user_decision
+                else InboxItemKind.ACTIVITY_EVENT.value
+            ),
         )
     except Exception:  # noqa: BLE001
         logger.debug(

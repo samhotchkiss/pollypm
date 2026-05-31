@@ -36,7 +36,12 @@ Rules (see issue #250 for the full spec):
    prompt ("Do you want to proceed?"). User-actionable: the handler
    emits an inbox task so Sam can approve.
 
-4. ``theme_trust_modal`` — the post-launch "Select a theme" /
+4. ``ask_user_decision`` — Claude Code is parked on an interactive
+   AskUserQuestion decision menu. User-actionable: the handler emits
+   an inbox task so the operator can see that the agent is waiting,
+   even when the option parser cannot model the menu yet.
+
+5. ``theme_trust_modal`` — the post-launch "Select a theme" /
    "Do you trust this workspace?" modals that ``_stabilize_claude_launch``
    is supposed to auto-dismiss but sometimes leaks. Detection only
    in this PR; the send-keys auto-dismiss is in the follow-up.
@@ -230,6 +235,87 @@ def _match_permission_prompt(pane_text: str) -> bool:
     return _PERMISSION_RE.search(pane_text) is not None
 
 
+# AskUserQuestion menus are not ordinary yes/no permission prompts. Claude
+# renders them as a Submit tab/row plus a keyboard footer. We deliberately
+# detect only the chrome, not the option labels, so this remains a visibility
+# backstop when the richer capture parser cannot understand the menu shape.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_ASK_USER_SUBMIT_RE = re.compile(r"(?:^|\s)[✔✓]\s*Submit\b", re.IGNORECASE)
+_ASK_USER_TAB_ARROW_RE = re.compile(
+    r"(?:tab\s*/\s*arrow|tab\b.*\barrow)",
+    re.IGNORECASE,
+)
+_ASK_USER_CHROME_LINES = (
+    "bypass permissions",
+    "shift+tab to cycle",
+    "ctrl+t to",
+    "tokens",
+    "chat about this",
+    "type something",
+)
+
+
+def _normalise_ask_user_line(line: str) -> str:
+    text = _ANSI_CSI_RE.sub("", line or "").rstrip()
+    stripped = text.strip()
+    if stripped.startswith(("│", "┆")):
+        stripped = stripped[1:].strip()
+    if stripped.endswith(("│", "┆")):
+        stripped = stripped[:-1].strip()
+    return stripped
+
+
+def _is_ask_user_footer_line(line: str) -> bool:
+    text = _normalise_ask_user_line(line)
+    if "`" in text:
+        return False
+    lower = text.lower()
+    return (
+        "enter to select" in lower
+        and "esc to cancel" in lower
+        and _ASK_USER_TAB_ARROW_RE.search(lower) is not None
+    )
+
+
+def _is_ask_user_submit_line(line: str) -> bool:
+    text = _normalise_ask_user_line(line)
+    if "`" in text:
+        return False
+    return _ASK_USER_SUBMIT_RE.search(text) is not None
+
+
+def _is_ask_user_trailing_chrome(line: str) -> bool:
+    text = _normalise_ask_user_line(line)
+    if not text:
+        return True
+    lower = text.lower()
+    if any(token in lower for token in _ASK_USER_CHROME_LINES):
+        return True
+    box_chars = {"─", "━", "╭", "╮", "╰", "╯", "│", "┆", " "}
+    return set(text) <= box_chars
+
+
+def _match_ask_user_decision(pane_text: str) -> bool:
+    if not pane_text:
+        return False
+    lines = pane_text.splitlines()
+    for footer_pos in range(len(lines) - 1, -1, -1):
+        if not _is_ask_user_footer_line(lines[footer_pos]):
+            continue
+        if not all(
+            _is_ask_user_trailing_chrome(line)
+            for line in lines[footer_pos + 1 :]
+        ):
+            continue
+        start = max(0, footer_pos - 80)
+        if any(
+            _is_ask_user_submit_line(lines[pos])
+            for pos in range(start, footer_pos + 1)
+        ):
+            return True
+    return False
+
+
 # Theme / trust / bypass post-launch modals. ``_stabilize_claude_launch``
 # is supposed to catch these but occasionally they leak (race on the
 # initial render, provider restart, etc.). Detection only — the
@@ -272,7 +358,7 @@ def _match_theme_trust_modal(pane_text: str) -> bool:
 # Order matters — ``classify_pane`` returns hits in declaration order so
 # a single-classification caller can take the first element. Priority is:
 # context_full (most actionable) → stuck_on_error → permission_prompt →
-# theme_trust_modal (most often self-heals).
+# ask_user_decision → theme_trust_modal (most often self-heals).
 RULES: list[ClassifierRule] = [
     ClassifierRule(
         name="context_full",
@@ -290,6 +376,11 @@ RULES: list[ClassifierRule] = [
         severity="warn",
     ),
     ClassifierRule(
+        name="ask_user_decision",
+        matcher=_match_ask_user_decision,
+        severity="warn",
+    ),
+    ClassifierRule(
         name="theme_trust_modal",
         matcher=_match_theme_trust_modal,
         severity="warn",
@@ -302,6 +393,7 @@ RULES: list[ClassifierRule] = [
 # Membership is data so a follow-up can promote / demote a rule without
 # touching the wiring layer.
 USER_VISIBLE_RULES: frozenset[str] = frozenset({
+    "ask_user_decision",
     "context_full",
     "permission_prompt",
 })

@@ -601,6 +601,66 @@ class TestPaneClassifyHandler:
         result2 = pane_text_classify_handler({})
         assert result2["alerts_raised"] == 0
         assert result2["inbox_items_emitted"] == 0
+        assert result2["inbox_items_resolved"] == 0
+        assert work.get(task.task_id).work_status.value == "draft"
+        assert svc.sent == []
+
+    def test_ask_user_decision_archives_stale_pane_pattern_task(
+        self, tmp_path, monkeypatch, pg_work_service,
+    ) -> None:
+        from pollypm.inbox.kind import InboxItemKind
+
+        store = StateStore(tmp_path / "state.db")
+        work = pg_work_service
+        svc = FakeSessionService(
+            handles=[FakeHandle("task-demo-7")],
+            captures={"task-demo-7": ASK_USER_DECISION_STALE_NEGATIVE},
+        )
+        _patch_resolver(monkeypatch, tmp_path, svc, store, work_service=work)
+
+        stale = work.create(
+            title="demo PM is waiting on a decision from you",
+            description="stale pane-pattern item",
+            type="task",
+            project="demo",
+            flow_template="chat",
+            roles={"requester": "user", "actor": "task-demo-7"},
+            created_by="task-demo-7",
+            labels=[
+                "pane_pattern",
+                "rule:ask_user_decision",
+                "session:task-demo-7",
+                "pane_pattern:ask_user_decision:task-demo-7",
+                "ask_user_decision",
+            ],
+            kind=InboxItemKind.PM_QUESTION_UNANSWERED.value,
+        )
+        unrelated = work.create(
+            title="demo PM is waiting on another decision",
+            description="different session",
+            type="task",
+            project="demo",
+            flow_template="chat",
+            roles={"requester": "user", "actor": "task-demo-8"},
+            created_by="task-demo-8",
+            labels=[
+                "pane_pattern",
+                "rule:ask_user_decision",
+                "session:task-demo-8",
+                "pane_pattern:ask_user_decision:task-demo-8",
+                "ask_user_decision",
+            ],
+            kind=InboxItemKind.PM_QUESTION_UNANSWERED.value,
+        )
+
+        result = pane_text_classify_handler({})
+
+        assert result["outcome"] == "swept"
+        assert result["alerts_raised"] == 0
+        assert result["inbox_items_emitted"] == 0
+        assert result["inbox_items_resolved"] == 1
+        assert work.get(stale.task_id).work_status.value == "done"
+        assert work.get(unrelated.task_id).work_status.value == "draft"
         assert svc.sent == []
 
     def test_context_full_emits_canonical_audit_event(

@@ -766,6 +766,41 @@ def test_plan_missing_queue_stall_routes_to_architect(
     assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
 
 
+def test_plan_missing_queue_stall_uses_current_gate_state_without_skip_event(
+    now: datetime,
+) -> None:
+    cfg = WatchdogConfig(plan_missing_queue_stall_seconds=600)
+    queued = _StubTask(
+        project="demo",
+        task_number=4,
+        work_status_str="queued",
+        executions=[],
+        updated_at=now - timedelta(hours=2),
+        flow_template_id="implement_module",
+        roles={"worker": "worker"},
+    )
+
+    findings = scan_events(
+        [],
+        now=now,
+        config=cfg,
+        open_tasks=[queued],
+        project="demo",
+        plan_missing_gate_closed=True,
+    )
+
+    matched = [
+        f for f in findings if f.rule == RULE_PLAN_MISSING_QUEUE_STALLED
+    ]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.evidence["queued_subjects"] == ["demo/4"]
+    assert f.evidence["auto_claim_skip_count"] == 0
+    assert f.evidence["plan_missing_gate_closed"] is True
+    assert f.evidence["signal_sources"] == ["current_plan_gate_state"]
+    assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
+
+
 def test_plan_missing_queue_stall_silent_when_planning_task_active(
     now: datetime,
 ) -> None:

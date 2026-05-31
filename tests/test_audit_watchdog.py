@@ -30,6 +30,7 @@ from pollypm.audit.watchdog import (
     EVENT_HEARTBEAT_TICK,
     EVENT_STUCK_DRAFT_RECLAIMED,
     EVENT_STUCK_DRAFT_TERMINATED,
+    RULE_PLAN_MISSING_QUEUE_STALLED,
     RULE_QUEUE_WITHOUT_MOTION,
     RULE_CANCEL_NO_PROMOTION,
     RULE_CANCELLATION_CHURN,
@@ -2040,6 +2041,61 @@ def test_cadence_handler_dispatches_stuck_draft(
     ]
     assert len(dispatch_rows) == 1
     assert dispatch_rows[0]["metadata"]["finding_type"] == RULE_STUCK_DRAFT
+
+
+def test_cadence_handler_dispatches_plan_missing_stall_from_gate_state(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cadence scan does not require a recent auto-claim skip row."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=4,
+        work_status="queued",
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(hours=2),
+    )
+    task.flow_template_id = "implement_module"
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: [],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_open_tasks",
+        lambda key, path: [task],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._plan_missing_gate_closed_for_queued_work",
+        lambda *args, **kwargs: True,
+    )
+
+    store = _RecordingStore()
+    counters = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(plan_missing_queue_stall_seconds=600),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert counters["plan_missing_queue_stalled_detected"] == 1
+    assert counters["dispatches_sent"] == 1
+    assert len(sent) == 1
+    target, brief = sent[0]
+    assert target == "pollypm-storage-closet:architect-savethenovel"
+    assert RULE_PLAN_MISSING_QUEUE_STALLED in brief
+    assert "savethenovel/4" in brief
 
 
 def test_cadence_handler_dispatches_cancellation_no_promotion(

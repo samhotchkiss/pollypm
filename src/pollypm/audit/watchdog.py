@@ -3112,6 +3112,7 @@ class ProbeContext:
     config: WatchdogConfig
     open_tasks: Sequence[Any]
     events: Sequence[AuditEvent]
+    plan_missing_gate_closed: bool = False
 
 
 # Probe registry — public so future PRs can register new probes
@@ -3306,7 +3307,7 @@ def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
     """
     if ctx.project_key in QUEUE_WITHOUT_MOTION_SUPPRESSED_PROJECTS:
         return []
-    if _has_plan_missing_auto_claim_skip(ctx):
+    if _has_plan_missing_auto_claim_skip(ctx) or ctx.plan_missing_gate_closed:
         return []
 
     cutoff = ctx.now - timedelta(
@@ -3405,7 +3406,7 @@ register_safety_net_probe(_queue_without_motion_probe)
 def _plan_missing_queue_stalled_probe(ctx: ProbeContext) -> list[Finding]:
     """Specific safety net for queued work blocked by the plan gate (#2503)."""
     skip_events = _plan_missing_skip_events(ctx)
-    if not skip_events:
+    if not skip_events and not ctx.plan_missing_gate_closed:
         return []
     if _open_plan_project_exists(ctx.open_tasks or (), project_key=ctx.project_key):
         return []
@@ -3449,6 +3450,11 @@ def _plan_missing_queue_stalled_probe(ctx: ProbeContext) -> list[Finding]:
         return []
 
     subjects_for_evidence = stale_subjects or queued_subjects
+    signal_sources: list[str] = []
+    if skip_events:
+        signal_sources.append(_AUTO_CLAIM_PLAN_MISSING_EVENT)
+    if ctx.plan_missing_gate_closed:
+        signal_sources.append("current_plan_gate_state")
     return [Finding(
         rule=RULE_PLAN_MISSING_QUEUE_STALLED,
         tier=TIER_2,
@@ -3456,8 +3462,7 @@ def _plan_missing_queue_stalled_probe(ctx: ProbeContext) -> list[Finding]:
         subject=ctx.project_key,
         message=(
             f"Project {ctx.project_key} has {len(queued_subjects)} queued "
-            "implementation task(s) that auto-claim skipped because the "
-            "approved plan is missing."
+            "implementation task(s) waiting on a missing approved plan."
         ),
         recommendation=(
             f"Dispatch the architect to start or resume planning for "
@@ -3472,6 +3477,7 @@ def _plan_missing_queue_stalled_probe(ctx: ProbeContext) -> list[Finding]:
             "skip_count": len(skip_events),
             "threshold_seconds": ctx.config.plan_missing_queue_stall_seconds,
             "detected_via": "probe",
+            "signal_sources": list(signal_sources),
         },
         evidence={
             "queued_subjects": list(subjects_for_evidence),
@@ -3482,6 +3488,8 @@ def _plan_missing_queue_stalled_probe(ctx: ProbeContext) -> list[Finding]:
             "first_skip_at": first_skip,
             "last_skip_at": last_skip,
             "threshold_seconds": ctx.config.plan_missing_queue_stall_seconds,
+            "plan_missing_gate_closed": ctx.plan_missing_gate_closed,
+            "signal_sources": list(signal_sources),
         },
     )]
 
@@ -3511,6 +3519,7 @@ def scan_events(
     state_db_probes: Sequence[Any] | None = None,
     run_safety_net_probes: bool = True,
     worker_cap_back_pressure: Mapping[str, bool] | None = None,
+    plan_missing_gate_closed: bool = False,
     stuck_draft_terminator_breadcrumbs: list[_TerminatorBreadcrumb] | None = None,
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
@@ -3562,6 +3571,11 @@ def scan_events(
             The cadence handler builds this list by probing the
             workspace + per-project state.db files for each known
             project. ``None`` disables the rule.
+        plan_missing_gate_closed: True when the cadence handler has
+            independently verified that this project has queued
+            non-bypass work and the approved-plan gate is closed. This
+            gives the plan-missing queue-stall probe a current-state
+            signal in addition to recent auto-claim skip audit events.
     """
     if config is None:
         config = WatchdogConfig()
@@ -3690,6 +3704,7 @@ def scan_events(
             config=config,
             open_tasks=tuple(open_tasks or ()),
             events=materialised,
+            plan_missing_gate_closed=bool(plan_missing_gate_closed),
         )
         findings.extend(_run_safety_net_probes(ctx))
     return _filter_dismissed_findings(
@@ -3848,6 +3863,7 @@ def scan_project(
     state_db_probes: Sequence[Any] | None = None,
     run_safety_net_probes: bool = True,
     worker_cap_back_pressure: Mapping[str, bool] | None = None,
+    plan_missing_gate_closed: bool = False,
 ) -> list[Finding]:
     """Read audit events for ``project`` and scan them.
 
@@ -3929,6 +3945,7 @@ def scan_project(
         state_db_probes=state_db_probes,
         run_safety_net_probes=run_safety_net_probes,
         worker_cap_back_pressure=worker_cap_back_pressure,
+        plan_missing_gate_closed=plan_missing_gate_closed,
         stuck_draft_terminator_breadcrumbs=pending_terminators,
     )
     if findings or pending_terminators or backfill_reclaims:

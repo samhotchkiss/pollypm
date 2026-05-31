@@ -46,6 +46,7 @@ from pollypm.audit.watchdog import (
     RULE_DUPLICATE_ADVISOR_TASKS,
     RULE_LEGACY_DB_SHADOW,
     RULE_PLAN_MISSING_ALERT_CHURN,
+    RULE_PLAN_MISSING_QUEUE_STALLED,
     RULE_PLAN_REVIEW_BYPASSED_APPROVAL,
     RULE_PLAN_REVIEW_MISSING,
     RULE_QUEUE_WITHOUT_MOTION,
@@ -165,6 +166,9 @@ _DISPATCHABLE_RULES: frozenset[str] = frozenset({
     RULE_TASK_ON_HOLD_STALE,
     # #1546 — rejection-loop detector → tier-2 PM dispatch.
     RULE_REJECTION_LOOP,
+    # #2503 — plan-gated queued work has already proven it cannot
+    # auto-claim; hand the recovery back to the architect, not Sam.
+    RULE_PLAN_MISSING_QUEUE_STALLED,
 })
 
 # #1546 — rules whose finding routes to the operator (tier-3) leg by

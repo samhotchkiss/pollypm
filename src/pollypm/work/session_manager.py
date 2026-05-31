@@ -160,7 +160,11 @@ def _unavailable_account_names(config: object) -> frozenset[str]:
     so per-task worker spawn skips the same accounts the control-plane
     failover skips. Reads ``account_runtime`` from the project state DB
     and consults ``is_account_runtime_unavailable`` (auth_broken,
-    auth-broken, exhausted, provider_outage, blocked).
+    auth-broken, exhausted, provider_outage, blocked). Also treats
+    known-low remaining usage as unavailable for new worker launches so
+    a fresh task does not pin itself to an account with only a few
+    percent of weekly budget left when a healthier failover account is
+    configured (#2503).
 
     Returns an empty frozenset when the state DB is unreachable so a
     transient store error does not block all worker launches — the
@@ -177,6 +181,32 @@ def _unavailable_account_names(config: object) -> frozenset[str]:
             runtime = get_account_runtime(name)
             if runtime is not None and is_account_runtime_unavailable(runtime.status):
                 unavailable.add(name)
+        try:
+            from pollypm.capacity import (
+                FAILOVER_TRIGGERS,
+                PROACTIVE_ROLLOVER_THRESHOLD_PCT,
+                probe_capacity,
+            )
+
+            for name in accounts:
+                if name in unavailable:
+                    continue
+                probe = probe_capacity(config, None, name)
+                if probe.state in FAILOVER_TRIGGERS:
+                    unavailable.add(name)
+                    continue
+                remaining = probe.remaining_pct
+                if (
+                    remaining is not None
+                    and remaining <= PROACTIVE_ROLLOVER_THRESHOLD_PCT
+                ):
+                    unavailable.add(name)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "worker launch: account-usage filter failed; "
+                "falling back to runtime-only availability",
+                exc_info=True,
+            )
         return frozenset(unavailable)
     except Exception:  # noqa: BLE001
         logger.exception("worker launch: account-runtime filter failed; allowing all")

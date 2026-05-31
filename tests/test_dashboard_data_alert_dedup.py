@@ -313,6 +313,99 @@ def test_alert_filter_task_facts_use_recent_done_for_liveness(monkeypatch) -> No
     assert facts.project_task_counts["dormant"]["queued"] == 1
 
 
+def test_alert_filter_task_facts_excludes_synthetic_done_projects(monkeypatch) -> None:
+    """#2491 — recent done rows from test debris are not brief liveness."""
+    from pollypm import dashboard_data
+
+    now = datetime.now(UTC)
+    grouped = {
+        "pm_test_01wave_1779715196": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=1),
+            ),
+            SimpleNamespace(
+                work_status="queued",
+                updated_at=now,
+            ),
+        ],
+        "savethenovel": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=1),
+            )
+        ],
+    }
+    config = SimpleNamespace(
+        projects={
+            "pm_test_01wave_1779715196": SimpleNamespace(
+                tracked=True,
+                path="/private/tmp/pm_test_01wave_1779715196",
+            ),
+            "savethenovel": SimpleNamespace(
+                tracked=True,
+                path="/Users/sam/dev/savethenovel",
+            ),
+        }
+    )
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_grouped",
+        lambda _config: grouped,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_for_project",
+        lambda data, _config, key: data[key],
+    )
+
+    facts = dashboard_data._project_task_facts_for_alert_filter(
+        config,
+        [
+            SimpleNamespace(
+                session_name="worker_session_gap-pm_test_01wave_1779715196",
+                alert_type="worker_session_gap",
+            )
+        ],
+    )
+    out = dashboard_data._build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=2,
+        recent_messages=[
+            dashboard_data.InboxPreview(
+                sender="watchdog",
+                title=(
+                    "Project pm_test_01wave_1779715196 has 1 queued "
+                    "task(s) but no claim / execution."
+                ),
+                project="pm test 01wave 1779715196",
+                task_id="pm_test_01wave_1779715196/92",
+                age_seconds=0.0,
+                project_key="pm_test_01wave_1779715196",
+            ),
+            dashboard_data.InboxPreview(
+                sender="watchdog",
+                title=(
+                    "Project savethenovel has 1 queued task(s) but no "
+                    "claim / execution."
+                ),
+                project="Save the Novel",
+                task_id="savethenovel/91",
+                age_seconds=60.0,
+                project_key="savethenovel",
+            ),
+        ],
+        recovery_count_24h=0,
+        recent_real_work_projects=facts.recent_real_work_projects,
+    )
+
+    assert facts.recent_real_work_projects == frozenset({"savethenovel"})
+    assert facts.project_task_counts["pm_test_01wave_1779715196"]["queued"] == 1
+    assert "pm_test" not in out
+    assert "pm test" not in out
+    assert "First up: Save the Novel has queued work without an active claim." in out
+
+
 def test_session_description_skips_claude_tui_bottom_bar(tmp_path) -> None:
     """The polly-dashboard "Now" section was rendering every idle
     session as ``"⏵⏵ bypass permissions on (shift+tab to cycle)"`` —

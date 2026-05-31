@@ -15,6 +15,7 @@ from pollypm.config import PollyPMConfig, load_config
 from pollypm.idle_placeholders import (
     is_codex_idle_placeholder as _is_codex_idle_placeholder,
 )
+from pollypm.project_liveness import is_real_operator_project
 from pollypm.projects import project_state_db_path
 
 logger = logging.getLogger(__name__)
@@ -841,14 +842,16 @@ def _project_task_facts_for_alert_filter(
         counts_by_project: dict[str, dict[str, int]] = {}
         recent_real_work: set[str] = set()
         recent_cutoff = datetime.now(UTC) - _REAL_WORK_RECENCY_WINDOW
-        for project_key in (getattr(config, "projects", {}) or {}):
+        projects = getattr(config, "projects", {}) or {}
+        for project_key, project in projects.items():
             counts: dict[str, int] = {}
+            real_operator_project = is_real_operator_project(project_key, project)
             for task in all_tasks_for_project(grouped, config, project_key):
                 status_key = _status_key(task)
                 if not status_key:
                     continue
                 counts[status_key] = counts.get(status_key, 0) + 1
-                if status_key == "done":
+                if status_key == "done" and real_operator_project:
                     stamped = _coerce_utc_datetime(
                         getattr(task, "updated_at", None)
                         or getattr(task, "created_at", None)

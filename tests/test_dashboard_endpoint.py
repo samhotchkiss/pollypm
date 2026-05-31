@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -475,6 +476,37 @@ def test_dashboard_cold_refresh_normalizes_cached_alert_count(
     assert first.json()["rollups"]["alert_count"] == 3
     assert second.json()["rollups"]["alert_count"] == 3
     assert calls == {"gather": 1, "fresh": 1}
+
+
+def test_dashboard_cache_miss_response_uses_snapshot_normalized_alert_count(
+    app, client, auth_headers, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"load": 0}
+
+    def fake_load_dashboard_snapshot(_config):
+        calls["load"] += 1
+        return dashboard_routes.DashboardSnapshot(
+            generated_at=datetime.now(timezone.utc),
+            projects=(_api_project("myproj"),),
+            data=_make_data(alert_count=29),
+            refreshed_at_monotonic=time.monotonic(),
+            normalized_alert_count=3,
+        )
+
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_load_dashboard_snapshot",
+        fake_load_dashboard_snapshot,
+    )
+
+    first = client.get("/api/v1/dashboard", headers=auth_headers)
+    second = client.get("/api/v1/dashboard", headers=auth_headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["rollups"]["alert_count"] == 3
+    assert second.json()["rollups"]["alert_count"] == 3
+    assert calls == {"load": 1}
 
 
 def test_dashboard_background_refresh_caches_normalized_alert_count(

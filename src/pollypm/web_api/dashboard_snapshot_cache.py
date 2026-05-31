@@ -21,6 +21,7 @@ class DashboardSnapshot:
     projects: tuple[Any, ...]
     data: Any
     refreshed_at_monotonic: float
+    normalized_alert_count: int | None = None
 
 
 class DashboardSnapshotCache:

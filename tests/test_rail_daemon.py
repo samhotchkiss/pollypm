@@ -14,7 +14,6 @@ import signal
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
@@ -25,6 +24,7 @@ from pollypm.rail_daemon import (
     _lock_file,
     _pid_alive,
     _pid_file,
+    _runtime_code_changed,
 )
 
 
@@ -51,10 +51,26 @@ def test_claim_pid_file_fresh(tmp_path: Path):
 
 def test_claim_pid_file_rejects_live_owner(tmp_path: Path):
     pid_path = tmp_path / "rail_daemon.pid"
-    # Simulate an already-running daemon owning the file.
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        # Simulate another live daemon owning the file.
+        pid_path.write_text(str(owner.pid))
+        assert _claim_pid_file(pid_path) is False
+        # The file must be untouched — we reject without stomping.
+        assert pid_path.read_text().strip() == str(owner.pid)
+    finally:
+        owner.terminate()
+        try:
+            owner.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            owner.kill()
+            owner.wait(timeout=2.0)
+
+
+def test_claim_pid_file_accepts_self_pid_for_reexec(tmp_path: Path):
+    pid_path = tmp_path / "rail_daemon.pid"
     pid_path.write_text(str(os.getpid()))
-    assert _claim_pid_file(pid_path) is False
-    # The file must be untouched — we reject without stomping.
+    assert _claim_pid_file(pid_path) is True
     assert pid_path.read_text().strip() == str(os.getpid())
 
 
@@ -88,6 +104,32 @@ def test_claim_pid_file_creates_parent_dir(tmp_path: Path):
     pid_path = tmp_path / "new_subdir" / "rail_daemon.pid"
     assert _claim_pid_file(pid_path) is True
     assert pid_path.exists()
+
+
+class _Fingerprint:
+    def __init__(self, kind: str, value: str) -> None:
+        self.kind = kind
+        self.value = value
+        self.token = f"{kind}:{value}"
+
+
+def test_runtime_code_changed_detects_comparable_value_change() -> None:
+    assert _runtime_code_changed(
+        _Fingerprint("served_git_sha", "old"),
+        _Fingerprint("served_git_sha", "new"),
+    )
+
+
+def test_runtime_code_changed_ignores_unknown_or_incomparable_values() -> None:
+    assert not _runtime_code_changed(None, _Fingerprint("served_git_sha", "new"))
+    assert not _runtime_code_changed(
+        _Fingerprint("served_git_sha", "old"),
+        _Fingerprint("package_mtime_ns", "new"),
+    )
+    assert not _runtime_code_changed(
+        _Fingerprint("served_git_sha", "same"),
+        _Fingerprint("served_git_sha", "same"),
+    )
 
 
 # --- Lifetime flock (#1586) ------------------------------------------------

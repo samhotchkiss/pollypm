@@ -113,6 +113,65 @@ def test_runtime_build_info_reads_embedded_served_git_sha(
     assert info.served_git_commit_time == "2026-05-29T12:00:00+00:00"
 
 
+def test_runtime_code_fingerprint_prefers_imported_package_git_head(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    package_path = tmp_path / "checkout" / "src" / "pollypm"
+    _write(package_path / "__init__.py", "")
+    checkout = tmp_path / "checkout"
+
+    monkeypatch.setattr(
+        deploy_info,
+        "_package_location",
+        lambda _import_name: (package_path, package_path / "__init__.py"),
+    )
+    monkeypatch.setattr(
+        deploy_info,
+        "_distribution_info",
+        lambda _package_name: ("1", tmp_path / "pollypm-1.dist-info", None),
+    )
+    monkeypatch.setattr(deploy_info, "_git_root", lambda path: checkout)
+    monkeypatch.setattr(deploy_info, "_git_head", lambda path: "abc123")
+
+    fingerprint = deploy_info.runtime_code_fingerprint()
+
+    assert fingerprint is not None
+    assert fingerprint.kind == "served_git_sha"
+    assert fingerprint.value == "abc123"
+    assert fingerprint.source_checkout == str(checkout)
+
+
+def test_runtime_code_fingerprint_uses_embedded_sha_without_git_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    package_path = tmp_path / "tool" / "pollypm"
+    _write(package_path / "__init__.py", "")
+    _write(
+        package_path / deploy_info.BUILD_INFO_FILENAME,
+        json.dumps({"git_sha": "embedded-sha"}),
+    )
+
+    monkeypatch.setattr(
+        deploy_info,
+        "_package_location",
+        lambda _import_name: (package_path, package_path / "__init__.py"),
+    )
+    monkeypatch.setattr(
+        deploy_info,
+        "_distribution_info",
+        lambda _package_name: ("1", tmp_path / "pollypm-1.dist-info", None),
+    )
+    monkeypatch.setattr(deploy_info, "_git_root", lambda path: None)
+
+    fingerprint = deploy_info.runtime_code_fingerprint()
+
+    assert fingerprint is not None
+    assert fingerprint.kind == "embedded_git_sha"
+    assert fingerprint.value == "embedded-sha"
+
+
 def test_runtime_build_info_flags_stale_when_embedded_sha_differs_from_source(
     tmp_path: Path,
     monkeypatch,

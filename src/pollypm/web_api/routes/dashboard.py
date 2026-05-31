@@ -371,12 +371,16 @@ def _load_dashboard_snapshot(config: Any) -> DashboardSnapshot:
             hint="Retry shortly; check `pm doctor` for pg pool health.",
         ) from data_result
 
-    _normalize_dashboard_alert_count(config, data_result)
+    normalized_alert_count = _normalize_dashboard_alert_count(
+        config,
+        data_result,
+    )
     return DashboardSnapshot(
         generated_at=datetime.now(timezone.utc),
         projects=tuple(projects_result),
         data=data_result,
         refreshed_at_monotonic=time.monotonic(),
+        normalized_alert_count=normalized_alert_count,
     )
 
 
@@ -528,11 +532,12 @@ async def get_dashboard_endpoint(
     # older snapshots, refresh that one cheap counter and write it through so
     # the Home headline does not hold an old-high value (#2504).
     snapshot_age = time.monotonic() - snapshot.refreshed_at_monotonic
-    fresh_alert_count = (
-        _normalize_dashboard_alert_count(config, data)
-        if snapshot_age > 2.0
-        else None
-    )
+    if snapshot_age > 2.0:
+        fresh_alert_count = _normalize_dashboard_alert_count(config, data)
+    else:
+        # Prefer the loader's explicit normalized value so the sync
+        # cache-miss response cannot fall back to the raw gathered count.
+        fresh_alert_count = snapshot.normalized_alert_count
 
     rollups = DashboardRollups(
         tracked_count=tracked_count,

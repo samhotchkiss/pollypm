@@ -309,26 +309,54 @@ def test_pg_concurrent_creates_assign_distinct_task_numbers(pg_schema_pool):
 
 def test_pg_approve_invokes_first_shipped_helper(pg_service, monkeypatch):
     """``approve`` must call ``maybe_record_first_shipped`` on DONE."""
-    from pollypm.work import sqlite_service as ss
+    from pollypm.work import first_shipped
+    from pollypm.work.models import WorkStatus
 
-    called: dict = {}
+    called: dict[str, object | None] = {}
 
     def _stub(svc, task_id, *, path=None, project_path=None, when=None):
+        called["svc"] = svc
         called["task_id"] = task_id
+        called["path"] = path
         called["project_path"] = project_path
+        called["when"] = when
         return True
 
-    monkeypatch.setattr(ss, "maybe_record_first_shipped", _stub)
+    monkeypatch.setattr(first_shipped, "maybe_record_first_shipped", _stub)
 
-    # The bare approval test requires a review node in the flow. We
-    # cheat by calling the hook directly through ``approve``'s post-
-    # DONE branch: the assertion is that the attribute initializer
-    # resets correctly and the hook is wired. The detailed flow-driven
-    # test lives in test_work_approval.py.
-    assert hasattr(pg_service, "last_first_shipped_created")
-    pg_service.last_first_shipped_created = True
-    # Sanity: importing the helper at module level works.
-    assert callable(ss.maybe_record_first_shipped)
+    task = pg_service.create(
+        title="ship it",
+        type="task",
+        project="demo-first-shipped",
+        flow_template="standard",
+        roles={"worker": "alice", "reviewer": "bob"},
+        description="body",
+    )
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="alice")
+    pg_service.node_done(
+        task.task_id,
+        actor="alice",
+        work_output={
+            "type": "code_change",
+            "summary": "implemented X",
+            "artifacts": [
+                {"kind": "commit", "description": "impl", "ref": "HEAD"}
+            ],
+        },
+    )
+
+    approved = pg_service.approve(task.task_id, actor="bob")
+
+    assert approved.work_status is WorkStatus.DONE
+    assert pg_service.last_first_shipped_created is True
+    assert called == {
+        "svc": pg_service,
+        "task_id": task.task_id,
+        "path": None,
+        "project_path": None,
+        "when": None,
+    }
 
 
 # ---------------------------------------------------------------------------

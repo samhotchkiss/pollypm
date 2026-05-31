@@ -182,6 +182,7 @@ _OPERATOR_DISPATCHABLE_RULES: frozenset[str] = frozenset({
 
 
 logger = logging.getLogger(__name__)
+_PLAN_MISSING_QUEUE_PROBE_LOGGED: set[tuple[str, str]] = set()
 
 
 __all__ = [
@@ -715,6 +716,94 @@ def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]
             project_key, exc_info=True,
         )
         return []
+
+
+def _plan_missing_gate_closed_for_queued_work(
+    project_key: str,
+    project_path: Path | None,
+    open_tasks: list[Any],
+    *,
+    enforce_plan: bool,
+    plan_dir: str,
+) -> bool:
+    """Return True when current queued work is blocked by the plan gate."""
+    if not enforce_plan or project_path is None or not open_tasks:
+        return False
+    try:
+        from pollypm.plan_presence import (
+            has_acceptable_plan,
+            task_bypasses_plan_gate,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: plan-gate helper import failed", exc_info=True,
+        )
+        return False
+
+    has_queued_blocked_candidate = False
+    for task in open_tasks:
+        status = getattr(task, "work_status", None)
+        status_value = getattr(status, "value", status)
+        if status_value != "queued":
+            continue
+        if (getattr(task, "project", None) or "") != project_key:
+            continue
+        try:
+            if task_bypasses_plan_gate(task):
+                continue
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: plan-bypass probe failed for %s/%s",
+                project_key,
+                getattr(task, "task_number", "?"),
+                exc_info=True,
+            )
+            continue
+        has_queued_blocked_candidate = True
+        break
+    if not has_queued_blocked_candidate:
+        return False
+
+    try:
+        from pollypm.work import create_work_service
+
+        with create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            return not has_acceptable_plan(
+                project_key, project_path, svc, plan_dir=plan_dir,
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: plan-gate state probe failed for %s",
+            project_key, exc_info=True,
+        )
+        return False
+
+
+def _log_plan_missing_queue_probe_once(
+    project_key: str,
+    *,
+    gate_closed: bool,
+    open_task_count: int,
+    finding_count: int,
+) -> None:
+    if not gate_closed and finding_count <= 0:
+        return
+    state = "finding" if finding_count else "gate_closed_no_finding"
+    key = (project_key, state)
+    if key in _PLAN_MISSING_QUEUE_PROBE_LOGGED:
+        return
+    _PLAN_MISSING_QUEUE_PROBE_LOGGED.add(key)
+    logger.info(
+        "audit.watchdog: plan_missing_queue_stalled probe ran for %s "
+        "gate_closed=%s open_tasks=%d findings=%d",
+        project_key,
+        gate_closed,
+        open_task_count,
+        finding_count,
+    )
 
 
 def _count_work_tasks_for_project(db_path: Path, project_key: str) -> int:
@@ -3859,6 +3948,7 @@ def _scan_one_project_counters() -> dict[str, int]:
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
         "plan_missing_churn_detected": 0,
+        "plan_missing_queue_stalled_detected": 0,
         # #1546 — new tier-1 healer counters.
         "worker_lane_spawned": 0,
         "worker_lane_failed": 0,
@@ -3950,6 +4040,8 @@ def _route_one_finding(
     if finding.rule == RULE_PLAN_MISSING_ALERT_CHURN:
         counters["plan_missing_churn_detected"] += 1
         return
+    if finding.rule == RULE_PLAN_MISSING_QUEUE_STALLED:
+        counters["plan_missing_queue_stalled_detected"] += 1
 
     # #1546 — tier-3 operator dispatchable rules route to the
     # operator inbox via ``_maybe_dispatch_to_operator``. The
@@ -4137,6 +4229,8 @@ def _scan_one_project(
     plan_missing_clears: list[_PlanMissingClear] | None = None,
     state_db_probes: list[_StateDbProbe] | None = None,
     config_path: Path | None = None,
+    enforce_plan: bool = True,
+    plan_dir: str = "docs/plan",
 ) -> dict[str, int]:
     """Scan one project and route every finding. Returns counters."""
     counters = _scan_one_project_counters()
@@ -4182,6 +4276,13 @@ def _scan_one_project(
     worker_cap_back_pressure = _gather_worker_cap_back_pressure(
         project_key, project_path, config_path,
     )
+    plan_missing_gate_closed = _plan_missing_gate_closed_for_queued_work(
+        project_key,
+        project_path,
+        open_tasks,
+        enforce_plan=enforce_plan,
+        plan_dir=plan_dir,
+    )
     try:
         findings = scan_project(
             project_key,
@@ -4197,6 +4298,7 @@ def _scan_one_project(
             plan_missing_clears=project_clears or None,
             state_db_probes=project_state_probes or None,
             worker_cap_back_pressure=worker_cap_back_pressure or None,
+            plan_missing_gate_closed=plan_missing_gate_closed,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -4204,6 +4306,17 @@ def _scan_one_project(
             project_key, exc_info=True,
         )
         return counters
+
+    plan_missing_finding_count = sum(
+        1 for finding in findings
+        if finding.rule == RULE_PLAN_MISSING_QUEUE_STALLED
+    )
+    _log_plan_missing_queue_probe_once(
+        project_key,
+        gate_closed=plan_missing_gate_closed,
+        open_task_count=len(open_tasks or []),
+        finding_count=plan_missing_finding_count,
+    )
 
     # #1554 HIGH-1 — collect the root_cause_hash for every finding seen
     # this scan. The cadence-level sweep uses the union across projects
@@ -4295,6 +4408,7 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
         "plan_missing_churn_detected": 0,
+        "plan_missing_queue_stalled_detected": 0,
         # #1546 — new tier-1 + tier-3 totals.
         "worker_lane_spawned": 0,
         "worker_lane_failed": 0,
@@ -4366,6 +4480,12 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             seen_projects.add(project_key)
             project_path = getattr(project, "path", None)
+            project_enforce = getattr(project, "enforce_plan", None)
+            enforce_plan = (
+                bool(project_enforce)
+                if project_enforce is not None
+                else bool(getattr(services, "enforce_plan", True))
+            )
             partial = _scan_one_project(
                 project_key=project_key,
                 project_path=Path(project_path) if project_path else None,
@@ -4378,6 +4498,10 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 plan_missing_clears=plan_missing_clears,
                 state_db_probes=state_db_probes,
                 config_path=config_path,
+                enforce_plan=enforce_plan,
+                plan_dir=(
+                    getattr(services, "plan_dir", "docs/plan") or "docs/plan"
+                ),
             )
             totals["projects_scanned"] += 1
             project_seen = partial.pop("_seen_root_cause_hashes", None)

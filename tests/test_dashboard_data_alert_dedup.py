@@ -704,6 +704,136 @@ def test_briefing_surfaces_recovery_narration() -> None:
     assert "Saved:" not in out
 
 
+def test_briefing_first_up_skips_dormant_projects() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing, InboxPreview
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=2,
+        recent_messages=[
+            InboxPreview(
+                sender="watchdog",
+                title=(
+                    "Project pm_test_05wave4_1779714744 has 1 queued "
+                    "task(s) but no claim / execution."
+                ),
+                project="pm test 05wave4 1779714744",
+                task_id="pm_test_05wave4_1779714744/64",
+                age_seconds=0.0,
+            ),
+            InboxPreview(
+                sender="watchdog",
+                title=(
+                    "Project savethenovel has 2 queued task(s) but no "
+                    "claim / execution."
+                ),
+                project="Save the Novel",
+                task_id="savethenovel/12",
+                age_seconds=60.0,
+                project_key="savethenovel",
+            ),
+        ],
+        recovery_count_24h=0,
+        recent_real_work_projects=frozenset({"savethenovel"}),
+    )
+
+    assert "pm_test" not in out
+    assert "pm test" not in out
+    assert "First up: Save the Novel has queued work without an active claim." in out
+    assert "no claim / execution" not in out
+    assert "open Inbox and clear that first" in out
+
+
+def test_briefing_uses_generic_inbox_line_when_only_dormant_items_exist() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing, InboxPreview
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=1,
+        recent_messages=[
+            InboxPreview(
+                sender="watchdog",
+                title=(
+                    "Task pm_test_05wave4_1779714744/64 has been at "
+                    "status=in_progress for ~25 min with no worker heartbeat."
+                ),
+                project="pm test 05wave4 1779714744",
+                task_id="pm_test_05wave4_1779714744/64",
+                age_seconds=0.0,
+            ),
+        ],
+        recovery_count_24h=0,
+        recent_real_work_projects=frozenset({"savethenovel"}),
+    )
+
+    assert "pm_test" not in out
+    assert "pm test" not in out
+    assert "status=in_progress" not in out
+    assert "One thing needs you: 1 inbox item waiting." in out
+
+
+def test_recovery_narration_filters_dormant_projects(monkeypatch) -> None:
+    from pollypm.dashboard_data import _recent_recovery_audit_narrations
+
+    rows = [
+        SimpleNamespace(
+            event="watchdog.escalation_dispatched",
+            ts="2026-05-30T10:00:00+00:00",
+            project="pm_test_05wave4_1779714744",
+            subject="pm_test_05wave4_1779714744/64",
+            actor="audit_watchdog",
+            status="ok",
+            metadata={
+                "finding_type": "stuck_draft",
+                "project": "pm_test_05wave4_1779714744",
+            },
+        ),
+        SimpleNamespace(
+            event="recovery.spawn",
+            ts="2026-05-30T10:05:00+00:00",
+            project="savethenovel",
+            subject="architect_savethenovel",
+            actor="supervisor",
+            status="ok",
+            metadata={
+                "failure_type": "capacity_exhausted",
+                "target_session": "architect_savethenovel",
+                "project": "savethenovel",
+            },
+        ),
+    ]
+
+    def fake_read_events(project: str, **_kwargs: object) -> list[object]:
+        return [row for row in rows if row.project == project]
+
+    monkeypatch.setattr("pollypm.audit.log.read_events", fake_read_events)
+    config = SimpleNamespace(
+        projects={
+            "pm_test_05wave4_1779714744": SimpleNamespace(
+                tracked=True,
+                path="/tmp/pm_test",
+            ),
+            "savethenovel": SimpleNamespace(
+                tracked=True,
+                path="/tmp/savethenovel",
+            ),
+        }
+    )
+
+    narrations, count = _recent_recovery_audit_narrations(
+        config,
+        since="2026-05-30T00:00:00+00:00",
+        recent_real_work_projects=frozenset({"savethenovel"}),
+    )
+
+    assert count == 2
+    assert len(narrations) == 1
+    assert "capacity was exhausted" in narrations[0]
+    assert "pm_test" not in narrations[0]
+
+
 def test_recent_recovery_audit_narrations_reads_audit_events(monkeypatch) -> None:
     from pollypm.dashboard_data import _recent_recovery_audit_narrations
 

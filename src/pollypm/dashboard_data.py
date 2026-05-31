@@ -166,6 +166,7 @@ class InboxPreview:
     project: str
     task_id: str
     age_seconds: float
+    project_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -821,10 +822,12 @@ def _alert_filter_needs_project_task_facts(open_alerts: list[object]) -> bool:
 def _project_task_facts_for_alert_filter(
     config: PollyPMConfig,
     open_alerts: list[object],
+    *,
+    force: bool = False,
 ) -> _AlertProjectTaskFacts:
     """Return per-project task facts only when alert policy needs them."""
 
-    if not _alert_filter_needs_project_task_facts(open_alerts):
+    if not force and not _alert_filter_needs_project_task_facts(open_alerts):
         return _AlertProjectTaskFacts({}, None)
     try:
         from pollypm.cockpit_pg_aggregates import (
@@ -870,6 +873,7 @@ def dashboard_actionable_alerts(
     open_alerts: list[object],
     *,
     user_waiting_task_ids: frozenset[str] | None = None,
+    project_task_facts: _AlertProjectTaskFacts | None = None,
 ) -> list[object]:
     """Return the alert rows that should drive Home/Alerts action counts."""
 
@@ -887,10 +891,11 @@ def dashboard_actionable_alerts(
                 exc_info=True,
             )
             user_waiting_task_ids = frozenset()
-    project_task_facts = _project_task_facts_for_alert_filter(
-        config,
-        open_alerts,
-    )
+    if project_task_facts is None:
+        project_task_facts = _project_task_facts_for_alert_filter(
+            config,
+            open_alerts,
+        )
     context = AlertActionabilityContext(
         user_waiting_task_ids=frozenset(user_waiting_task_ids),
         known_projects=_known_project_keys(config),
@@ -906,6 +911,7 @@ def count_dashboard_alerts(
     open_alerts: list[object] | None = None,
     *,
     user_waiting_task_ids: frozenset[str] | None = None,
+    project_task_facts: _AlertProjectTaskFacts | None = None,
 ) -> int:
     """Count the same user-actionable alert set the Home dashboard renders."""
 
@@ -918,6 +924,7 @@ def count_dashboard_alerts(
             config,
             open_alerts,
             user_waiting_task_ids=user_waiting_task_ids,
+            project_task_facts=project_task_facts,
         )
     )
 
@@ -928,12 +935,75 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
 
 
 _TASK_ID_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_.-]+/\d+\b")
+_PROJECT_QUEUED_NO_CLAIM_RE = re.compile(
+    r"^Project\s+(?P<project>[A-Za-z0-9_.-]+)\s+has\s+"
+    r"(?P<count>\d+)\s+queued\s+task(?:\(s\)|s)?\s+"
+    r"but\s+no\s+claim\s*/\s*execution\b",
+    re.IGNORECASE,
+)
+_TASK_STALE_STATUS_RE = re.compile(
+    r"^(?:Task\s+)?(?P<task>a task|[A-Za-z0-9_.-]+/\d+)\s+"
+    r"has\s+been\s+at\s+status=(?P<status>[A-Za-z_]+)\b",
+    re.IGNORECASE,
+)
 
 
-def _clean_briefing_title(title: str) -> str:
+def _human_project_label(value: str) -> str:
+    words = re.sub(r"[_-]+", " ", value or "").strip()
+    return words or "That project"
+
+
+def _clean_briefing_title(title: str, *, project_label: str = "") -> str:
     text = re.sub(r"\s+", " ", title or "").strip()
+    queued_match = _PROJECT_QUEUED_NO_CLAIM_RE.match(text)
+    if queued_match is not None:
+        label = _human_project_label(project_label or queued_match.group("project"))
+        return f"{label} has queued work without an active claim"
+    stale_match = _TASK_STALE_STATUS_RE.match(text)
+    if stale_match is not None:
+        label = _human_project_label(project_label)
+        status = stale_match.group("status").replace("_", " ")
+        state = "in progress" if status == "in progress" else f"at {status}"
+        if project_label:
+            return f"{label} has a task stalled {state}"
+        return f"A task looks stalled {state}"
     text = _TASK_ID_TOKEN_RE.sub("a task", text)
     return text.rstrip(".")
+
+
+def _briefing_message_project_key(message: object) -> str | None:
+    explicit = getattr(message, "project_key", None)
+    if explicit:
+        return str(explicit)
+    task_id = str(getattr(message, "task_id", "") or "")
+    if "/" in task_id:
+        return task_id.rsplit("/", 1)[0].strip() or None
+    return None
+
+
+def _project_is_live_for_briefing(
+    project_key: str | None,
+    recent_real_work_projects: frozenset[str] | None,
+) -> bool:
+    if recent_real_work_projects is None:
+        return True
+    if not project_key:
+        return True
+    return project_key in recent_real_work_projects
+
+
+def _first_briefing_message(
+    recent_messages: list[InboxPreview],
+    *,
+    recent_real_work_projects: frozenset[str] | None,
+) -> InboxPreview | None:
+    for message in recent_messages:
+        if _project_is_live_for_briefing(
+            _briefing_message_project_key(message),
+            recent_real_work_projects,
+        ):
+            return message
+    return None
 
 
 def _recovery_narration_line(recovery_summaries: list[str] | None) -> str | None:
@@ -955,6 +1025,7 @@ def _build_dashboard_briefing(
     recent_messages: list[InboxPreview],
     recovery_count_24h: int,
     recovery_summaries: list[str] | None = None,
+    recent_real_work_projects: frozenset[str] | None = None,
 ) -> str:
     """Build the concise Home briefing from already-gathered dashboard facts."""
 
@@ -986,10 +1057,15 @@ def _build_dashboard_briefing(
 
     if inbox_count:
         decision = ""
-        for message in recent_messages:
-            decision = _clean_briefing_title(getattr(message, "title", "") or "")
-            if decision:
-                break
+        message = _first_briefing_message(
+            recent_messages,
+            recent_real_work_projects=recent_real_work_projects,
+        )
+        if message is not None:
+            decision = _clean_briefing_title(
+                getattr(message, "title", "") or "",
+                project_label=str(getattr(message, "project", "") or ""),
+            )
         if decision:
             if inbox_count == 1:
                 lines.append(
@@ -1003,7 +1079,7 @@ def _build_dashboard_briefing(
                     + decision
                     + ". "
                     + _plural(inbox_count, "inbox item")
-                    + " waiting."
+                    + " waiting; open Inbox and clear that first."
                 )
         else:
             prefix = "One thing needs you: " if inbox_count == 1 else "Inbox needs you: "
@@ -1020,22 +1096,20 @@ def _build_dashboard_briefing(
     return "\n".join(lines[:6])
 
 
-def _recent_recovery_audit_narrations(
+def _recent_recovery_audit_events(
     config: PollyPMConfig,
     *,
     since: str,
-    limit: int = 3,
-) -> tuple[list[str], int]:
-    """Return recent recovery/self-heal audit narration for the Home brief."""
+) -> list[object]:
+    """Return recent unique recovery/self-heal audit events for the Home brief."""
 
     try:
         from pollypm.audit.log import read_events
         from pollypm.recovery.narration import (
             RECOVERY_BRIEF_EVENT_NAMES,
-            narrate_recovery_event,
         )
     except Exception:  # noqa: BLE001
-        return [], 0
+        return []
 
     events = []
     for project_key, project in (getattr(config, "projects", {}) or {}).items():
@@ -1074,8 +1148,29 @@ def _recent_recovery_audit_narrations(
         seen.add(dedupe_key)
         unique_events.append(event)
 
+    return unique_events
+
+
+def _recovery_audit_narrations_from_events(
+    events: list[object],
+    *,
+    limit: int,
+    recent_real_work_projects: frozenset[str] | None,
+) -> list[str]:
+    try:
+        from pollypm.recovery.narration import narrate_recovery_event
+    except Exception:  # noqa: BLE001
+        return []
+
+    live_events = [
+        event for event in events
+        if _project_is_live_for_briefing(
+            str(getattr(event, "project", "") or "") or None,
+            recent_real_work_projects,
+        )
+    ]
     narrations: list[str] = []
-    for event in unique_events[:limit]:
+    for event in live_events[:limit]:
         metadata = event.metadata or {}
         sentence = narrate_recovery_event(
             event.event,
@@ -1086,7 +1181,27 @@ def _recent_recovery_audit_narrations(
         )
         if sentence:
             narrations.append(sentence)
-    return narrations, len(unique_events)
+    return narrations
+
+
+def _recent_recovery_audit_narrations(
+    config: PollyPMConfig,
+    *,
+    since: str,
+    limit: int = 3,
+    recent_real_work_projects: frozenset[str] | None = None,
+) -> tuple[list[str], int]:
+    """Return recent recovery/self-heal audit narration for the Home brief."""
+
+    events = _recent_recovery_audit_events(config, since=since)
+    return (
+        _recovery_audit_narrations_from_events(
+            events,
+            limit=limit,
+            recent_real_work_projects=recent_real_work_projects,
+        ),
+        len(events),
+    )
 
 
 def _inbox_sender(task) -> str:
@@ -1127,7 +1242,11 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
     if pg_grouped is None:
         return []
 
-    def _emit_preview(task: object, project_label: str) -> None:
+    def _emit_preview(
+        task: object,
+        project_label: str,
+        project_key: str | None,
+    ) -> None:
         if task.task_id in seen_task_ids:
             return
         seen_task_ids.add(task.task_id)
@@ -1149,6 +1268,7 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
                 project=project_label,
                 task_id=task.task_id,
                 age_seconds=age_seconds,
+                project_key=project_key,
             )
         )
 
@@ -1158,7 +1278,7 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
             # workspace-root source has no task rows under pg.
             continue
         for task in inbox_tasks_for_project(pg_grouped, config, project_key):
-            _emit_preview(task, project_label)
+            _emit_preview(task, project_label, project_key)
     previews.sort(key=lambda item: item.age_seconds)
     return previews[:limit]
 
@@ -1381,36 +1501,50 @@ def gather(
         config,
         use_state_cache=use_state_cache,
     )
-    recent_messages = _recent_inbox_messages(config)
-    sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
-    recovery_summaries, audit_recovery_count = _recent_recovery_audit_narrations(
+    recent_message_candidates = _recent_inbox_messages(
         config,
-        since=cutoff,
+        limit=max(3, inbox_count),
+    )
+    recent_messages = recent_message_candidates[:3]
+    sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
+    recovery_events = _recent_recovery_audit_events(config, since=cutoff)
+
+    if use_pg:
+        open_alerts = list(pg_open_alerts())
+    elif store is not None:
+        open_alerts = list(store.open_alerts())  # type: ignore[attr-defined]
+    else:
+        open_alerts = []
+    project_task_facts = _project_task_facts_for_alert_filter(
+        config,
+        open_alerts,
+        force=use_pg and bool(recent_message_candidates or recovery_events),
+    )
+    recent_real_work_projects = project_task_facts.recent_real_work_projects
+    recovery_summaries = _recovery_audit_narrations_from_events(
+        recovery_events,
+        limit=3,
+        recent_real_work_projects=recent_real_work_projects,
     )
     recoveries = (
         sum(1 for e in day_events if "recover" in e.event_type)
-        + audit_recovery_count
+        + len(recovery_events)
     )
-
-    if use_pg:
-        open_alerts = pg_open_alerts()
-    elif store is not None:
-        open_alerts = store.open_alerts()  # type: ignore[attr-defined]
-    else:
-        open_alerts = []
     user_waiting = _user_waiting_task_ids_across_projects(config)
     alert_count = count_dashboard_alerts(
         config,
-        list(open_alerts),
+        open_alerts,
         user_waiting_task_ids=user_waiting,
+        project_task_facts=project_task_facts,
     )
     briefing = _build_dashboard_briefing(
         commits=commits,
         completed=completed,
         inbox_count=inbox_count,
-        recent_messages=recent_messages,
+        recent_messages=recent_message_candidates,
         recovery_count_24h=recoveries,
         recovery_summaries=recovery_summaries,
+        recent_real_work_projects=recent_real_work_projects,
     )
 
     return DashboardData(

@@ -86,6 +86,49 @@ def test_list_projects_tracked_filter(api_config, client, auth_headers) -> None:
     assert keys == ["myproj"]
 
 
+def test_list_projects_operator_filter_hides_seed_harness_projects(
+    api_config, client, auth_headers, project_root
+) -> None:
+    from pollypm.models import KnownProject, ProjectKind
+
+    real_root = project_root.parent / "savethenovel"
+    seed_root = project_root.parent / "pm-test-01wave-1779715196"
+    paused_root = project_root.parent / "real-paused"
+    real_root.mkdir()
+    seed_root.mkdir()
+    paused_root.mkdir()
+    (real_root / ".pollypm").mkdir()
+    (seed_root / ".pollypm").mkdir()
+    (paused_root / ".pollypm").mkdir()
+    api_config.projects["savethenovel"] = KnownProject(
+        key="savethenovel",
+        path=real_root,
+        name="Save the Novel",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+    api_config.projects["real-paused"] = KnownProject(
+        key="real-paused",
+        path=paused_root,
+        name="Real Paused",
+        tracked=False,
+        kind=ProjectKind.GIT,
+    )
+    api_config.projects["pm-test-01wave-1779715196"] = KnownProject(
+        key="pm-test-01wave-1779715196",
+        path=seed_root,
+        name="PM Test",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+
+    response = client.get("/api/v1/projects?operator=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    keys = [item["key"] for item in response.json()["items"]]
+    assert keys == ["savethenovel", "real-paused"]
+
+
 def test_project_metrics_normalize_last_activity_at(api_config) -> None:
     from pollypm.web_api import service as api_service
 

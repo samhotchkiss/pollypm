@@ -2576,19 +2576,22 @@ class PollyCockpitApp(App[None]):
             supervisor = self.router._load_supervisor()
             config = supervisor.config
 
-            # project_count: every configured project (tracked + paused).
-            # The footer is a workspace-wide signal \u2014 filtering to
-            # tracked would hide projects the operator just paused,
-            # contradicting the "Tracked-Filter Asymmetry" memo for the
-            # rail badge.
             projects = getattr(config, "projects", {}) or {}
-            project_count = len(projects)
+            from pollypm.project_liveness import real_operator_project_items
 
-            # agent_count: every configured session row, since "agents"
-            # in the audit copy maps to the session table the supervisor
-            # launches. Live-only counts would jitter as workers restart.
+            operator_projects = real_operator_project_items(
+                projects,
+                default_tracked=False,
+            )
+            operator_project_keys = {str(key) for key, _project in operator_projects}
+            project_count = len(operator_projects)
+
             sessions = getattr(config, "sessions", {}) or {}
-            agent_count = len(sessions)
+            agent_count = 0
+            for session in sessions.values():
+                project_key = getattr(session, "project", None)
+                if project_key is None or str(project_key) in operator_project_keys:
+                    agent_count += 1
 
             # inbox_count: share the rail badge helper, but bypass the
             # state-cache snapshot so the operator-visible footer

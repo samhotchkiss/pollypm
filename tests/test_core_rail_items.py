@@ -417,6 +417,57 @@ def test_build_items_keeps_projects_section_when_empty(
     assert keys.index("inbox") < keys.index("projects_root") < keys.index("settings")
 
 
+def test_project_rows_hide_seed_harness_projects_when_real_projects_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    real = KnownProject(
+        key="savethenovel",
+        path=tmp_path / "savethenovel",
+        name="Save the Novel",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+    synthetic = KnownProject(
+        key="pm-test-01wave-1779715196",
+        path=tmp_path / "pm-test-01wave-1779715196",
+        name="PM Test 01",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+    real.path.mkdir()
+    synthetic.path.mkdir()
+    config = _FakeConfig(
+        tmp_path,
+        projects={
+            "savethenovel": real,
+            "pm-test-01wave-1779715196": synthetic,
+        },
+    )
+
+    class _Router:
+        _project_activity_cache: dict = {}
+
+        def _session_state(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return "idle"
+
+    monkeypatch.setattr(
+        "pollypm.work.task_state.project_activity",
+        lambda **_kwargs: (True, False),
+    )
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "active_task_numbers",
+        lambda project, *, config=None: [],
+    )
+    ctx = RailContext(router=_Router(), config=config, launches=[])
+
+    rows = core_rail_items_plugin._project_rows(ctx)
+    keys = [row.key for row in rows]
+
+    assert "project:savethenovel" in keys
+    assert "project:pm-test-01wave-1779715196" not in keys
+
+
 def test_russell_rail_entry_hidden_when_reviewer_session_unconfigured(
     monkeypatch, tmp_path: Path,
 ) -> None:

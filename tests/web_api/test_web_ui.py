@@ -1174,7 +1174,7 @@ def test_ui_app_js_has_alerts_panel_hooks(client: TestClient) -> None:
         "/doctor/run",
         "session-drift",
         "Run session drift",
-        "Open alerts",
+        "Open background alerts",
     ):
         assert expected in body
 
@@ -1849,7 +1849,7 @@ def test_render_dashboard_real_payload_executes() -> None:
     Asserts the rendered DOM contains:
     - the inbox count + label
     - the plan-reviews count + label
-    - the alert count + ``alerts`` label
+    - the alert count + ``watching`` label
     - the daemon ``up`` status + label
     - the activity sweeps/msgs label
     - the active-sessions count
@@ -1904,7 +1904,7 @@ def test_render_dashboard_real_payload_executes() -> None:
         "Claude headroom",
         "inbox",
         "plan reviews",
-        "alerts",
+        "watching",
         "activity (24h)",
         "daemon",
         "active sessions",
@@ -1926,16 +1926,16 @@ def test_render_dashboard_real_payload_executes() -> None:
     assert ">5<" in rendered, "tracked_count value 5 missing"
     assert "58% left this week" in rendered, "quota summary missing"
     assert "1234 today / 5678 total tokens" in rendered, "token line missing"
-    assert "12 things need you" in rendered, "lead headline missing"
+    assert "9 things need you" in rendered, "lead headline missing"
+    assert "3 background alerts being watched" in rendered
     assert 'role="button"' in rendered
     assert 'title="Open inbox"' in rendered
-    assert 'title="Open alerts"' in rendered
+    assert 'title="Open background alerts"' in rendered
 
-    # Color-coding contract: daemon=up → rollup-working; alert_count>0
-    # → rollup-blocked. Pin these too so a future restyle that drops
+    # Color-coding contract: daemon=up and alert_count>0 both use
+    # the working/watching treatment. Pin this so a future restyle that drops
     # the class hooks fails loudly.
     assert "rollup-working" in rendered
-    assert "rollup-blocked" in rendered
 
 
 def test_render_dashboard_daemon_down_uses_blocked_class() -> None:

@@ -15,7 +15,10 @@ from pollypm.config import PollyPMConfig, load_config
 from pollypm.idle_placeholders import (
     is_codex_idle_placeholder as _is_codex_idle_placeholder,
 )
-from pollypm.project_liveness import is_real_operator_project
+from pollypm.project_liveness import (
+    is_real_operator_project,
+    real_operator_project_items,
+)
 from pollypm.projects import project_state_db_path
 
 logger = logging.getLogger(__name__)
@@ -291,7 +294,9 @@ def _recent_commits(config: PollyPMConfig, hours: int = 24) -> list[CommitInfo]:
     now = datetime.now(UTC)
     seen: set[str] = set()
 
-    project_items = list(config.projects.items())
+    project_items = list(
+        real_operator_project_items(config.projects, default_tracked=False)
+    )
     if len(project_items) > 1:
         with ThreadPoolExecutor(
             max_workers=min(_COMMIT_LOG_MAX_WORKERS, len(project_items)),
@@ -377,7 +382,10 @@ def _completed_issues(config: PollyPMConfig, hours: int = 72) -> list[CompletedI
         now = datetime.now(UTC)
         cutoff = now - timedelta(hours=hours)
 
-        for key, project in config.projects.items():
+        for key, project in real_operator_project_items(
+            config.projects,
+            default_tracked=False,
+        ):
             completed_dir = project.path / "issues" / "05-completed"
             if not completed_dir.exists():
                 continue
@@ -684,7 +692,9 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
     from pollypm.notify_task import is_notify_only_inbox_entry
 
     total = 0
-    for project_key, project in getattr(config, "projects", {}).items():
+    for project_key, project in real_operator_project_items(
+        getattr(config, "projects", {}) or {}
+    ):
         if not getattr(project, "tracked", False):
             continue
         total += sum(
@@ -949,6 +959,10 @@ _TASK_STALE_STATUS_RE = re.compile(
     r"has\s+been\s+at\s+status=(?P<status>[A-Za-z_]+)\b",
     re.IGNORECASE,
 )
+_BOOKKEEPING_COMMIT_RE = re.compile(
+    r"^(?:journal|ledger|chore)(?:\(|:)|^journal\(48h\):",
+    re.IGNORECASE,
+)
 
 
 def _human_project_label(value: str) -> str:
@@ -1020,6 +1034,112 @@ def _recovery_narration_line(recovery_summaries: list[str] | None) -> str | None
     return "While you were away, I handled this: " + " ".join(summaries[:2])
 
 
+def _is_bookkeeping_commit(commit: CommitInfo) -> bool:
+    return _BOOKKEEPING_COMMIT_RE.search(commit.message.strip()) is not None
+
+
+def _briefing_progress_line(commits: list[CommitInfo]) -> str | None:
+    if not commits:
+        return None
+    product_commits = [commit for commit in commits if not _is_bookkeeping_commit(commit)]
+    bookkeeping_count = len(commits) - len(product_commits)
+    counted_commits = product_commits if product_commits else commits
+    projects_touched = len({commit.project for commit in counted_commits})
+    if bookkeeping_count:
+        return (
+            "Progress: "
+            + _plural(len(product_commits), "product commit")
+            + " (+"
+            + _plural(bookkeeping_count, "bookkeeping commit")
+            + ") across "
+            + _plural(projects_touched, "project")
+            + "."
+        )
+    return (
+        "Progress: "
+        + _plural(len(product_commits), "commit")
+        + " across "
+        + _plural(projects_touched, "project")
+        + "."
+    )
+
+
+def _format_idle_age(age_seconds: float) -> str:
+    seconds = max(0, int(age_seconds))
+    days = seconds // 86400
+    hours = seconds // 3600
+    minutes = seconds // 60
+    if days:
+        return f"{days}d"
+    if hours:
+        return f"{hours}h"
+    if minutes >= 15:
+        return f"{minutes}m"
+    return ""
+
+
+def _remaining_inbox_line(
+    *,
+    first_message: InboxPreview | None,
+    inbox_count: int,
+    recent_messages: list[InboxPreview],
+    recent_real_work_projects: frozenset[str] | None,
+) -> str | None:
+    remaining_total = inbox_count - (1 if first_message is not None else 0)
+    if remaining_total <= 0:
+        return None
+    first_task_id = getattr(first_message, "task_id", None) if first_message else None
+    groups: dict[str, tuple[int, float]] = {}
+    for message in recent_messages:
+        if getattr(message, "task_id", None) == first_task_id:
+            continue
+        if not _project_is_live_for_briefing(
+            _briefing_message_project_key(message),
+            recent_real_work_projects,
+        ):
+            continue
+        label = _human_project_label(str(getattr(message, "project", "") or "Other"))
+        count, oldest = groups.get(label, (0, 0.0))
+        groups[label] = (count + 1, max(oldest, float(message.age_seconds or 0.0)))
+    if not groups:
+        return "Remaining: " + _plural(remaining_total, "other inbox item") + "."
+    parts: list[str] = []
+    covered = 0
+    for label, (count, oldest) in sorted(
+        groups.items(),
+        key=lambda item: (-item[1][0], -item[1][1], item[0].lower()),
+    )[:3]:
+        covered += count
+        age = _format_idle_age(oldest)
+        detail = f"{count}, idle {age}" if age else str(count)
+        parts.append(f"{label} ({detail})")
+    missing = max(0, remaining_total - covered)
+    if missing:
+        parts.append(_plural(missing, "other"))
+    return "Remaining: " + ", ".join(parts) + "."
+
+
+def _strain_note(
+    *,
+    account_usages: list[AccountQuotaUsage] | None,
+    recovery_count_24h: int,
+) -> str | None:
+    notes: list[str] = []
+    tight_accounts = [
+        usage for usage in (account_usages or [])
+        if int(getattr(usage, "used_pct", 0) or 0) >= 95
+    ]
+    if tight_accounts:
+        usage = tight_accounts[0]
+        limit = usage.limit_label or "limit"
+        notes.append(f"{usage.provider or usage.account_name} is near its {limit}")
+    if recovery_count_24h >= 50:
+        notes.append(f"{recovery_count_24h} recoveries in 24h")
+    if not notes:
+        return None
+    return "Health note: " + "; ".join(notes) + "."
+
+
 def _build_dashboard_briefing(
     *,
     commits: list[CommitInfo],
@@ -1029,6 +1149,7 @@ def _build_dashboard_briefing(
     recovery_count_24h: int,
     recovery_summaries: list[str] | None = None,
     recent_real_work_projects: frozenset[str] | None = None,
+    account_usages: list[AccountQuotaUsage] | None = None,
 ) -> str:
     """Build the concise Home briefing from already-gathered dashboard facts."""
 
@@ -1039,15 +1160,9 @@ def _build_dashboard_briefing(
             + _plural(len(completed), "item")
             + " wrapped in the last 72 hours."
         )
-    if commits:
-        projects_touched = len({c.project for c in commits})
-        lines.append(
-            "Progress: "
-            + _plural(len(commits), "commit")
-            + " across "
-            + _plural(projects_touched, "project")
-            + "."
-        )
+    progress_line = _briefing_progress_line(commits)
+    if progress_line:
+        lines.append(progress_line)
     recovery_line = _recovery_narration_line(recovery_summaries)
     if recovery_line:
         lines.append(recovery_line)
@@ -1057,6 +1172,12 @@ def _build_dashboard_briefing(
             + _plural(recovery_count_24h, "recovery", "recoveries")
             + " handled without handing you a mess."
         )
+    strain = _strain_note(
+        account_usages=account_usages,
+        recovery_count_24h=recovery_count_24h,
+    )
+    if strain:
+        lines.append(strain)
 
     if inbox_count:
         decision = ""
@@ -1084,6 +1205,14 @@ def _build_dashboard_briefing(
                     + _plural(inbox_count, "inbox item")
                     + " waiting; open Inbox and clear that first."
                 )
+                remaining = _remaining_inbox_line(
+                    first_message=message,
+                    inbox_count=inbox_count,
+                    recent_messages=recent_messages,
+                    recent_real_work_projects=recent_real_work_projects,
+                )
+                if remaining:
+                    lines.append(remaining)
         else:
             prefix = "One thing needs you: " if inbox_count == 1 else "Inbox needs you: "
             lines.append(
@@ -1096,7 +1225,7 @@ def _build_dashboard_briefing(
     else:
         lines.append("All handled: no inbox items waiting.")
 
-    return "\n".join(lines[:6])
+    return "\n".join(lines[:7])
 
 
 def _recent_recovery_audit_events(
@@ -1229,7 +1358,9 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
     seen_task_ids: set[str] = set()
     previews: list[InboxPreview] = []
     sources: list[tuple[str | None, str, Path, Path]] = []
-    for project_key, project in getattr(config, "projects", {}).items():
+    for project_key, project in real_operator_project_items(
+        getattr(config, "projects", {}) or {}
+    ):
         # Same tracked-only invariant as _count_inbox_tasks (cycle 86):
         # a non-tracked project's leftover state would leak stale tasks
         # into the polly-dashboard's "Recent messages" preview.
@@ -1282,6 +1413,96 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
             continue
         for task in inbox_tasks_for_project(pg_grouped, config, project_key):
             _emit_preview(task, project_label, project_key)
+    previews.sort(key=lambda item: item.age_seconds)
+    return previews[:limit]
+
+
+def _recent_pm_chat_messages(
+    config: PollyPMConfig,
+    *,
+    limit: int = 3,
+) -> list[InboxPreview]:
+    """Return latest persona-authored PM chat lines for Home previews."""
+
+    try:
+        from pollypm.web_api.chat import (
+            MessageRole,
+            MessageType,
+            SurfaceType,
+            enumerate_chat_surfaces,
+            parse_events_jsonl_tail,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+    projects = getattr(config, "projects", {}) or {}
+    project_items = real_operator_project_items(projects, default_tracked=False)
+    real_keys = {str(key) for key, _project in project_items}
+    project_labels = {
+        str(key): (
+            project.display_label()
+            if hasattr(project, "display_label")
+            else str(getattr(project, "name", None) or key)
+        )
+        for key, project in project_items
+    }
+    try:
+        surfaces = enumerate_chat_surfaces(
+            config,
+            work_service=None,
+            tmux_client=None,
+            include_transcripts=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("dashboard_data: PM chat surface enumeration failed", exc_info=True)
+        return []
+
+    previews: list[InboxPreview] = []
+    now = datetime.now(UTC)
+    wanted_types = {SurfaceType.ARCHITECT, SurfaceType.ADVISOR}
+    for surface in surfaces:
+        project_key = str(surface.project or "")
+        if surface.surface_type not in wanted_types or project_key not in real_keys:
+            continue
+        archive = surface.transcript_path
+        if archive is None or not archive.exists():
+            continue
+        try:
+            envelopes = parse_events_jsonl_tail(
+                archive,
+                limit=40,
+                actor_fallback=surface.persona or "agent",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "dashboard_data: PM chat parse failed for %s",
+                surface.session_name,
+                exc_info=True,
+            )
+            continue
+        for envelope in reversed(envelopes):
+            if envelope.role != MessageRole.ASSISTANT or envelope.type != MessageType.TEXT:
+                continue
+            text = re.sub(r"\s+", " ", envelope.text or "").strip()
+            if not text:
+                continue
+            stamped = _coerce_utc_datetime(envelope.ts)
+            age_seconds = (
+                max(0.0, (now - stamped).total_seconds())
+                if stamped is not None
+                else 0.0
+            )
+            previews.append(
+                InboxPreview(
+                    sender=surface.persona or "PM",
+                    title=text[:80],
+                    project=project_labels.get(project_key, project_key),
+                    task_id=f"{project_key}:pm-chat",
+                    age_seconds=age_seconds,
+                    project_key=project_key,
+                )
+            )
+            break
     previews.sort(key=lambda item: item.age_seconds)
     return previews[:limit]
 
@@ -1508,7 +1729,8 @@ def gather(
         config,
         limit=max(3, inbox_count),
     )
-    recent_messages = recent_message_candidates[:3]
+    recent_pm_messages = _recent_pm_chat_messages(config, limit=3)
+    recent_messages = (recent_pm_messages + recent_message_candidates)[:3]
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
     recovery_events = _recent_recovery_audit_events(config, since=cutoff)
 
@@ -1548,6 +1770,7 @@ def gather(
         recovery_count_24h=recoveries,
         recovery_summaries=recovery_summaries,
         recent_real_work_projects=recent_real_work_projects,
+        account_usages=account_usages,
     )
 
     return DashboardData(

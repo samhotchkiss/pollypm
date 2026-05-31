@@ -798,6 +798,66 @@ def test_messages_endpoint_empty_when_no_transcript_yet(
     assert "transcript_path" not in body
 
 
+def test_pm_messages_auto_prefers_stale_jsonl_and_filters_tool_plumbing(
+    client, auth_headers, patch_registry, patch_parser, monkeypatch, tmp_path,
+):
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("placeholder")
+    patch_registry([_surface(
+        "architect_myproj", SurfaceType.ARCHITECT,
+        persona="Sage", project="myproj", transcript_path=archive,
+        present=True,
+    )])
+    patch_parser({archive: [
+        _env("assistant", role=MessageRole.ASSISTANT, actor="Sage",
+             type_=MessageType.TEXT, text="The pitch draft is ready."),
+        _env("tool", role=MessageRole.TOOL, actor="tool",
+             type_=MessageType.TOOL_RESULT, text="Bash(cd /tmp && cat x)"),
+        _env("user", role=MessageRole.USER, actor="user",
+             type_=MessageType.TEXT, text="Ship it."),
+    ]})
+    monkeypatch.setattr(chat_messages_routes, "is_archive_stale", lambda *_a, **_kw: True)
+
+    body = client.get(
+        "/api/v1/chat/architect_myproj/messages?direction=asc",
+        headers=auth_headers,
+    ).json()
+
+    assert body["transcript_source"] == "jsonl"
+    assert [(m["role"], m["type"], m["text"]) for m in body["messages"]] == [
+        ("assistant", "text", "The pitch draft is ready."),
+        ("user", "text", "Ship it."),
+    ]
+    assert "Bash(" not in str(body["messages"])
+
+
+def test_pm_messages_idle_surface_returns_persona_greeting_not_tui_capture(
+    client, auth_headers, patch_registry, monkeypatch,
+):
+    patch_registry([_surface(
+        "architect_myproj", SurfaceType.ARCHITECT,
+        persona="Sage", project="myproj", transcript_path=None,
+        present=True,
+    )])
+
+    def _capture_should_not_run(*_args, **_kwargs):
+        raise AssertionError("PM auto history must not scrape tmux capture")
+
+    monkeypatch.setattr(chat_messages_routes, "capture_envelopes", _capture_should_not_run)
+    body = client.get(
+        "/api/v1/chat/architect_myproj/messages",
+        headers=auth_headers,
+    ).json()
+
+    assert body["transcript_source"] == "idle_greeting"
+    assert len(body["messages"]) == 1
+    message = body["messages"][0]
+    assert message["actor"] == "Sage"
+    assert message["role"] == "assistant"
+    assert "standing by on myproj" in message["text"]
+    assert "Try how do I log an error" not in message["text"]
+
+
 # ---------------------------------------------------------------------------
 # Pagination + filtering
 # ---------------------------------------------------------------------------

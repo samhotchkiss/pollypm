@@ -1717,6 +1717,74 @@ def test_answer_to_msg_envelope_id_resolves(
     assert response.status_code == 200, response.json()
 
 
+def test_answer_to_capture_id_exempts_current_open_ask_user_tool(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """M5/#2501 — capture ids are not the JSONL AskUserQuestion tool id.
+
+    The GET messages capture fallback synthesizes ``cap_<digest>`` ids
+    for a live TUI menu. The strict mid-tool gate must exempt the real
+    open AskUserQuestion ``tool_use_id`` in events.jsonl, not the
+    synthetic capture id, or every answer returns ``unsafe_mid_tool``.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(project_root, "session-capture-ask", [
+        {"event_type": "user_turn", "payload": {"text": "pick"}},
+        _ask_user_event(message_id="toolu_ask", options=["alpha", "bravo"]),
+    ], cwd=workspace_root)
+
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"answer_to": "cap_deadbeef", "selections": ["bravo"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.json()
+    assert patched_tmux.send_calls == [
+        ("pollypm-test-storage-closet:pm-operator", "2\t", True),
+    ]
+
+
+def test_answer_to_capture_id_still_blocks_unrelated_open_tool(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(project_root, "session-capture-mixed", [
+        {"event_type": "user_turn", "payload": {"text": "pick"}},
+        _ask_user_event(message_id="toolu_ask", options=["alpha"]),
+        {
+            "event_type": "tool_call",
+            "payload": {
+                "type": "tool_use",
+                "id": "toolu_bash_open",
+                "name": "Bash",
+                "input": {"command": "sleep 5"},
+            },
+        },
+    ], cwd=workspace_root)
+
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"answer_to": "cap_deadbeef", "selections": ["alpha"]},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 409, response.json()
+    assert response.json()["error"]["code"] == "unsafe_mid_tool"
+
+
 # ---------------------------------------------------------------------------
 # Codex #2043 review v4 — narrow tmux validation errors
 # ---------------------------------------------------------------------------
@@ -1979,6 +2047,24 @@ def test_build_answer_text_with_notes() -> None:
 
 def test_build_answer_text_notes_only() -> None:
     assert chat_send_routes._build_answer_text([], "just notes") == "just notes"
+
+
+def test_build_capture_answer_text_maps_labels_to_numbers_and_submit() -> None:
+    questions = [
+        {
+            "question": "Q1",
+            "options": [{"label": "alpha"}, {"label": "bravo"}],
+        },
+        {
+            "question": "Q2",
+            "options": [{"label": "plain"}, {"label": "bold"}],
+        },
+    ]
+
+    assert (
+        chat_send_routes._build_capture_answer_text(["bravo", "bold"], questions, None)
+        == "2\t2\t"
+    )
 
 
 def test_read_events_tail_handles_truncated_first_line(tmp_path: Path) -> None:

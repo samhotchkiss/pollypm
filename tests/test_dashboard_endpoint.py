@@ -369,7 +369,8 @@ def test_dashboard_loads_projects_and_gather_concurrently(
     project_started = threading.Event()
     gather_started = threading.Event()
 
-    def fake_list_projects(_config):
+    def fake_list_projects(_config, *, operator_facing: bool = False):
+        assert operator_facing is True
         project_started.set()
         assert gather_started.wait(1.0)
         return [_api_project("myproj")]
@@ -413,7 +414,8 @@ def test_dashboard_cache_hit_skips_repeated_expensive_loads(
 ) -> None:
     calls = {"list": 0, "gather": 0}
 
-    def fake_list_projects(_config):
+    def fake_list_projects(_config, *, operator_facing: bool = False):
+        assert operator_facing is True
         calls["list"] += 1
         return [_api_project("myproj")]
 
@@ -443,7 +445,8 @@ def test_dashboard_stale_cache_returns_while_refresh_runs(
     refresh_started = threading.Event()
     release_refresh = threading.Event()
 
-    def fake_list_projects(_config):
+    def fake_list_projects(_config, *, operator_facing: bool = False):
+        assert operator_facing is True
         return [_api_project("myproj")]
 
     def fake_gather(_config):

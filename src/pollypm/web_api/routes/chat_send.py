@@ -829,24 +829,7 @@ def _last_assistant_open_tool_ids(
     any *other* open tool still blocks the send (Codex #2043 review
     v4 block 1).
     """
-    # Find the most-recent boundary. ``turn_end`` / ``session_state``
-    # close stale orphaned tool calls left by a prior crashed turn.
-    # Everything after that belongs to the current in-flight response.
-    boundary = -1
-    for idx in range(len(events) - 1, -1, -1):
-        event_type = events[idx].get("event_type")
-        if event_type in (
-            "user_turn",
-            "assistant_turn",
-            "turn_end",
-            "session_state",
-        ):
-            boundary = idx
-            break
-    # When no boundary exists in the tail we still scan: that's the
-    # very-long-tool-output case where the assistant_turn fell out of
-    # the 64 KiB window. Treat the whole tail as the current response.
-    span = events[boundary + 1:] if boundary >= 0 else events
+    span = _current_assistant_response_span(events)
     open_ids: set[str] = set()
     seen_results: set[str] = set()
     for event in span:
@@ -864,6 +847,62 @@ def _last_assistant_open_tool_ids(
     if exempt_tool_ids:
         unmatched -= exempt_tool_ids
     return unmatched
+
+
+def _current_assistant_response_span(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the current in-flight assistant response span from a tail read."""
+
+    # Find the most-recent boundary. ``turn_end`` / ``session_state``
+    # close stale orphaned tool calls left by a prior crashed turn.
+    # Everything after that belongs to the current in-flight response.
+    boundary = -1
+    for idx in range(len(events) - 1, -1, -1):
+        event_type = events[idx].get("event_type")
+        if event_type in (
+            "user_turn",
+            "assistant_turn",
+            "turn_end",
+            "session_state",
+        ):
+            boundary = idx
+            break
+    # When no boundary exists in the tail we still scan: that's the
+    # very-long-tool-output case where the assistant_turn fell out of
+    # the 64 KiB window. Treat the whole tail as the current response.
+    return events[boundary + 1:] if boundary >= 0 else events
+
+
+def _open_ask_user_tool_call_events(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return unmatched AskUserQuestion tool calls in the current turn."""
+
+    span = _current_assistant_response_span(events)
+    seen_results: set[str] = set()
+    for event in span:
+        if event.get("event_type") != "tool_result":
+            continue
+        payload = event.get("payload") or {}
+        tid = payload.get("tool_use_id")
+        if isinstance(tid, str) and tid:
+            seen_results.add(tid)
+
+    open_events: list[dict[str, Any]] = []
+    for event in span:
+        tool_id = _ask_user_tool_id(event)
+        if tool_id is not None and tool_id not in seen_results:
+            open_events.append(event)
+    return open_events
+
+
+def _ask_user_tool_id(event: dict[str, Any]) -> str | None:
+    if event.get("event_type") != "tool_call":
+        return None
+    payload = event.get("payload") or {}
+    if not isinstance(payload, dict) or payload.get("name") != "AskUserQuestion":
+        return None
+    tool_id = payload.get("id")
+    return tool_id if isinstance(tool_id, str) and tool_id else None
 
 
 def _is_mid_tool(
@@ -1076,7 +1115,15 @@ def _find_ask_user_envelope(
             continue
         if event_id in candidates:
             return event
+    if _is_capture_answer_id(answer_to):
+        open_asks = _open_ask_user_tool_call_events(events)
+        if len(open_asks) == 1:
+            return open_asks[0]
     return None
+
+
+def _is_capture_answer_id(answer_to: str | None) -> bool:
+    return isinstance(answer_to, str) and answer_to.startswith("cap_")
 
 
 def _event_message_id(event: dict[str, Any]) -> str | None:
@@ -1109,11 +1156,20 @@ def _ask_user_options(event: dict[str, Any]) -> list[str] | None:
     Accepts the raw events.jsonl shape too (tool_call payload for
     AskUserQuestion) so the router works pre-normalisation.
     """
+    questions = _ask_user_questions(event)
+    if questions is not None:
+        return _flatten_question_options(questions)
+    return None
+
+
+def _ask_user_questions(event: dict[str, Any]) -> list[Any] | None:
+    """Return AskUserQuestion question metadata from JSONL or capture shapes."""
+
     metadata = event.get("metadata")
     if isinstance(metadata, dict):
         questions = metadata.get("questions")
         if isinstance(questions, list):
-            return _flatten_question_options(questions)
+            return questions
     payload = event.get("payload") or {}
     if isinstance(payload, dict):
         if payload.get("name") == "AskUserQuestion":
@@ -1121,11 +1177,11 @@ def _ask_user_options(event: dict[str, Any]) -> list[str] | None:
             if isinstance(tool_input, dict):
                 questions = tool_input.get("questions")
                 if isinstance(questions, list):
-                    return _flatten_question_options(questions)
+                    return questions
         if payload.get("type") == "ask_user":
             questions = payload.get("questions")
             if isinstance(questions, list):
-                return _flatten_question_options(questions)
+                return questions
     return None
 
 
@@ -1168,6 +1224,56 @@ def _build_answer_text(selections: list[str], notes: str | None) -> str:
         else:
             body = notes
     return body
+
+
+def _build_capture_answer_text(
+    selections: list[str],
+    questions: list[Any],
+    notes: str | None,
+) -> str:
+    """Translate capture-sourced AskUserQuestion labels into TUI keystrokes.
+
+    A captured menu has a ``cap_<digest>`` envelope id, while the real
+    transcript still has the open AskUserQuestion tool_use id. For that
+    TUI path Claude expects option numbers, not option-label prose. The
+    final tab moves focus to the Submit tab; the endpoint's existing
+    ``press_enter`` then activates Submit.
+    """
+
+    if notes or not selections:
+        return _build_answer_text(selections, notes)
+
+    remaining = list(selections)
+    groups: list[str] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        raw_options = question.get("options")
+        if not isinstance(raw_options, list):
+            continue
+        labels: list[str] = []
+        for option in raw_options:
+            if isinstance(option, dict):
+                label = option.get("label")
+            else:
+                label = option
+            if isinstance(label, str) and label:
+                labels.append(label)
+        if not labels:
+            continue
+
+        digits: list[str] = []
+        for selected in list(remaining):
+            if selected not in labels:
+                continue
+            digits.append(str(labels.index(selected) + 1))
+            remaining.remove(selected)
+        if digits:
+            groups.append("".join(digits))
+
+    if remaining or not groups:
+        return _build_answer_text(selections, notes)
+    return "\t".join(groups) + "\t"
 
 
 # ---------------------------------------------------------------------------
@@ -1549,7 +1655,14 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
         if body.selections and invalid:
             raise _selections_invalid(invalid, options)
         if body.selections:
-            text_to_send = _build_answer_text(body.selections, body.notes)
+            if _is_capture_answer_id(body.answer_to):
+                text_to_send = _build_capture_answer_text(
+                    body.selections,
+                    _ask_user_questions(ask_envelope) or [],
+                    body.notes,
+                )
+            else:
+                text_to_send = _build_answer_text(body.selections, body.notes)
         elif body.text:
             text_to_send = body.text
         elif body.notes:

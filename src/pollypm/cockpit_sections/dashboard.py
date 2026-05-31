@@ -24,6 +24,7 @@ from pollypm.cockpit_sections.project_dashboard import (
     _DASHBOARD_PROJECT_CACHE,
     _dashboard_project_tasks,
 )
+from pollypm.project_liveness import real_operator_project_items
 
 
 @dataclass(slots=True)
@@ -645,8 +646,12 @@ def _collect_dashboard_buckets(config, now: datetime) -> _DashboardCollection:
     all_tasks: list[tuple[str, object]] = []
     project_scorecards: list[tuple[int, str, str]] = []
     total_counts: dict[str, int] = {}
+    project_items = real_operator_project_items(
+        getattr(config, "projects", {}) or {},
+        default_tracked=False,
+    )
     live_keys: set[str] = set()
-    for project_key, project in config.projects.items():
+    for project_key, project in project_items:
         live_keys.add(project_key)
         partitioned, counts = _dashboard_project_tasks(project_key, project.path)
         project_tasks = [task for bucket in partitioned.values() for task in bucket]
@@ -956,7 +961,12 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
             lines.append(f"  ▲ {alert.session_name}: {alert.message[:55]}")
         lines.append("")
 
-    project_count = len(config.projects)
+    project_count = len(
+        real_operator_project_items(
+            getattr(config, "projects", {}) or {},
+            default_tracked=False,
+        )
+    )
     project_word = "project" if project_count == 1 else "projects"
     lines.append(
         f"  {project_count} {project_word}  ·  j/k navigate  ·  S settings"

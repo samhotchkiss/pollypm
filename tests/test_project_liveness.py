@@ -7,6 +7,7 @@ from pollypm.project_liveness import (
     is_real_operator_project,
     project_key_looks_synthetic,
     project_path_looks_synthetic,
+    real_operator_project_items,
     real_operator_project_keys,
 )
 
@@ -14,8 +15,11 @@ from pollypm.project_liveness import (
 def test_project_key_looks_synthetic_for_known_test_patterns() -> None:
     assert project_key_looks_synthetic("pm_test_01wave_1779715196")
     assert project_key_looks_synthetic("pm test 01wave 1779715196")
+    assert project_key_looks_synthetic("load-wave-1779715196")
+    assert project_key_looks_synthetic("pr2498-drift-17797201")
     assert project_key_looks_synthetic("queuestorm_1779777233")
     assert project_key_looks_synthetic("myproj")
+    assert project_key_looks_synthetic("smoketest")
     assert project_key_looks_synthetic("inbox")
 
 
@@ -33,13 +37,18 @@ def test_is_real_operator_project_requires_tracked_non_synthetic_project() -> No
         "savethenovel",
         SimpleNamespace(tracked=False, path="/Users/sam/dev/savethenovel"),
     )
+    assert is_real_operator_project(
+        "savethenovel",
+        SimpleNamespace(tracked=False, path="/Users/sam/dev/savethenovel"),
+        default_tracked=False,
+    )
     assert not is_real_operator_project(
         "pm_test_01wave_1779715196",
         SimpleNamespace(tracked=True, path="/Users/sam/dev/pm_test_01wave_1779715196"),
     )
     assert not is_real_operator_project(
         "scratch",
-        SimpleNamespace(tracked=True, path="/private/tmp/scratch"),
+        SimpleNamespace(tracked=True, path="/private/tmp/pm_test_01wave_1779715196"),
     )
 
 
@@ -60,3 +69,19 @@ def test_real_operator_project_keys_filters_config_map() -> None:
     }
 
     assert real_operator_project_keys(projects) == frozenset({"savethenovel"})
+
+
+def test_real_operator_project_items_falls_back_when_only_synthetic() -> None:
+    projects = {
+        "myproj": SimpleNamespace(tracked=True, path="/Users/sam/dev/myproj"),
+        "pm_test_01wave_1779715196": SimpleNamespace(
+            tracked=True,
+            path="/Users/sam/dev/pm_test_01wave_1779715196",
+        ),
+    }
+
+    assert [key for key, _project in real_operator_project_items(projects)] == [
+        "myproj",
+        "pm_test_01wave_1779715196",
+    ]
+    assert real_operator_project_items(projects, fallback_to_all=False) == ()

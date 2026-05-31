@@ -1308,6 +1308,33 @@ def test_scan_project_against_empty_log_returns_no_findings(now: datetime) -> No
     assert findings == []
 
 
+def test_scan_project_filters_and_caps_audit_read(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cadence path should not materialize unrelated audit rows."""
+    import pollypm.audit.log as log_mod
+
+    calls: list[dict[str, object]] = []
+
+    def fake_read_events(*args: object, **kwargs: object) -> list[AuditEvent]:
+        calls.append(dict(kwargs))
+        return []
+
+    monkeypatch.setattr(log_mod, "read_events", fake_read_events)
+
+    config = WatchdogConfig(scan_event_limit=7)
+    assert scan_project("demo", now=now, config=config) == []
+
+    assert calls
+    first = calls[0]
+    assert first["limit"] == 7
+    event_names = first["event_names"]
+    assert isinstance(event_names, frozenset)
+    assert EVENT_TASK_CREATED in event_names
+    assert EVENT_TASK_STATUS_CHANGED in event_names
+    assert EVENT_HEARTBEAT_TICK not in event_names
+
+
 def test_scan_project_against_synthetic_log(now: datetime, tmp_path: Path) -> None:
     """Write events through ``emit`` then read via ``scan_project``.
 

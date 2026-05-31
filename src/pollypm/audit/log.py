@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1054,9 +1055,13 @@ def _audit_obj_matches(
     project: str,
     since: str | None,
     event: str | None,
+    event_names: frozenset[str] | None = None,
 ) -> bool:
     """Apply the read_events filters to a decoded audit object."""
-    if event is not None and obj.get("event") != event:
+    obj_event = obj.get("event")
+    if event is not None and obj_event != event:
+        return False
+    if event_names is not None and obj_event not in event_names:
         return False
     if since is not None:
         ts = str(obj.get("ts", ""))
@@ -1147,21 +1152,46 @@ def _read_events_limited_tail(
     *,
     limit: int,
     event: str | None,
+    event_names: frozenset[str] | None,
 ) -> list[AuditEvent]:
     """Read the newest ``limit`` matching rows without scanning history."""
     if limit <= 0:
         return []
     events: list[AuditEvent] = []
     for path in _walk_log_chain(live):
-        for obj in _iter_log_lines_reverse(path):
-            if not _audit_obj_matches(
-                obj, project=project, since=None, event=event
-            ):
-                continue
-            events.append(AuditEvent.from_dict(obj))
-            if len(events) >= limit:
-                events.sort(key=lambda e: e.ts)
-                return events
+        remaining = limit - len(events)
+        if remaining <= 0:
+            break
+        if path.suffix == ".gz":
+            archive_matches: deque[AuditEvent] = deque(maxlen=remaining)
+            for obj in _iter_log_lines(path):
+                if not _audit_obj_matches(
+                    obj,
+                    project=project,
+                    since=None,
+                    event=event,
+                    event_names=event_names,
+                ):
+                    continue
+                archive_matches.append(AuditEvent.from_dict(obj))
+            events.extend(archive_matches)
+        else:
+            for obj in _iter_log_lines_reverse(path):
+                if not _audit_obj_matches(
+                    obj,
+                    project=project,
+                    since=None,
+                    event=event,
+                    event_names=event_names,
+                ):
+                    continue
+                events.append(AuditEvent.from_dict(obj))
+                if len(events) >= limit:
+                    events.sort(key=lambda e: e.ts)
+                    return events
+        if len(events) >= limit:
+            events.sort(key=lambda e: e.ts)
+            return events
     events.sort(key=lambda e: e.ts)
     return events
 
@@ -1190,6 +1220,7 @@ def _read_events_since_tail(
     since: str,
     limit: int | None,
     event: str | None,
+    event_names: frozenset[str] | None,
 ) -> list[AuditEvent]:
     """Read rows newer than ``since`` without scanning full audit history.
 
@@ -1206,18 +1237,35 @@ def _read_events_since_tail(
 
     events: list[AuditEvent] = []
     for path in _walk_log_chain(live):
+        remaining = (
+            None
+            if limit is None or limit < 0
+            else max(0, limit - len(events))
+        )
+        if remaining == 0:
+            break
         stop_chain = False
         if path.suffix == ".gz":
             saw_cutoff = False
+            archive_matches: list[AuditEvent] | deque[AuditEvent]
+            if remaining is None:
+                archive_matches = []
+            else:
+                archive_matches = deque(maxlen=remaining)
             for obj in _iter_log_lines(path):
                 if _audit_obj_at_or_before_since(obj, since):
                     saw_cutoff = True
                     continue
                 if not _audit_obj_matches(
-                    obj, project=project, since=since, event=event,
+                    obj,
+                    project=project,
+                    since=since,
+                    event=event,
+                    event_names=event_names,
                 ):
                     continue
-                events.append(AuditEvent.from_dict(obj))
+                archive_matches.append(AuditEvent.from_dict(obj))
+            events.extend(archive_matches)
             if saw_cutoff:
                 stop_chain = True
         else:
@@ -1226,7 +1274,11 @@ def _read_events_since_tail(
                     stop_chain = True
                     break
                 if not _audit_obj_matches(
-                    obj, project=project, since=since, event=event,
+                    obj,
+                    project=project,
+                    since=since,
+                    event=event,
+                    event_names=event_names,
                 ):
                     continue
                 events.append(AuditEvent.from_dict(obj))
@@ -1247,6 +1299,7 @@ def read_events(
     since: str | None = None,
     limit: int | None = None,
     event: str | None = None,
+    event_names: Iterable[str] | None = None,
     project_path: Path | str | None = None,
 ) -> list[AuditEvent]:
     """Read recent audit events for ``project``.
@@ -1272,6 +1325,8 @@ def read_events(
     Filters apply in order:
 
     * ``event``: only events matching this exact name.
+    * ``event_names``: only events whose name appears in this set. Mutually
+      exclusive with ``event``.
     * ``since``: only events with ``ts > since``. Compare as
       strings — ISO-8601 UTC sorts lexicographically.
     * ``limit``: keep at most the last N matching events
@@ -1284,6 +1339,12 @@ def read_events(
     fallback so recurring watchdog sweeps stay proportional to their
     lookback window rather than total audit history.
     """
+    if event is not None and event_names is not None:
+        raise ValueError("read_events accepts only one of event or event_names")
+    event_name_set: frozenset[str] | None = None
+    if event_names is not None:
+        event_name_set = frozenset(str(name) for name in event_names if name)
+
     per_project = project_log_path(project_path)
     if per_project is not None and per_project.exists():
         live = per_project
@@ -1292,12 +1353,21 @@ def read_events(
 
     if since is not None:
         return _read_events_since_tail(
-            live, project, since=since, limit=limit, event=event,
+            live,
+            project,
+            since=since,
+            limit=limit,
+            event=event,
+            event_names=event_name_set,
         )
 
     if limit is not None and limit >= 0 and since is None:
         return _read_events_limited_tail(
-            live, project, limit=limit, event=event
+            live,
+            project,
+            limit=limit,
+            event=event,
+            event_names=event_name_set,
         )
 
     # ``_walk_log_chain`` yields live first then archives newest-first.
@@ -1312,7 +1382,11 @@ def read_events(
         bucket: list[AuditEvent] = []
         for obj in _iter_log_lines(path):
             if not _audit_obj_matches(
-                obj, project=project, since=since, event=event
+                obj,
+                project=project,
+                since=since,
+                event=event,
+                event_names=event_name_set,
             ):
                 continue
             bucket.append(AuditEvent.from_dict(obj))

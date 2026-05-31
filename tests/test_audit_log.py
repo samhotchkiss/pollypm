@@ -861,6 +861,71 @@ def test_read_events_since_uses_live_tail_without_full_scan(
     )
 
 
+def test_read_events_since_accepts_event_name_set(tmp_path: Path) -> None:
+    """Watchdog scans can exclude audit rows their detectors never read."""
+    project_root = tmp_path / "eventset"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    rows = [
+        {
+            "schema": SCHEMA_VERSION,
+            "ts": "2026-05-31T10:00:00+00:00",
+            "project": "eventset",
+            "event": "heartbeat.tick",
+            "subject": "audit_watchdog",
+            "actor": "test",
+            "status": "ok",
+            "metadata": {"padding": "x" * 1024},
+        },
+        {
+            "schema": SCHEMA_VERSION,
+            "ts": "2026-05-31T10:00:01+00:00",
+            "project": "eventset",
+            "event": EVENT_TASK_CREATED,
+            "subject": "eventset/1",
+            "actor": "test",
+            "status": "ok",
+            "metadata": {},
+        },
+        {
+            "schema": SCHEMA_VERSION,
+            "ts": "2026-05-31T10:00:02+00:00",
+            "project": "eventset",
+            "event": "worker.heartbeat",
+            "subject": "eventset/1",
+            "actor": "test",
+            "status": "ok",
+            "metadata": {},
+        },
+    ]
+    audit_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    events = read_events(
+        "eventset",
+        project_path=project_root,
+        since="2026-05-31T09:59:59+00:00",
+        event_names={EVENT_TASK_CREATED, "worker.heartbeat"},
+    )
+
+    assert [event.event for event in events] == [
+        EVENT_TASK_CREATED,
+        "worker.heartbeat",
+    ]
+
+
+def test_read_events_rejects_event_and_event_name_set() -> None:
+    with pytest.raises(ValueError, match="only one of event or event_names"):
+        read_events(
+            "demo",
+            event=EVENT_TASK_CREATED,
+            event_names={EVENT_TASK_STATUS_CHANGED},
+        )
+
+
 def test_read_events_chains_live_and_gz_in_chronological_order(
     tmp_path: Path,
 ) -> None:
@@ -942,6 +1007,48 @@ def test_read_events_walks_gz_archives_for_central_tail(
         since="2026-05-01T00:00:00+00:00",
     )
     assert [e.subject for e in events] == ["centralgz/finding-Z"]
+
+
+def test_read_events_since_limit_keeps_newest_gz_rows(
+    tmp_path: Path,
+) -> None:
+    """Limited archive fallback must not require retaining every match."""
+    import gzip as _gz
+
+    project_root = tmp_path / "gzlimit"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+    gz_archive = audit_path.with_suffix(audit_path.suffix + ".1700000002.gz")
+
+    with _gz.open(gz_archive, "wt", encoding="utf-8") as fh:
+        for i in range(20):
+            fh.write(json.dumps({
+                "schema": SCHEMA_VERSION,
+                "ts": f"2026-05-31T10:00:{i:02d}+00:00",
+                "project": "gzlimit",
+                "event": EVENT_TASK_STATUS_CHANGED,
+                "subject": f"gzlimit/{i}",
+                "actor": "test",
+                "status": "ok",
+                "metadata": {"to": "queued"},
+            }) + "\n")
+    audit_path.touch()
+
+    events = read_events(
+        "gzlimit",
+        project_path=project_root,
+        since="2026-05-31T09:59:59+00:00",
+        event_names={EVENT_TASK_STATUS_CHANGED},
+        limit=5,
+    )
+
+    assert [event.subject for event in events] == [
+        "gzlimit/15",
+        "gzlimit/16",
+        "gzlimit/17",
+        "gzlimit/18",
+        "gzlimit/19",
+    ]
 
 
 # ---------------------------------------------------------------------------

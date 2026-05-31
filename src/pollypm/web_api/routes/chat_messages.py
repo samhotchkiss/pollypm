@@ -77,6 +77,7 @@ MAX_MESSAGE_LIMIT = 500
 # file. The forward parser stays authoritative for ``asc``, cursor
 # paging, and the strict ``source=jsonl`` validation path.
 TAIL_READ_LIMIT_THRESHOLD = 200
+LIVE_ASK_USER_CAPTURE_LINES = 240
 
 
 SourceMode = Literal["auto", "jsonl", "capture"]
@@ -579,6 +580,7 @@ def _load_envelopes(
     source: SourceMode,
     tail_hint: int | None = None,
     include_thinking: bool = False,
+    probe_live_ask_user: bool = False,
 ) -> tuple[list[MessageEnvelope], str | None, Path | None]:
     """Return ``(envelopes, transcript_source, transcript_path)``.
 
@@ -603,6 +605,11 @@ def _load_envelopes(
     are dropped at parse time. The parser caches separately for each
     flag value, so a default-False request never sees a thinking-True
     cache hit and vice versa.
+
+    ``probe_live_ask_user`` lets the default latest-page UI poll detect
+    Claude Code's active AskUserQuestion TUI form before the tool_use is
+    flushed to JSONL. The probe is a small live capture and only wins
+    when it parses a structured open ask_user envelope.
     """
     archive = surface.transcript_path
     actor_fallback = surface.persona or "agent"
@@ -661,6 +668,15 @@ def _load_envelopes(
                 include_thinking=include_thinking,
             )
         if envelopes:
+            if _latest_envelope_is_open_ask_user(envelopes):
+                return envelopes, "jsonl", archive
+            captured_ask = _live_capture_open_ask_user(
+                surface,
+                actor_fallback=actor_fallback,
+                enabled=probe_live_ask_user,
+            )
+            if captured_ask:
+                return captured_ask, "capture", None
             return envelopes, "jsonl", archive
         # Empty result on a fresh (non-stale) archive could be a
         # legitimately empty transcript OR an unreadable archive whose
@@ -686,6 +702,13 @@ def _load_envelopes(
                 exc_info=True,
             )
         else:
+            captured_ask = _live_capture_open_ask_user(
+                surface,
+                actor_fallback=actor_fallback,
+                enabled=probe_live_ask_user,
+            )
+            if captured_ask:
+                return captured_ask, "capture", None
             return strict_envelopes, "jsonl", archive
 
     # Stale or missing archive (or unreadable archive in the auto
@@ -747,6 +770,24 @@ def _latest_envelope_is_open_ask_user(envelopes: list[MessageEnvelope]) -> bool:
     return False
 
 
+def _live_capture_open_ask_user(
+    surface: ChatSurface,
+    *,
+    actor_fallback: str,
+    enabled: bool,
+) -> list[MessageEnvelope]:
+    if not enabled:
+        return []
+    captured = _capture_for_surface(
+        surface,
+        actor_fallback=actor_fallback,
+        lines=LIVE_ASK_USER_CAPTURE_LINES,
+    )
+    if _latest_envelope_is_open_ask_user(captured):
+        return captured
+    return []
+
+
 def _is_pm_chat_surface(surface: ChatSurface) -> bool:
     return surface.surface_type in _PM_CHAT_SURFACE_TYPES
 
@@ -792,6 +833,7 @@ def _capture_for_surface(
     *,
     actor_fallback: str,
     strict: bool = False,
+    lines: int = 3000,
 ) -> list[MessageEnvelope]:
     """Capture the surface's tmux pane into envelopes.
 
@@ -824,6 +866,7 @@ def _capture_for_surface(
             session_name=surface.session_name,
             target=target,
             actor_fallback=actor_fallback,
+            lines=lines,
             strict=strict,
         )
     except APIError:
@@ -1215,8 +1258,9 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
     source: Annotated[SourceMode, Query(
         description=(
             "Transcript source: 'auto' (jsonl with capture fallback when "
-            f">{int(STALE_THRESHOLD_SECONDS)}s stale), 'jsonl' (force "
-            "JSONL, 404 if absent), 'capture' (force tmux capture)."
+            f">{int(STALE_THRESHOLD_SECONDS)}s stale or when the latest "
+            "page has a live AskUserQuestion menu), 'jsonl' (force JSONL, "
+            "404 if absent), 'capture' (force tmux capture)."
         ),
     )] = "auto",
     include_subagents: Annotated[bool, Query(
@@ -1275,6 +1319,13 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         source=source,
         tail_hint=tail_hint,
         include_thinking=include_thinking,
+        probe_live_ask_user=(
+            source == "auto"
+            and direction == "desc"
+            and since_id is None
+            and not include_subagents
+            and not include_thinking
+        ),
     )
     if (
         _is_pm_chat_surface(surface)

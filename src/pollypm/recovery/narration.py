@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from typing import Any, Mapping
 
 
@@ -64,7 +65,14 @@ _FINDING_PHRASES: dict[str, str] = {
     "stuck_draft": "a stuck draft",
     "task_on_hold_stale": "stale on-hold work",
     "task_review_stale": "stale review work",
+    "task_rework_stale": "stale rework",
     "worker_session_dead_loop": "a worker session restart loop",
+}
+
+_BRIEF_GROUP_FINDING_PHRASES: dict[str, str] = {
+    "task_on_hold_stale": "stale on-hold work",
+    "task_review_stale": "stale review",
+    "task_rework_stale": "stale rework",
 }
 
 
@@ -169,6 +177,32 @@ def narrate_recovery_event(
     return _sentence(f"I handled a recovery event in {project_label}")
 
 
+def narrate_watchdog_escalation_group(
+    finding_types: Iterable[str],
+    *,
+    subject: str | None,
+    project: str | None,
+) -> str:
+    """Render grouped same-subject watchdog dispatches for the morning brief."""
+
+    findings = _unique_text(finding_types)
+    if len(findings) <= 1:
+        metadata = {"finding_type": findings[0]} if findings else {}
+        return narrate_recovery_event(
+            "watchdog.escalation_dispatched",
+            metadata,
+            subject=subject,
+            project=project,
+            status="ok",
+        ) or ""
+
+    problem = _combined_brief_finding_label(findings)
+    target = _subject_label(subject, project=project) or f"work in {_project_label(project)}"
+    return _sentence(
+        f"I sent unstick briefs for {problem} on {target} so the project could keep moving"
+    )
+
+
 def summarize_audit_event(
     *,
     event_name: str | None,
@@ -242,6 +276,52 @@ def _finding_label(value: str) -> str:
     if not value:
         return "the issue"
     return _humanize_token(value)
+
+
+def _brief_group_finding_label(value: str) -> str:
+    text = re.sub(r"\s+", " ", (value or "").strip())
+    if not text:
+        return "the issue"
+    if text in _BRIEF_GROUP_FINDING_PHRASES:
+        return _BRIEF_GROUP_FINDING_PHRASES[text]
+    return _finding_label(text)
+
+
+def _unique_text(values: Iterable[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = re.sub(r"\s+", " ", (value or "").strip())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
+
+
+def _combined_brief_finding_label(values: Iterable[str]) -> str:
+    labels = _unique_text(_brief_group_finding_label(value) for value in values)
+    if not labels:
+        return "the issue"
+    if len(labels) == 1:
+        return labels[0]
+    if all(label.startswith("stale ") for label in labels):
+        stale_bits = [
+            label.removeprefix("stale ").removesuffix(" work")
+            for label in labels
+        ]
+        return "stale " + _join_words(stale_bits)
+    return _join_words(labels)
+
+
+def _join_words(values: list[str]) -> str:
+    if not values:
+        return ""
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return f"{values[0]} and {values[1]}"
+    return ", ".join(values[:-1]) + f", and {values[-1]}"
 
 
 def _project_label(value: str | None) -> str:
@@ -320,5 +400,6 @@ __all__ = [
     "RECOVERY_EVENT_NAMES",
     "is_recovery_event",
     "narrate_recovery_event",
+    "narrate_watchdog_escalation_group",
     "summarize_audit_event",
 ]

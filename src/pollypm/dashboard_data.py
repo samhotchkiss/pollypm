@@ -1307,7 +1307,10 @@ def _recovery_audit_narrations_from_events(
     recent_real_work_projects: frozenset[str] | None,
 ) -> list[str]:
     try:
-        from pollypm.recovery.narration import narrate_recovery_event
+        from pollypm.recovery.narration import (
+            narrate_recovery_event,
+            narrate_watchdog_escalation_group,
+        )
     except Exception:  # noqa: BLE001
         return []
 
@@ -1319,18 +1322,60 @@ def _recovery_audit_narrations_from_events(
         )
     ]
     narrations: list[str] = []
-    for event in live_events[:limit]:
+    for group in _group_recovery_brief_events(live_events)[:limit]:
+        event = group[0]
         metadata = event.metadata or {}
-        sentence = narrate_recovery_event(
-            event.event,
-            metadata,
-            subject=event.subject,
-            project=event.project,
-            status=event.status,
-        )
+        if event.event == "watchdog.escalation_dispatched" and len(group) > 1:
+            sentence = narrate_watchdog_escalation_group(
+                (
+                    str((group_event.metadata or {}).get("finding_type") or "")
+                    for group_event in group
+                ),
+                subject=str(metadata.get("subject") or event.subject or ""),
+                project=str(event.project or ""),
+            )
+        else:
+            sentence = narrate_recovery_event(
+                event.event,
+                metadata,
+                subject=event.subject,
+                project=event.project,
+                status=event.status,
+            )
         if sentence:
             narrations.append(sentence)
     return narrations
+
+
+def _group_recovery_brief_events(events: list[object]) -> list[list[object]]:
+    grouped: list[list[object]] = []
+    group_indexes: dict[tuple[str, str, str], int] = {}
+    for event in events:
+        key = _recovery_brief_group_key(event)
+        index = group_indexes.get(key)
+        if index is None:
+            group_indexes[key] = len(grouped)
+            grouped.append([event])
+        else:
+            grouped[index].append(event)
+    return grouped
+
+
+def _recovery_brief_group_key(event: object) -> tuple[str, str, str]:
+    metadata = getattr(event, "metadata", None) or {}
+    event_name = str(getattr(event, "event", "") or "")
+    project = str(getattr(event, "project", "") or "")
+    if event_name == "watchdog.escalation_dispatched":
+        subject = str(metadata.get("subject") or getattr(event, "subject", "") or "")
+        return (event_name, project, subject)
+    subject = str(
+        metadata.get("target_session")
+        or metadata.get("session")
+        or getattr(event, "subject", "")
+        or ""
+    )
+    problem = str(metadata.get("finding_type") or metadata.get("reason") or "")
+    return (event_name, subject, problem)
 
 
 def _recent_recovery_audit_narrations(

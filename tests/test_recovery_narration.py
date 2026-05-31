@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pollypm.recovery.narration import (
     narrate_recovery_event,
+    narrate_watchdog_escalation_group,
     summarize_audit_event,
 )
 
@@ -47,6 +48,21 @@ def test_watchdog_dispatch_narration_uses_finding_metadata() -> None:
     )
     assert "samblog/32" not in sentence
     assert "dedup_hash" not in sentence
+
+
+def test_watchdog_dispatch_group_merges_same_task_recovery_reasons() -> None:
+    sentence = narrate_watchdog_escalation_group(
+        ["task_review_stale", "task_rework_stale"],
+        subject="itsalive/55",
+        project="itsalive",
+    )
+
+    assert sentence == (
+        "I sent unstick briefs for stale review and rework on task 55 in itsalive "
+        "so the project could keep moving."
+    )
+    assert "task_review_stale" not in sentence
+    assert "task_rework_stale" not in sentence
 
 
 def test_non_recovery_audit_summary_keeps_generic_shape() -> None:

@@ -893,10 +893,123 @@ def iter_matching_events(
             session.close()
 
 
+def iter_recent_matching_events(
+    *,
+    targets: Iterable[Path],
+    since: datetime,
+    pattern: re.Pattern[str] | None = None,
+    literal: str | None = None,
+    event_type: str | None,
+    stats: MutableMapping[str, int] | None = None,
+    bounded_regex: bool = False,
+    deadline_s: float | None = None,
+    per_target_limit: int | None = None,
+) -> Iterator[dict]:
+    """Stream recent parsed events newest-first for each audit target.
+
+    This is the feed-oriented sibling of :func:`iter_matching_events`.
+    It assumes audit files are append-only chronological logs, reads
+    live logs from the tail, and stops each target's chain as soon as a
+    valid row predates ``since``. That keeps recent dashboard surfaces
+    from walking all-time history before they can show current activity.
+    """
+    use_bounded_regex = (
+        bounded_regex and pattern is not None and pattern.pattern and not literal
+    )
+    session: _BoundedRegexSession | None = (
+        _BoundedRegexSession(pattern) if use_bounded_regex else None  # type: ignore[arg-type]
+    )
+    deadline_at: float | None = (
+        time.monotonic() + deadline_s
+        if deadline_s is not None and deadline_s > 0
+        else None
+    )
+    try:
+        for path in targets:
+            emitted_for_target = 0
+            stop_target = False
+            for chain_path in walk_log_chain(path):
+                if _archive_predates_since(chain_path, since):
+                    continue
+                line_stats: MutableMapping[str, int] = (
+                    stats if stats is not None else {}
+                )
+                for stripped in _iter_log_lines_newest_first(
+                    chain_path, stats=line_stats
+                ):
+                    if not stripped:
+                        continue
+                    remaining_budget: float | None = None
+                    if deadline_at is not None:
+                        remaining_budget = deadline_at - time.monotonic()
+                        if remaining_budget <= 0:
+                            if stats is not None:
+                                stats["truncated_by_deadline"] = 1
+                            return
+                    if stats is not None:
+                        stats["lines_scanned"] = (
+                            stats.get("lines_scanned", 0) + 1
+                        )
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    ts_raw = record.get("ts")
+                    parsed_ts = (
+                        parse_event_ts(ts_raw) if isinstance(ts_raw, str) else None
+                    )
+                    if parsed_ts is None:
+                        if stats is not None:
+                            stats["malformed_rows_skipped"] = (
+                                stats.get("malformed_rows_skipped", 0) + 1
+                            )
+                        continue
+                    if parsed_ts < since:
+                        stop_target = True
+                        break
+                    if event_type is not None and record.get("event") != event_type:
+                        continue
+                    if literal:
+                        if literal not in stripped:
+                            continue
+                    elif session is not None:
+                        matched, timed_out = session.search(
+                            stripped, max_wall_clock_s=remaining_budget
+                        )
+                        if timed_out:
+                            if stats is not None:
+                                stats["pattern_timeouts"] = (
+                                    stats.get("pattern_timeouts", 0) + 1
+                                )
+                            continue
+                        if not matched:
+                            continue
+                    elif pattern is not None and pattern.pattern:
+                        if not pattern.search(stripped):
+                            continue
+                    yield record
+                    emitted_for_target += 1
+                    if (
+                        per_target_limit is not None
+                        and per_target_limit > 0
+                        and emitted_for_target >= per_target_limit
+                    ):
+                        stop_target = True
+                        break
+                if stop_target:
+                    break
+    finally:
+        if session is not None:
+            session.close()
+
+
 __all__ = [
     "AuditStatsAggregate",
     "aggregate_recent_stats",
     "iter_matching_events",
+    "iter_recent_matching_events",
     "open_log_lines",
     "parse_event_ts",
     "parse_since",

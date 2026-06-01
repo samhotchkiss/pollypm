@@ -123,6 +123,15 @@ class _BulkSnoozeService:
         }
 
 
+class _DependencyService(_BulkSnoozeService):
+    def __init__(self, tasks: list[Task]) -> None:
+        super().__init__(tasks)
+        self.by_id = {task.task_id: task for task in tasks}
+
+    def get(self, task_id: str) -> Task:
+        return self.by_id[task_id]
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -210,3 +219,54 @@ def test_inbox_tasks_without_bulk_helper_returns_all_rows() -> None:
 
     result = inbox_tasks(_LegacyService(), project="demo")
     assert [t.task_id for t in result] == ["demo/1"]
+
+
+def test_inbox_tasks_surfaces_blocked_task_when_cancelled_blocker_was_user_handoff() -> None:
+    """Cancelled operator handoffs must not erase the downstream ask.
+
+    The cancelled blocker itself stays terminal/closed, but the dependent
+    blocked task remains visible in the shared inbox view so cockpit, rail,
+    dashboard counts, and API write guards agree that the user still has an
+    action to resolve.
+    """
+    blocker = _task(
+        26,
+        title="Needs your inputs",
+        current_node_id=None,
+    )
+    blocker.roles = {"requester": "user", "operator": "user"}
+    blocker.work_status = WorkStatus.CANCELLED
+    target = _task(
+        30,
+        title="Ship after inputs",
+        current_node_id=None,
+    )
+    target.roles = {}
+    target.work_status = WorkStatus.BLOCKED
+    target.blocked_by = [("demo", 26)]
+
+    result = inbox_tasks(_DependencyService([blocker, target]), project="demo")
+
+    assert [task.task_id for task in result] == ["demo/30"]
+
+
+def test_inbox_tasks_does_not_surface_blocked_task_for_ordinary_cancelled_blocker() -> None:
+    blocker = _task(
+        1,
+        title="Ordinary cancelled task",
+        current_node_id=None,
+    )
+    blocker.roles = {}
+    blocker.work_status = WorkStatus.CANCELLED
+    target = _task(
+        2,
+        title="Still blocked internally",
+        current_node_id=None,
+    )
+    target.roles = {}
+    target.work_status = WorkStatus.BLOCKED
+    target.blocked_by = [("demo", 1)]
+
+    result = inbox_tasks(_DependencyService([blocker, target]), project="demo")
+
+    assert result == []

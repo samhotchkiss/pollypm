@@ -790,7 +790,7 @@ Flow templates are **immutable once a task is using them**. If the flow needs to
 - **Blocker reaches `done`**: Dependency is satisfied. Blocked task automatically unblocks (returns to `queued`).
 - **Blocker is `cancelled`**: Dependency is NOT automatically satisfied. The work service flags this to the PM/operator, who must decide: should the blocked tasks also be cancelled, or can they be unblocked now? The blocked task stays `blocked` until the PM explicitly removes the dependency or cancels it.
 
-This prevents a cancelled blocker from silently unblocking work that may no longer make sense.
+The cancelled-blocker watchdog raises a project-scoped `blocked_cancelled_blocker:<project>/<task>` alert for each affected blocked task. If the cancelled blocker was an operator/user handoff, the dependent blocked task remains visible in the default inbox so the request is preserved after cancellation. This prevents a cancelled blocker from either silently unblocking work that may no longer make sense or silently hiding the decision the operator still owes.
 
 ### ~~OQ-8: Cross-Project Dependencies~~ — RESOLVED
 

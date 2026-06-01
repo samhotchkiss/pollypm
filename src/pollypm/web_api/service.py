@@ -4034,6 +4034,7 @@ def list_inbox(
             include_drafts=include_drafts,
             limit=None,
         )
+        items = metric_items
     items.sort(key=lambda item: item.updated_at, reverse=True)
 
     cursor_idx = 0

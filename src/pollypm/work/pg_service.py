@@ -909,9 +909,11 @@ class PgWorkService:
             "WHERE role.v = 'user'"
             ") "
             "OR labels ? 'plan_review' "
-            "OR current_node_id IS NOT NULL"
+            "OR current_node_id IS NOT NULL "
+            "OR work_status = %s"
             ")"
         )
+        params.append(WorkStatus.BLOCKED.value)
 
         clause = " WHERE " + " AND ".join(where)
         order_limit = " ORDER BY updated_at DESC, project ASC, task_number DESC"

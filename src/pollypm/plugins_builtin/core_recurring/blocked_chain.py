@@ -23,9 +23,11 @@ it and decides):
   non-in-flight status. "In-flight" means ``in_progress`` / ``review`` /
   ``rework`` — actively being worked on or actively being reviewed.
   ``queued`` counts as not-in-flight: a queued blocker that itself
-  depends on stuck work is still part of a dead end. ``done`` /
-  ``cancelled`` blockers are filtered upstream by ``maybe_unblock``;
-  if any remain on the chain we still treat them as resolved.
+  depends on stuck work is still part of a dead end. ``done`` blockers
+  are filtered upstream by ``maybe_unblock``. ``cancelled`` blockers
+  are not dependency-satisfying; they emit a separate actionable
+  ``blocked_cancelled_blocker:<project>/<task>`` alert scoped to the
+  affected project so the inbox/dashboard can route it to the operator.
 
 The alert is keyed by ``session_name = blocked-<project>-<N>`` and
 ``alert_type = blocked_dead_end`` so ``upsert_alert`` dedupes across
@@ -61,11 +63,14 @@ _IN_FLIGHT_STATUSES: frozenset[str] = frozenset({
     WorkStatus.REWORK.value,
 })
 
-# Statuses that count as resolved — a blocker that's done or cancelled
-# would already have been filtered out by ``maybe_unblock``; if it
-# lingers we still treat it as not-blocking.
+# Statuses that count as resolved. ``cancelled`` is intentionally not
+# included: a cancelled prerequisite is terminal, but does not satisfy the
+# dependency. It requires a PM/operator decision.
 _RESOLVED_STATUSES: frozenset[str] = frozenset({
     WorkStatus.DONE.value,
+})
+
+_CANCELLED_STATUSES: frozenset[str] = frozenset({
     WorkStatus.CANCELLED.value,
 })
 
@@ -76,6 +81,15 @@ def blocked_dead_end_session_name(project: str, task_number: int) -> str:
 
 
 BLOCKED_DEAD_END_ALERT_TYPE = "blocked_dead_end"
+BLOCKED_CANCELLED_BLOCKER_ALERT_TYPE_PREFIX = "blocked_cancelled_blocker:"
+
+
+def blocked_cancelled_blocker_alert_type(project: str, task_number: int) -> str:
+    """Return the per-task alert_type for cancelled-blocker deadlocks."""
+    return (
+        f"{BLOCKED_CANCELLED_BLOCKER_ALERT_TYPE_PREFIX}"
+        f"{project}/{int(task_number)}"
+    )
 
 
 def _parse_iso(stamp: Any) -> datetime | None:
@@ -178,6 +192,44 @@ def _format_chain_summary(
     )
 
 
+def _format_blocker_label(work: Any, key: tuple[str, int]) -> str:
+    ref = f"{key[0]}/{int(key[1])}"
+    get_task = getattr(work, "get", None)
+    if not callable(get_task):
+        return ref
+    try:
+        task = get_task(ref)
+    except Exception:  # noqa: BLE001 - alert still useful with just the ref
+        return ref
+    title = str(getattr(task, "title", "") or "").strip()
+    if not title:
+        return ref
+    return f"{ref} ({title})"
+
+
+def _format_cancelled_blocker_summary(
+    *,
+    work: Any,
+    task_id: str,
+    cancelled_keys: set[tuple[str, int]],
+) -> str:
+    """Build the alert message for a chain ending at cancelled blockers."""
+    labels = [
+        _format_blocker_label(work, key)
+        for key in sorted(cancelled_keys)
+    ]
+    shown = ", ".join(labels[:4])
+    if len(labels) > 4:
+        shown += f", +{len(labels) - 4} more"
+    word = "blocker" if len(labels) == 1 else "blockers"
+    return (
+        f"Task {task_id} is blocked by cancelled dependency {word}: "
+        f"{shown}. Cancelled blockers do not auto-satisfy dependencies. "
+        "Reopen the cancelled blocker, unlink/requeue this task if the "
+        "dependency is no longer required, or cancel the dependent work."
+    )
+
+
 def _emit_alert(
     *,
     msg_store: Any,
@@ -185,16 +237,18 @@ def _emit_alert(
     project: str,
     task_number: int,
     message: str,
+    session_name: str | None = None,
+    alert_type: str = BLOCKED_DEAD_END_ALERT_TYPE,
 ) -> bool:
-    """Upsert a ``blocked_dead_end`` alert. Returns True iff a write ran."""
-    session_name = blocked_dead_end_session_name(project, task_number)
+    """Upsert a blocked-chain alert. Returns True iff a write ran."""
+    session_name = session_name or blocked_dead_end_session_name(
+        project, task_number,
+    )
     target = msg_store or state_store
     if target is None:
         return False
     try:
-        target.upsert_alert(
-            session_name, BLOCKED_DEAD_END_ALERT_TYPE, "warn", message,
-        )
+        target.upsert_alert(session_name, alert_type, "warn", message)
         return True
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -244,7 +298,9 @@ def sweep_blocked_chains(
     counters = {
         "blocked_considered": 0,
         "dead_end_detected": 0,
+        "cancelled_blocker_detected": 0,
         "alerts_raised": 0,
+        "cancelled_blocker_alerts_raised": 0,
         "skipped_recent": 0,
         "skipped_in_flight_chain": 0,
         "skipped_no_blockers": 0,
@@ -287,6 +343,33 @@ def sweep_blocked_chains(
                 message=message,
             ):
                 counters["alerts_raised"] += 1
+            continue
+        cancelled_chain = {
+            key: status
+            for key, status in status_by_key.items()
+            if status in _CANCELLED_STATUSES
+        }
+        if cancelled_chain:
+            counters["dead_end_detected"] += 1
+            counters["cancelled_blocker_detected"] += 1
+            message = _format_cancelled_blocker_summary(
+                work=work,
+                task_id=task.task_id,
+                cancelled_keys=set(cancelled_chain.keys()),
+            )
+            if _emit_alert(
+                msg_store=msg_store,
+                state_store=state_store,
+                project=project,
+                task_number=task_number,
+                message=message,
+                session_name=project,
+                alert_type=blocked_cancelled_blocker_alert_type(
+                    project, task_number,
+                ),
+            ):
+                counters["alerts_raised"] += 1
+                counters["cancelled_blocker_alerts_raised"] += 1
             continue
         # Drop resolved blockers from the dead-end consideration. If
         # any remain in flight the chain is alive.
@@ -361,7 +444,9 @@ def blocked_chain_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     totals = {
         "blocked_considered": 0,
         "dead_end_detected": 0,
+        "cancelled_blocker_detected": 0,
         "alerts_raised": 0,
+        "cancelled_blocker_alerts_raised": 0,
         "skipped_recent": 0,
         "skipped_in_flight_chain": 0,
         "skipped_no_blockers": 0,

@@ -11,6 +11,9 @@ A task is considered in the user's inbox when any of the following hold:
     role named "user" to the task).
   * The task's ``roles`` dict contains *any* role whose value is literally
     the string ``"user"`` (a role like ``requester=user``).
+  * The task is blocked by a cancelled dependency that itself had inbox
+    identity. This preserves cancelled operator handoffs as visible
+    downstream action instead of letting the dependent task disappear.
 
 Terminal tasks (``done`` / ``cancelled``) are always excluded.
 
@@ -271,6 +274,45 @@ def is_inbox_task_identity(
     return _current_node_is_human(task, service, flow_cache=cache)
 
 
+def _blocked_on_cancelled_inbox_dependency(
+    task: Task,
+    service: _FlowLookup,
+    *,
+    flow_cache: dict[tuple[str, int], FlowTemplate],
+) -> bool:
+    """Return True when ``task`` is blocked on a cancelled inbox handoff.
+
+    Cancelled blockers intentionally do not auto-satisfy dependencies: the PM
+    must choose whether to reopen the blocker, unlink/requeue the dependent, or
+    cancel the dependent work. If the cancelled blocker was itself an inbox row
+    (roles/user/human-node/plan-review identity), the dependent task must stay
+    visible in the user's inbox so the operator-input request is not erased by
+    the cancellation.
+    """
+    if _status_value(task) != WorkStatus.BLOCKED.value:
+        return False
+    refs = getattr(task, "blocked_by", None) or []
+    if not refs:
+        return False
+    get_task = getattr(service, "get", None)
+    if not callable(get_task):
+        return False
+    for ref in refs:
+        try:
+            project, task_number = ref
+        except (TypeError, ValueError):
+            continue
+        try:
+            blocker = get_task(f"{project}/{int(task_number)}")
+        except Exception:  # noqa: BLE001 - readonly predicate degrades hidden
+            continue
+        if _status_value(blocker) != WorkStatus.CANCELLED.value:
+            continue
+        if is_inbox_task_identity(blocker, service, flow_cache=flow_cache):
+            return True
+    return False
+
+
 def is_inbox_task(
     task: Task,
     service: _FlowLookup,
@@ -287,9 +329,15 @@ def is_inbox_task(
     snoozed, mark-read, replied to, or promoted via the API if it
     would not have appeared in the cockpit inbox.
     """
-    if getattr(task, "work_status", None) in TERMINAL_STATUSES:
+    status = getattr(task, "work_status", None)
+    if status in TERMINAL_STATUSES or _status_value(task) in {"done", "cancelled"}:
         return False
-    return is_inbox_task_identity(task, service, flow_cache=flow_cache)
+    cache = flow_cache if flow_cache is not None else {}
+    if is_inbox_task_identity(task, service, flow_cache=cache):
+        return True
+    return _blocked_on_cancelled_inbox_dependency(
+        task, service, flow_cache=cache,
+    )
 
 
 # ---------------------------------------------------------------------------

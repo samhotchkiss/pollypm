@@ -438,3 +438,45 @@ def test_multiple_missing_workers_each_get_their_own_alert(
         "missing_task_worker-polly_remote/13",
         "missing_task_worker-polly_remote/14",
     }
+
+
+def test_liveness_gate_skips_dormant_project_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2530: dormant projects are not scanned for missing workers."""
+    live_project = _FakeProject(key="polly_remote")
+    dormant_project = _FakeProject(key="pm_test_01wave_1779715196")
+    store = _FakeStore()
+    services = _build_services(
+        windows=[],
+        known_projects=(live_project, dormant_project),
+        store=store,
+    )
+    opened: list[str] = []
+
+    def _opener(project: _FakeProject, _services: Any) -> _FakeWorkService:
+        opened.append(project.key)
+        return _FakeWorkService(
+            [
+                _make_task(
+                    project=project.key,
+                    task_number=1,
+                    work_status=WorkStatus.IN_PROGRESS.value,
+                ),
+            ],
+            is_workspace=False,
+        )
+
+    monkeypatch.setattr(sweep_mod, "_open_project_work_service", _opener)
+
+    summary = _sweep_missing_task_workers(
+        services,
+        recent_real_work_projects=frozenset({"polly_remote"}),
+    )
+
+    assert opened == ["polly_remote"]
+    assert summary["emitted"] == 1
+    assert summary["considered"] == 1
+    assert {row[0] for row in store.upserts} == {
+        "missing_task_worker-polly_remote/1",
+    }

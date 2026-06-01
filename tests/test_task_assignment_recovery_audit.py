@@ -8,6 +8,7 @@ from pollypm.plugins_builtin.task_assignment_notify.handlers import sweep as swe
 from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
     _auto_claim_next,
     _recover_dead_claims,
+    _sweep_workspace_per_project,
 )
 from pollypm.work.models import WorkStatus
 
@@ -119,6 +120,65 @@ def _write_pause_marker(base_dir: Path, names: list[str]) -> None:
 def _reset_tmux_probe_tracking() -> None:
     sweep_mod._TMUX_WINDOW_PROBE_UNAVAILABLE_COUNTS.clear()
     sweep_mod._TMUX_WINDOW_PROBE_UNAVAILABLE_ALERTED.clear()
+
+
+class _ClosableWork:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_auto_claim_workspace_pass_skips_dormant_projects(monkeypatch) -> None:
+    """#2530: auto-claim enumeration is liveness-gated before DB work."""
+    live = SimpleNamespace(key="savethenovel", auto_claim=None)
+    dormant = SimpleNamespace(key="pm_test_01wave_1779715196", auto_claim=None)
+    services = SimpleNamespace(
+        auto_claim=True,
+        known_projects=(live, dormant),
+    )
+    opened: list[str] = []
+    recovered: list[str] = []
+    claimed: list[str] = []
+    work_by_project: dict[str, _ClosableWork] = {}
+
+    def _open(project, _services):
+        opened.append(project.key)
+        work = _ClosableWork()
+        work_by_project[project.key] = work
+        return work
+
+    monkeypatch.setattr(
+        sweep_mod,
+        "_open_workspace_project_work_service",
+        _open,
+    )
+    monkeypatch.setattr(
+        sweep_mod,
+        "_recover_dead_claims",
+        lambda _services, _work, project, _totals: recovered.append(project.key),
+    )
+    monkeypatch.setattr(
+        sweep_mod,
+        "_auto_claim_next",
+        lambda _services, _work, project, _totals, **_kwargs: claimed.append(
+            project.key
+        ),
+    )
+
+    _sweep_workspace_per_project(
+        services=services,
+        totals={"by_outcome": {}},
+        plan_missing_projects=set(),
+        recent_real_work_projects=frozenset({"savethenovel"}),
+    )
+
+    assert opened == ["savethenovel"]
+    assert recovered == ["savethenovel"]
+    assert claimed == ["savethenovel"]
+    assert work_by_project["savethenovel"].closed
+
 
 def test_recover_dead_claims_emits_task_reclaimed_audit(
     monkeypatch,

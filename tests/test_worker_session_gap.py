@@ -13,7 +13,6 @@ contract without spinning up real tmux sessions or DBs.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -373,3 +372,35 @@ def test_no_known_projects_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     assert summary == {"emitted": 0, "cleared": 0}
     assert store.upserts == []
     assert store.clears == []
+
+
+def test_liveness_gate_skips_dormant_project_gap_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2530: queued tasks in dormant projects do not refresh gap alerts."""
+    live_project = _FakeProject(key="polly_remote")
+    dormant_project = _FakeProject(key="pm_test_01wave_1779715196")
+    store = _FakeStore()
+    services = _build_services(
+        windows=[],
+        known_projects=(live_project, dormant_project),
+        store=store,
+    )
+    opened: list[str] = []
+
+    def _opener(project: _FakeProject, _services: Any) -> _FakeWorkService:
+        opened.append(project.key)
+        return _FakeWorkService({project.key: 3})
+
+    monkeypatch.setattr(sweep_mod, "_open_project_work_service", _opener)
+
+    summary = _sweep_worker_session_gaps(
+        services,
+        recent_real_work_projects=frozenset({"polly_remote"}),
+    )
+
+    assert opened == ["polly_remote"]
+    assert summary == {"emitted": 1, "cleared": 0}
+    assert [row[0] for row in store.upserts] == [
+        "worker_session_gap-polly_remote",
+    ]

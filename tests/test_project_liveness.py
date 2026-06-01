@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 from pollypm.project_liveness import (
+    coerce_utc_datetime,
     is_real_operator_project,
     project_key_looks_synthetic,
     project_path_looks_synthetic,
     real_operator_project_items,
     real_operator_project_keys,
+    recent_real_work_project_keys,
+    task_is_recent_done_work,
 )
 
 
@@ -85,3 +89,72 @@ def test_real_operator_project_items_falls_back_when_only_synthetic() -> None:
         "pm_test_01wave_1779715196",
     ]
     assert real_operator_project_items(projects, fallback_to_all=False) == ()
+
+
+def test_recent_real_work_project_keys_use_recent_done_real_projects() -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    projects = {
+        "active": SimpleNamespace(tracked=True, path="/Users/sam/dev/active"),
+        "dormant": SimpleNamespace(tracked=True, path="/Users/sam/dev/dormant"),
+        "queued_only": SimpleNamespace(tracked=True, path="/Users/sam/dev/queued"),
+        "pm_test_01wave_1779715196": SimpleNamespace(
+            tracked=True,
+            path="/private/tmp/pm_test_01wave_1779715196",
+        ),
+    }
+    tasks = {
+        "active": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=1),
+            ),
+        ],
+        "dormant": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=14),
+            ),
+        ],
+        "queued_only": [
+            SimpleNamespace(
+                work_status="queued",
+                updated_at=now,
+            ),
+        ],
+        "pm_test_01wave_1779715196": [
+            SimpleNamespace(
+                work_status="done",
+                updated_at=now - timedelta(days=1),
+            ),
+        ],
+    }
+
+    assert recent_real_work_project_keys(
+        projects,
+        lambda key: tasks[key],
+        now=now,
+    ) == frozenset({"active"})
+
+
+def test_task_is_recent_done_work_treats_missing_timestamp_as_live() -> None:
+    cutoff = datetime(2026, 5, 25, tzinfo=UTC)
+    assert task_is_recent_done_work(
+        SimpleNamespace(work_status="done", updated_at=None, created_at=None),
+        cutoff=cutoff,
+    )
+    assert not task_is_recent_done_work(
+        SimpleNamespace(work_status="queued", updated_at=None, created_at=None),
+        cutoff=cutoff,
+    )
+
+
+def test_coerce_utc_datetime_handles_z_suffix_and_naive_values() -> None:
+    assert coerce_utc_datetime("2026-06-01T12:00:00Z") == datetime(
+        2026,
+        6,
+        1,
+        12,
+        0,
+        tzinfo=UTC,
+    )
+    assert coerce_utc_datetime(datetime(2026, 6, 1, 12, 0)).tzinfo is UTC

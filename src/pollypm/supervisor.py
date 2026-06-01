@@ -3042,6 +3042,13 @@ class Supervisor:
 
             swept = 0
             terminal_swept = 0
+            try:
+                from pollypm.supervision.alert_task_lookup import (
+                    is_project_scoped_task_alert as _is_project_scoped_task_alert,
+                )
+            except Exception:  # noqa: BLE001
+                def _is_project_scoped_task_alert(_alert_type: str) -> bool:
+                    return False
             # Read through ``self.open_alerts()`` — the supervisor method
             # that routes to the unified ``messages`` store (#349) and
             # strips the ``[Alert]`` title tag for caller-friendly
@@ -3093,6 +3100,15 @@ class Supervisor:
                     or alert_type.startswith("no_session_for_assignment:")
                     or alert_type == "plan_missing"
                 ):
+                    continue
+                # ``blocked_chain.sweep`` emits cancelled-blocker alerts
+                # on the project scope (e.g. ``samblog``), not on a tmux
+                # launch session. That scope is intentionally absent
+                # from ``tracked``; treating it as an orphan makes the
+                # heartbeat stale sweep clear a still-live deadlock
+                # between blocked-chain cadence ticks (#2536). Terminal
+                # task cleanup above still owns the real close path.
+                if _is_project_scoped_task_alert(alert_type):
                     continue
                 if session_name in tracked:
                     window_key = expected_window_key.get(session_name)

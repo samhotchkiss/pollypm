@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pollypm.supervision.alert_task_lookup import (
     extract_task_ids,
+    is_project_scoped_task_alert,
     project_key_from_task_id,
 )
 
@@ -40,6 +41,21 @@ def test_extract_no_session_for_assignment_returns_task_id() -> None:
         session_name="worker-demo",
     )
     assert candidates == ["demo/42"]
+
+
+def test_extract_blocked_cancelled_blocker_returns_task_id() -> None:
+    candidates = extract_task_ids(
+        alert_type="blocked_cancelled_blocker:samblog/30",
+        session_name="samblog",
+    )
+    assert candidates == ["samblog/30"]
+
+
+def test_blocked_cancelled_blocker_is_project_scoped() -> None:
+    assert is_project_scoped_task_alert(
+        "blocked_cancelled_blocker:samblog/30",
+    )
+    assert not is_project_scoped_task_alert("stuck_on_task:samblog/30")
 
 
 def test_extract_handles_hyphenated_project_in_alert_type_suffix() -> None:

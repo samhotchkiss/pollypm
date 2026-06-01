@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pollypm.supervisor_alerts as _supervisor_alerts
 from pollypm.models import (
@@ -638,6 +639,86 @@ def test_recovery_alert_auto_clear_skips_untracked_sessions(
         "auto-clear sweep must not touch untracked sessions; "
         "_sweep_stale_alerts owns that path"
     )
+
+
+def test_stale_alert_gc_keeps_blocked_cancelled_blocker_for_live_task(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Project-scoped blocked-chain alerts are not orphan sessions.
+
+    ``blocked_chain.sweep`` keys cancelled-blocker alerts on the project
+    scope so the dashboard can route them to the operator. The generic
+    stale-alert sweep must not clear that project scope just because it
+    is absent from the tmux launch plan while the dependent task is live.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    alert = SimpleNamespace(
+        session_name="pollypm",
+        alert_type="blocked_cancelled_blocker:pollypm/30",
+        message="Task pollypm/30 is blocked by cancelled dependency pollypm/26.",
+    )
+    monkeypatch.setattr(supervisor, "open_alerts", lambda: [alert])
+    cleared: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor._msg_store,
+        "clear_alert",
+        lambda session_name, alert_type, *args, **kwargs: cleared.append(
+            (session_name, alert_type),
+        ),
+    )
+    lookups: list[tuple[str, str]] = []
+
+    def _live_status(project_key: str, task_id: str) -> str:
+        lookups.append((project_key, task_id))
+        return "blocked"
+
+    monkeypatch.setattr(supervisor, "_lookup_task_status", _live_status)
+
+    supervisor._sweep_stale_alerts(window_map={}, name_by_window={})
+
+    assert cleared == []
+    assert lookups == [("pollypm", "pollypm/30")]
+
+
+def test_stale_alert_gc_clears_blocked_cancelled_blocker_when_task_terminal(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """The project-scope exclusion must not bypass terminal-task cleanup."""
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    alert = SimpleNamespace(
+        session_name="pollypm",
+        alert_type="blocked_cancelled_blocker:pollypm/30",
+        message="Task pollypm/30 is blocked by cancelled dependency pollypm/26.",
+    )
+    monkeypatch.setattr(supervisor, "open_alerts", lambda: [alert])
+    cleared: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor._msg_store,
+        "clear_alert",
+        lambda session_name, alert_type, *args, **kwargs: cleared.append(
+            (session_name, alert_type),
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor._msg_store,
+        "append_event",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_lookup_task_status",
+        lambda project_key, task_id: "done",
+    )
+
+    supervisor._sweep_stale_alerts(window_map={}, name_by_window={})
+
+    assert cleared == [("pollypm", "blocked_cancelled_blocker:pollypm/30")]
 
 
 def test_recovery_alert_auto_clear_full_lifecycle(

@@ -7,6 +7,8 @@ referenced task in different places:
 * ``stuck_on_task:<project>/<num>`` — task id in the ``alert_type``
   suffix.
 * ``no_session_for_assignment:<project>/<num>`` — same shape.
+* ``blocked_cancelled_blocker:<project>/<num>`` — same shape, but
+  project-scoped instead of session-scoped.
 * ``review-<project>-<num>`` — task number in the ``session_name``
   scope (the synthetic ``review_pending`` alert key from #1053).
 * ``plan_missing`` (scope: ``plan_gate-<project>``) — the task is
@@ -52,6 +54,14 @@ _REVIEW_SCOPE_RE = re.compile(r"^review-(?P<project>.+)-(?P<num>\d+)$")
 _TYPE_PREFIXES_WITH_TASK_ID: tuple[str, ...] = (
     "stuck_on_task:",
     "no_session_for_assignment:",
+    "blocked_cancelled_blocker:",
+)
+
+# Project-scoped alert families whose ``scope`` is not a launch-plan
+# session name. The generic stale-alert sweep must leave these to their
+# owner even though the task-terminal cleanup can still parse them.
+_PROJECT_SCOPED_TASK_ALERT_PREFIXES: tuple[str, ...] = (
+    "blocked_cancelled_blocker:",
 )
 
 # Alert types whose underlying task reference must come from the
@@ -135,7 +145,14 @@ def project_key_from_task_id(task_id: str) -> str:
     return task_id.split("/", 1)[0]
 
 
+def is_project_scoped_task_alert(alert_type: str) -> bool:
+    """Return True when ``alert_type`` is task-keyed but not session-keyed."""
+    alert_type = (alert_type or "").strip()
+    return alert_type.startswith(_PROJECT_SCOPED_TASK_ALERT_PREFIXES)
+
+
 __all__ = [
     "extract_task_ids",
+    "is_project_scoped_task_alert",
     "project_key_from_task_id",
 ]

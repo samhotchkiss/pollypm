@@ -52,6 +52,7 @@ from pollypm.plan_presence import (
     has_acceptable_plan,
     task_bypasses_plan_gate,
 )
+from pollypm.project_liveness import recent_real_work_project_keys
 from pollypm.plugins_builtin.task_assignment_notify.resolver import (
     SWEEPER_COOLDOWN_SECONDS,
     _known_project_keys,
@@ -148,6 +149,73 @@ _IDLE_GATED_STATUSES = frozenset(_ACTIVE_WORKER_STATUSES)
 
 _TMUX_WINDOW_PROBE_UNAVAILABLE_COUNTS: dict[tuple[str, int], int] = {}
 _TMUX_WINDOW_PROBE_UNAVAILABLE_ALERTED: set[tuple[str, int]] = set()
+
+
+def _recent_real_work_project_keys_for_sweep(
+    services: Any,
+) -> frozenset[str] | None:
+    """Return the #2483 recent-real-work liveness set for sweep gating.
+
+    ``None`` means the workspace facts could not be loaded, so callers
+    fail open and preserve the old sweep behavior. A concrete empty set
+    means liveness was computed and no registered project has recent real
+    completed work.
+    """
+
+    config = getattr(services, "config", None)
+    if config is None:
+        return None
+    projects = getattr(config, "projects", {}) or {}
+    if not projects:
+        return None
+    try:
+        from pollypm.cockpit_pg_aggregates import (
+            all_tasks_for_project,
+            all_tasks_grouped,
+        )
+
+        grouped = all_tasks_grouped(config)
+        if grouped is None:
+            return None
+        return recent_real_work_project_keys(
+            projects,
+            lambda project_key: all_tasks_for_project(grouped, config, project_key),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: recent real-work liveness lookup failed",
+            exc_info=True,
+        )
+        return None
+
+
+def _project_is_live_for_sweep(
+    project_key: str | None,
+    recent_real_work_projects: frozenset[str] | None,
+) -> bool:
+    if recent_real_work_projects is None:
+        return True
+    if not project_key:
+        return True
+    return project_key in recent_real_work_projects
+
+
+def _known_projects_for_sweep(
+    services: Any,
+    *,
+    recent_real_work_projects: frozenset[str] | None,
+) -> tuple[Any, ...]:
+    projects = tuple(getattr(services, "known_projects", ()) or ())
+    if recent_real_work_projects is None:
+        return projects
+    return tuple(
+        project
+        for project in projects
+        if _project_is_live_for_sweep(
+            getattr(project, "key", None),
+            recent_real_work_projects,
+        )
+    )
 
 
 def _build_event_for_task(work_service: Any, task: Any) -> TaskAssignmentEvent | None:
@@ -761,7 +829,11 @@ def _count_queued_tasks_for_project(
     return total
 
 
-def _sweep_worker_session_gaps(services: Any) -> dict[str, int]:
+def _sweep_worker_session_gaps(
+    services: Any,
+    *,
+    recent_real_work_projects: frozenset[str] | None = None,
+) -> dict[str, int]:
     """Emit ``worker_session_gap`` alerts for projects with queued tasks
     and no worker session. Auto-clears stale alerts.
 
@@ -769,7 +841,14 @@ def _sweep_worker_session_gaps(services: Any) -> dict[str, int]:
     the sweep's by-outcome tally.
     """
     summary = {"emitted": 0, "cleared": 0}
-    known = list(getattr(services, "known_projects", ()) or ())
+    if recent_real_work_projects is None:
+        recent_real_work_projects = _recent_real_work_project_keys_for_sweep(services)
+    known = list(
+        _known_projects_for_sweep(
+            services,
+            recent_real_work_projects=recent_real_work_projects,
+        )
+    )
     if not known:
         return summary
     window_names = _storage_closet_window_names(services)
@@ -917,7 +996,11 @@ def _list_active_worker_tasks(work: Any, project_key: str | None) -> list[Any]:
     return out
 
 
-def _sweep_missing_task_workers(services: Any) -> dict[str, int]:
+def _sweep_missing_task_workers(
+    services: Any,
+    *,
+    recent_real_work_projects: frozenset[str] | None = None,
+) -> dict[str, int]:
     """Emit ``missing_task_worker`` alerts for stuck-with-no-worker tasks.
 
     #1070 — detection-only counterpart to ``_recover_dead_claims``.
@@ -939,6 +1022,8 @@ def _sweep_missing_task_workers(services: Any) -> dict[str, int]:
     if window_names is None:
         # Can't enumerate sessions — bail rather than emit false positives.
         return summary
+    if recent_real_work_projects is None:
+        recent_real_work_projects = _recent_real_work_project_keys_for_sweep(services)
 
     def _check_task(project_key: str, task: Any) -> None:
         roles = getattr(task, "roles", {}) or {}
@@ -977,7 +1062,12 @@ def _sweep_missing_task_workers(services: Any) -> dict[str, int]:
     # workspace tasks without a project key have no per-task window
     # naming convention to check against.
     workspace_work = getattr(services, "work_service", None)
-    known = list(getattr(services, "known_projects", ()) or ())
+    known = list(
+        _known_projects_for_sweep(
+            services,
+            recent_real_work_projects=recent_real_work_projects,
+        )
+    )
     if workspace_work is not None and known:
         for project in known:
             project_key = getattr(project, "key", None)
@@ -1189,6 +1279,7 @@ def _sweep_work_service(
     review_pending_tasks: set[tuple[str, int]] | None = None,
     project_path: Any = None,
     project: Any = None,
+    recent_real_work_projects: frozenset[str] | None = None,
 ) -> None:
     """Run one sweep pass over a single work-service DB.
 
@@ -1221,7 +1312,10 @@ def _sweep_work_service(
     # ``auto_claim_skipped_plan_missing`` outcome on the same task.
     known_by_key: dict[str, Any] = {}
     if project is None and project_path is None:
-        for known in getattr(services, "known_projects", ()) or ():
+        for known in _known_projects_for_sweep(
+            services,
+            recent_real_work_projects=recent_real_work_projects,
+        ):
             known_key = getattr(known, "key", None)
             if known_key:
                 known_by_key[known_key] = known
@@ -1242,6 +1336,15 @@ def _sweep_work_service(
             # ``review`` is by definition work-for-the-human and should
             # be visible. Tracked so the post-sweep clearing pass can
             # close alerts whose task transitioned out of ``review``.
+            task_project_key = str(getattr(task, "project", "") or "")
+            if not _project_is_live_for_sweep(
+                task_project_key,
+                recent_real_work_projects,
+            ):
+                by_outcome["skipped_dormant_project"] = (
+                    by_outcome.get("skipped_dormant_project", 0) + 1
+                )
+                continue
             if (
                 review_pending_tasks is not None
                 and status == WorkStatus.REVIEW.value
@@ -2543,7 +2646,11 @@ def _wire_session_manager(svc: Any, project_root: Path, services: Any) -> None:
         )
 
 
-def _precompute_plan_missing_projects(services: Any) -> dict[str, str | None]:
+def _precompute_plan_missing_projects(
+    services: Any,
+    *,
+    recent_real_work_projects: frozenset[str] | None = None,
+) -> dict[str, str | None]:
     """Return a mapping of plan-gated project keys → an example queued task_id.
 
     #1524 — computed up front from the canonical workspace DB so the
@@ -2562,7 +2669,12 @@ def _precompute_plan_missing_projects(services: Any) -> dict[str, str | None]:
         global_enforce = bool(getattr(services, "enforce_plan", True))
         if not global_enforce:
             return {}
-        known = list(getattr(services, "known_projects", ()) or ())
+        known = list(
+            _known_projects_for_sweep(
+                services,
+                recent_real_work_projects=recent_real_work_projects,
+            )
+        )
         if not known:
             return {}
         plan_dir = getattr(services, "plan_dir", "docs/plan") or "docs/plan"
@@ -2711,6 +2823,7 @@ def _sweep_workspace_root(
     plan_missing_projects: set,
     plan_decisions: dict,
     review_pending_tasks: set,
+    recent_real_work_projects: frozenset[str] | None,
 ) -> dict[str, Any] | None:
     """Pass 1: workspace-root DB sweep.
 
@@ -2730,6 +2843,7 @@ def _sweep_workspace_root(
                 plan_decisions=plan_decisions,
                 review_pending_tasks=review_pending_tasks,
                 project_path=None,
+                recent_real_work_projects=recent_real_work_projects,
             )
         finally:
             _close_quietly(workspace_work)
@@ -2742,10 +2856,17 @@ def _sweep_workspace_root(
 
 
 def _sweep_workspace_per_project(
-    *, services: Any, totals: dict, plan_missing_projects: set,
+    *,
+    services: Any,
+    totals: dict,
+    plan_missing_projects: set,
+    recent_real_work_projects: frozenset[str] | None,
 ) -> None:
     """Open the workspace DB once per registered project and run auto-claim."""
-    for project in services.known_projects:
+    for project in _known_projects_for_sweep(
+        services,
+        recent_real_work_projects=recent_real_work_projects,
+    ):
         if not _auto_claim_enabled_for_project(services, project):
             continue
         workspace_project_work = _open_workspace_project_work_service(
@@ -2775,11 +2896,15 @@ def _sweep_per_project_dbs(
     plan_missing_projects: set,
     plan_decisions: dict,
     review_pending_tasks: set,
+    recent_real_work_projects: frozenset[str] | None,
 ) -> tuple[int, int]:
     """Pass 2: per-project DB sweep. Returns ``(scanned, skipped)``."""
     projects_scanned = 0
     projects_skipped = 0
-    for project in services.known_projects:
+    for project in _known_projects_for_sweep(
+        services,
+        recent_real_work_projects=recent_real_work_projects,
+    ):
         project_key = getattr(project, "key", None)
         project_work = _open_project_work_service(project, services)
         if project_work is None:
@@ -2798,6 +2923,7 @@ def _sweep_per_project_dbs(
                 review_pending_tasks=review_pending_tasks,
                 project_path=getattr(project, "path", None),
                 project=project,
+                recent_real_work_projects=recent_real_work_projects,
             )
             # #768: auto-claim runs after the regular sweep body so
             # dead-window recovery has the most-recent state to work
@@ -2829,7 +2955,10 @@ def _sweep_per_project_dbs(
 
 
 def _sweep_recovery_passes(
-    *, services: Any, config_path: Path | None,
+    *,
+    services: Any,
+    config_path: Path | None,
+    recent_real_work_projects: frozenset[str] | None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
     """End-of-tick recovery passes.
 
@@ -2855,7 +2984,10 @@ def _sweep_recovery_passes(
 
     worker_gap_summary = {"emitted": 0, "cleared": 0}
     try:
-        worker_gap_summary = _sweep_worker_session_gaps(services)
+        worker_gap_summary = _sweep_worker_session_gaps(
+            services,
+            recent_real_work_projects=recent_real_work_projects,
+        )
     except Exception:  # noqa: BLE001
         logger.debug(
             "task_assignment sweep: worker_session_gap pass failed",
@@ -2864,7 +2996,10 @@ def _sweep_recovery_passes(
 
     missing_worker_summary = {"emitted": 0, "cleared": 0, "considered": 0}
     try:
-        missing_worker_summary = _sweep_missing_task_workers(services)
+        missing_worker_summary = _sweep_missing_task_workers(
+            services,
+            recent_real_work_projects=recent_real_work_projects,
+        )
     except Exception:  # noqa: BLE001
         logger.debug(
             "task_assignment sweep: missing_task_worker pass failed",
@@ -2893,10 +3028,14 @@ def _task_assignment_sweep_body(
 
     totals: dict[str, Any] = {"considered": 0, "by_outcome": {}}
     alerted_pairs: set[tuple[str, str]] = set()
+    recent_real_work_projects = _recent_real_work_project_keys_for_sweep(services)
     # #1524 — pre-compute the set of projects that are plan-gated this
     # tick so the emit/clear decision is deterministic across the
     # workspace pass + per-project pass.
-    precomputed_missing = _precompute_plan_missing_projects(services)
+    precomputed_missing = _precompute_plan_missing_projects(
+        services,
+        recent_real_work_projects=recent_real_work_projects,
+    )
     plan_missing_projects: set[str] = set(precomputed_missing.keys())
     plan_decisions: dict[str, bool] = {}
     # Seed the per-tick gate cache with the precomputed answers so the
@@ -2933,6 +3072,7 @@ def _task_assignment_sweep_body(
         plan_missing_projects=plan_missing_projects,
         plan_decisions=plan_decisions,
         review_pending_tasks=review_pending_tasks,
+        recent_real_work_projects=recent_real_work_projects,
     )
     if short_circuit is not None:
         return short_circuit
@@ -2941,6 +3081,7 @@ def _task_assignment_sweep_body(
         services=services,
         totals=totals,
         plan_missing_projects=plan_missing_projects,
+        recent_real_work_projects=recent_real_work_projects,
     )
 
     projects_scanned, projects_skipped = _sweep_per_project_dbs(
@@ -2951,6 +3092,7 @@ def _task_assignment_sweep_body(
         plan_missing_projects=plan_missing_projects,
         plan_decisions=plan_decisions,
         review_pending_tasks=review_pending_tasks,
+        recent_real_work_projects=recent_real_work_projects,
     )
 
     # #1053: clear stale ``review_pending`` alerts.
@@ -2959,7 +3101,11 @@ def _task_assignment_sweep_body(
     )
 
     spawn_summary, worker_gap_summary, missing_worker_summary = (
-        _sweep_recovery_passes(services=services, config_path=config_path)
+        _sweep_recovery_passes(
+            services=services,
+            config_path=config_path,
+            recent_real_work_projects=recent_real_work_projects,
+        )
     )
 
     return {

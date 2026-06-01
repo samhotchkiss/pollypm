@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Mapping, TypeVar
+from typing import Callable, Iterable, Mapping, TypeVar
 
 
 _SYNTHETIC_PROJECT_KEYS = frozenset(
@@ -37,6 +38,7 @@ _SYNTHETIC_PROJECT_PREFIXES = (
     "testpause-",
 )
 _SYNTHETIC_PATH_PREFIXES = ("/private/tmp/",)
+RECENT_REAL_WORK_WINDOW = timedelta(days=7)
 
 _ProjectKey = TypeVar("_ProjectKey")
 _ProjectValue = TypeVar("_ProjectValue")
@@ -94,6 +96,84 @@ def is_real_operator_project(
     return True
 
 
+def task_status_key(task: object) -> str:
+    """Return a task's work-status value as a plain string."""
+
+    status = getattr(task, "work_status", "") or ""
+    status_value = getattr(status, "value", status)
+    return str(status_value or "")
+
+
+def coerce_utc_datetime(value: object) -> datetime | None:
+    """Coerce an ISO/datetime value to UTC, returning ``None`` on parse failure."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def task_is_recent_done_work(
+    task: object,
+    *,
+    cutoff: datetime,
+) -> bool:
+    """Return True when ``task`` is recently completed real work."""
+
+    if task_status_key(task) != "done":
+        return False
+    stamped = coerce_utc_datetime(
+        getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+    )
+    return stamped is None or stamped >= cutoff
+
+
+def recent_real_work_project_keys(
+    projects: Mapping[object, object],
+    tasks_for_project: Callable[[object], Iterable[object]],
+    *,
+    now: datetime | None = None,
+    recency_window: timedelta = RECENT_REAL_WORK_WINDOW,
+) -> frozenset[str]:
+    """Return real operator projects with recent completed task work.
+
+    This is the liveness signal used by operator-facing alert demotion
+    and sweep-side watchdog gating. It intentionally ignores queued /
+    recently touched rows because watchdog sweeps themselves can refresh
+    those timestamps.
+    """
+
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    else:
+        current = current.astimezone(UTC)
+    cutoff = current - recency_window
+    recent: set[str] = set()
+    for project_key, project in projects.items():
+        if not is_real_operator_project(project_key, project):
+            continue
+        for task in tasks_for_project(project_key):
+            if task_is_recent_done_work(task, cutoff=cutoff):
+                recent.add(str(project_key))
+                break
+    return frozenset(recent)
+
+
 def real_operator_project_keys(
     projects: Mapping[object, object],
     *,
@@ -141,9 +221,14 @@ def real_operator_project_items(
 
 
 __all__ = [
+    "RECENT_REAL_WORK_WINDOW",
+    "coerce_utc_datetime",
     "is_real_operator_project",
     "project_key_looks_synthetic",
     "project_path_looks_synthetic",
     "real_operator_project_items",
     "real_operator_project_keys",
+    "recent_real_work_project_keys",
+    "task_is_recent_done_work",
+    "task_status_key",
 ]

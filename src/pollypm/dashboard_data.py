@@ -16,8 +16,12 @@ from pollypm.idle_placeholders import (
     is_codex_idle_placeholder as _is_codex_idle_placeholder,
 )
 from pollypm.project_liveness import (
+    RECENT_REAL_WORK_WINDOW,
+    coerce_utc_datetime as _coerce_utc_datetime,
     is_real_operator_project,
     real_operator_project_items,
+    task_is_recent_done_work,
+    task_status_key,
 )
 from pollypm.projects import project_state_db_path
 
@@ -776,7 +780,6 @@ def _known_project_keys(config: PollyPMConfig) -> frozenset[str]:
     return frozenset((getattr(config, "projects", {}) or {}).keys())
 
 
-_REAL_WORK_RECENCY_WINDOW = timedelta(days=7)
 _RECOVERY_ALERT_TYPES_FOR_LIVENESS = frozenset({
     "plan_missing",
     "worker_session_gap",
@@ -788,33 +791,6 @@ _RECOVERY_ALERT_TYPES_FOR_LIVENESS = frozenset({
 class _AlertProjectTaskFacts:
     project_task_counts: dict[str, dict[str, int]]
     recent_real_work_projects: frozenset[str] | None
-
-
-def _status_key(task: object) -> str:
-    status = getattr(task, "work_status", "") or ""
-    status_value = getattr(status, "value", status)
-    return str(status_value or "")
-
-
-def _coerce_utc_datetime(value: object) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=UTC)
-        return value.astimezone(UTC)
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
 
 
 def _alert_filter_needs_project_task_facts(open_alerts: list[object]) -> bool:
@@ -851,23 +827,21 @@ def _project_task_facts_for_alert_filter(
             return _AlertProjectTaskFacts({}, None)
         counts_by_project: dict[str, dict[str, int]] = {}
         recent_real_work: set[str] = set()
-        recent_cutoff = datetime.now(UTC) - _REAL_WORK_RECENCY_WINDOW
+        recent_cutoff = datetime.now(UTC) - RECENT_REAL_WORK_WINDOW
         projects = getattr(config, "projects", {}) or {}
         for project_key, project in projects.items():
             counts: dict[str, int] = {}
             real_operator_project = is_real_operator_project(project_key, project)
             for task in all_tasks_for_project(grouped, config, project_key):
-                status_key = _status_key(task)
+                status_key = task_status_key(task)
                 if not status_key:
                     continue
                 counts[status_key] = counts.get(status_key, 0) + 1
-                if status_key == "done" and real_operator_project:
-                    stamped = _coerce_utc_datetime(
-                        getattr(task, "updated_at", None)
-                        or getattr(task, "created_at", None)
-                    )
-                    if stamped is None or stamped >= recent_cutoff:
-                        recent_real_work.add(project_key)
+                if real_operator_project and task_is_recent_done_work(
+                    task,
+                    cutoff=recent_cutoff,
+                ):
+                    recent_real_work.add(project_key)
             counts_by_project[project_key] = counts
         return _AlertProjectTaskFacts(
             counts_by_project,

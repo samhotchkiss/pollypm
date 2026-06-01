@@ -175,13 +175,103 @@ def blocked_since_stamp_for_service(
     )
 
 
+def _coerce_task_ref(raw: Any) -> tuple[str, int] | None:
+    if isinstance(raw, str):
+        project, sep, number = raw.rpartition("/")
+        if sep and project and number.isdigit():
+            return project, int(number)
+        return None
+    if isinstance(raw, (tuple, list)) and len(raw) == 2:
+        project, number = raw
+        try:
+            return str(project), int(number)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _task_status_value(task: Any) -> str:
+    status = getattr(task, "work_status", "")
+    return str(getattr(status, "value", status) or "")
+
+
+def _task_blockers(task: Any) -> list[tuple[str, int]]:
+    refs: list[tuple[str, int]] = []
+    for raw in getattr(task, "blocked_by", None) or ():
+        ref = _coerce_task_ref(raw)
+        if ref is not None:
+            refs.append(ref)
+    return refs
+
+
+def _task_id(project_key: str, task_number: int) -> str:
+    return f"{project_key}/{int(task_number)}"
+
+
+def _service_blocker_chain_statuses(
+    work: Any,
+    *,
+    project_key: str,
+    task_number: int,
+    root_task: Any | None = None,
+) -> tuple[set[tuple[str, int]], dict[tuple[str, int], str]] | None:
+    """Walk blockers through the public work-service Task surface.
+
+    ``Task.blocked_by`` is the same representation rendered by
+    ``pm task get`` and hydrated by ``PgWorkService.list_tasks``. Use it
+    before falling back to the legacy SQLite row probe so PG-backed and
+    field-hydrated blockers do not look like missing dependency rows.
+    """
+    get_task = getattr(work, "get", None)
+    if not callable(get_task):
+        return None
+
+    origin = (str(project_key), int(task_number))
+    if root_task is None:
+        try:
+            root_task = get_task(_task_id(*origin))
+        except Exception:  # noqa: BLE001 - caller can try the row probe
+            return None
+
+    visited: set[tuple[str, int]] = set()
+    status_by_key: dict[tuple[str, int], str] = {}
+    stack = list(reversed(_task_blockers(root_task)))
+
+    while stack:
+        key = stack.pop()
+        if key == origin or key in visited:
+            continue
+        visited.add(key)
+        try:
+            blocker = get_task(_task_id(*key))
+        except Exception:  # noqa: BLE001 - missing row is unresolved
+            status_by_key[key] = ""
+            continue
+        status_by_key[key] = _task_status_value(blocker)
+        for blocker_key in reversed(_task_blockers(blocker)):
+            if blocker_key != origin and blocker_key not in visited:
+                stack.append(blocker_key)
+
+    return visited, status_by_key
+
+
 def blocker_chain_for_service(
     work: Any,
     *,
     project_key: str,
     task_number: int,
+    root_task: Any | None = None,
 ) -> tuple[set[tuple[str, int]], dict[tuple[str, int], str]]:
     """Return recursive blocker keys and statuses from a work service."""
+    task_surface = _service_blocker_chain_statuses(
+        work,
+        project_key=project_key,
+        task_number=task_number,
+        root_task=root_task,
+    )
+    if task_surface is not None:
+        return task_surface
+
     conn = getattr(work, "_conn", None)
     if conn is None:
         return set(), {}

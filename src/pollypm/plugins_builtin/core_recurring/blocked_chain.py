@@ -128,6 +128,7 @@ def _walk_blocker_chain(
     *,
     project: str,
     task_number: int,
+    root_task: Any | None = None,
 ) -> tuple[set[tuple[str, int]], dict[tuple[str, int], str]]:
     """Walk the recursive ``blocked_by`` chain.
 
@@ -144,6 +145,7 @@ def _walk_blocker_chain(
         work,
         project_key=project,
         task_number=task_number,
+        root_task=root_task,
     )
 
 
@@ -234,6 +236,7 @@ def _emit_alert(
     *,
     msg_store: Any,
     state_store: Any,
+    config: Any | None = None,
     project: str,
     task_number: int,
     message: str,
@@ -244,16 +247,63 @@ def _emit_alert(
     session_name = session_name or blocked_dead_end_session_name(
         project, task_number,
     )
-    target = msg_store or state_store
-    if target is None:
+    if msg_store is not None:
+        try:
+            msg_store.upsert_alert(session_name, alert_type, "warn", message)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "blocked_chain.sweep: msg_store upsert_alert failed for %s/%d",
+                project, task_number, exc_info=True,
+            )
+
+    if _upsert_pg_alert(
+        config=config,
+        session_name=session_name,
+        alert_type=alert_type,
+        message=message,
+    ):
+        return True
+
+    if state_store is None:
         return False
     try:
-        target.upsert_alert(session_name, alert_type, "warn", message)
+        state_store.upsert_alert(session_name, alert_type, "warn", message)
         return True
     except Exception:  # noqa: BLE001
         logger.debug(
-            "blocked_chain.sweep: upsert_alert failed for %s/%d",
+            "blocked_chain.sweep: state_store upsert_alert failed for %s/%d",
             project, task_number, exc_info=True,
+        )
+        return False
+
+
+def _upsert_pg_alert(
+    *,
+    config: Any | None,
+    session_name: str,
+    alert_type: str,
+    message: str,
+) -> bool:
+    storage = getattr(config, "storage", None)
+    backend = str(getattr(storage, "backend", "") or "").lower()
+    if backend != "postgres":
+        return False
+    try:
+        from pollypm.storage.pg_alerts import upsert_alert
+
+        upsert_alert(
+            session_name,
+            alert_type,
+            "warn",
+            message,
+            config=config,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "blocked_chain.sweep: pg_alerts upsert_alert failed for %s/%s",
+            session_name, alert_type, exc_info=True,
         )
         return False
 
@@ -286,6 +336,7 @@ def sweep_blocked_chains(
     work: Any,
     msg_store: Any,
     state_store: Any,
+    config: Any | None = None,
     now: datetime,
     stale_threshold_seconds: int = DEFAULT_STALE_THRESHOLD_SECONDS,
 ) -> dict[str, int]:
@@ -324,7 +375,10 @@ def sweep_blocked_chains(
             counters["skipped_recent"] += 1
             continue
         visited, status_by_key = _walk_blocker_chain(
-            work, project=project, task_number=task_number,
+            work,
+            project=project,
+            task_number=task_number,
+            root_task=task,
         )
         if not visited:
             counters["dead_end_detected"] += 1
@@ -338,6 +392,7 @@ def sweep_blocked_chains(
             if _emit_alert(
                 msg_store=msg_store,
                 state_store=state_store,
+                config=config,
                 project=project,
                 task_number=task_number,
                 message=message,
@@ -360,6 +415,7 @@ def sweep_blocked_chains(
             if _emit_alert(
                 msg_store=msg_store,
                 state_store=state_store,
+                config=config,
                 project=project,
                 task_number=task_number,
                 message=message,
@@ -395,6 +451,7 @@ def sweep_blocked_chains(
         if _emit_alert(
             msg_store=msg_store,
             state_store=state_store,
+            config=config,
             project=project,
             task_number=task_number,
             message=message,
@@ -460,6 +517,7 @@ def blocked_chain_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 work=services.work_service,
                 msg_store=services.msg_store,
                 state_store=services.state_store,
+                config=services.config,
                 now=now,
                 stale_threshold_seconds=stale_threshold_seconds,
             )
@@ -476,6 +534,7 @@ def blocked_chain_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     work=project_work,
                     msg_store=services.msg_store,
                     state_store=services.state_store,
+                    config=services.config,
                     now=now,
                     stale_threshold_seconds=stale_threshold_seconds,
                 )

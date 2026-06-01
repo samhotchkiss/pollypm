@@ -2411,6 +2411,45 @@ def test_list_inbox_limit_passes_bounded_candidate_limit(
     assert svc.list_tasks_calls == 0
 
 
+def test_list_inbox_fills_page_after_false_positive_candidates(
+    client, auth_headers, monkeypatch,
+) -> None:
+    """Candidate paging must not make totals disagree with materialized rows.
+
+    The pg candidate query intentionally admits some cheap false positives
+    such as blocked tasks, then the canonical inbox predicate decides whether
+    they really belong in the inbox. If the bounded candidate page is filled
+    with false positives, the full metric scan may find a real inbox item
+    later. The response must page from that materialized full scan instead of
+    returning ``total: 1`` with ``items: []``.
+    """
+    from pollypm.work.models import WorkStatus
+
+    false_positives = [
+        _ReadInboxTask(i, title=f"Blocked non-inbox {i}", status=WorkStatus.BLOCKED)
+        for i in range(1, 12)
+    ]
+    for task in false_positives:
+        task.roles = {}
+        task.current_node_id = None
+    visible = _ReadInboxTask(30, title="Visible inbox item")
+    svc = _ReadInboxSvc([*false_positives, visible])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get(
+        "/api/v1/inbox?project=myproj&limit=10",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["myproj/30"]
+    assert body["total"] == 1
+    assert body["unread_count"] == 1
+    assert body["has_more"] is False
+    assert svc.list_tasks_calls == 0
+
+
 def test_inbox_detail_messages_include_reply_context(
     client, auth_headers, monkeypatch,
 ) -> None:

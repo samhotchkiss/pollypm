@@ -2572,6 +2572,12 @@
     return parseTaskKey(item.task_id || metadata.task_id || item.id || "");
   }
 
+  function isBlockedCancelledHandoff(item) {
+    const metadata = item && item.metadata && typeof item.metadata === "object"
+      ? item.metadata : {};
+    return Boolean(metadata.blocked_cancelled_handoff);
+  }
+
   function disabledInboxAction(label, title) {
     const btn = el("button", {
       class: "inbox-action disabled",
@@ -2831,10 +2837,13 @@
         ]),
         el("div", { class: "inbox-thread-body", text: msg.body || "" }),
       ]));
+    const resolvesCancelledHandoff = isBlockedCancelledHandoff(detail);
     const reply = el("textarea", {
       class: "inbox-reply-input",
       rows: "3",
-      placeholder: "Reply...",
+      placeholder: resolvesCancelledHandoff
+        ? "Answer the handoff inputs..."
+        : "Reply...",
       "aria-label": "Reply to inbox item",
     });
     reply.value = state.inbox.replyDraft || "";
@@ -2844,14 +2853,16 @@
     const send = el("button", {
       class: "inbox-filter-button primary",
       type: "submit",
-      text: "Reply",
+      text: resolvesCancelledHandoff ? "Answer and unblock" : "Reply",
     });
     const actionKey = detail.id + ":reply";
     send.disabled = Boolean(state.inbox.actionInFlight[actionKey]);
     const form = el("form", { class: "inbox-reply-form" }, [reply, send]);
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
-      replyInboxItem(detail, reply.value || "");
+      replyInboxItem(detail, reply.value || "", {
+        clearSelection: resolvesCancelledHandoff,
+      });
     });
     const decisionActions = [];
     if (detail.type === "plan_review") {
@@ -2974,18 +2985,23 @@
     );
   }
 
-  async function replyInboxItem(item, body) {
+  async function replyInboxItem(item, body, options) {
     const text = String(body || "").trim();
     if (!text) return;
+    const clearSelection = Boolean(options && options.clearSelection);
     const ok = await runInboxAction(
       item,
       "reply",
       "/reply",
       { body: text, owner: OPERATOR_ACTOR },
-      {},
+      { clearSelection },
     );
     if (ok) {
       state.inbox.replyDraft = "";
+      showToast(
+        "ok",
+        clearSelection ? "answer recorded; dependency cleared" : "reply sent",
+      );
       renderInboxView();
     }
   }

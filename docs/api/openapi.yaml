@@ -2028,6 +2028,11 @@ paths:
       tags: [Inbox]
       operationId: replyInboxItem
       summary: Append a reply to an inbox thread
+      description: >
+        Appends a reply to a normal inbox thread. For inbox items whose
+        metadata has `blocked_cancelled_handoff=true`, records the reply on
+        the cancelled handoff task and clears that blocker edge through the
+        work-service dependency facade.
       requestBody:
         required: true
         content:
@@ -2036,7 +2041,7 @@ paths:
               $ref: "#/components/schemas/InboxReplyRequest"
       responses:
         "200":
-          description: Reply appended; returns the updated task detail.
+          description: Reply appended or handoff answer recorded; returns the updated task detail.
           content:
             application/json:
               schema:

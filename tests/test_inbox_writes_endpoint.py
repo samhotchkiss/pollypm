@@ -1243,18 +1243,21 @@ def test_membership_helper_matches_canonical_inbox_predicate() -> None:
     ``"plan_review" in lbl`` widening is what Codex round-5 caught.
     """
     from pollypm.web_api.service import _is_inbox_member
+    from pollypm.work.models import WorkStatus
 
     class _ChatWithUserRole:
         flow_template_id = "chat"
         labels: list[str] = []
         roles = {"requester": "user"}
         current_node_id = None
+        work_status = WorkStatus.IN_PROGRESS
 
     class _PlanReviewLabel:
         flow_template_id = "standard"
         labels = ["plan_review"]
         roles: dict = {}
         current_node_id = None
+        work_status = WorkStatus.IN_PROGRESS
 
     class _ChatNoUserRole:
         # Chat-flow but no user role + no current node — would have
@@ -1264,6 +1267,7 @@ def test_membership_helper_matches_canonical_inbox_predicate() -> None:
         labels: list[str] = []
         roles: dict = {}
         current_node_id = None
+        work_status = WorkStatus.IN_PROGRESS
 
     class _NearMissPlanLabel:
         # Substring would have matched the old helper; canonical
@@ -1272,12 +1276,14 @@ def test_membership_helper_matches_canonical_inbox_predicate() -> None:
         labels = ["not_plan_review"]
         roles: dict = {}
         current_node_id = None
+        work_status = WorkStatus.IN_PROGRESS
 
     class _NonInbox:
         flow_template_id = "standard"
         labels: list[str] = []
         roles: dict = {}
         current_node_id = None
+        work_status = WorkStatus.IN_PROGRESS
 
     assert _is_inbox_member(_ChatWithUserRole()) is True
     assert _is_inbox_member(_PlanReviewLabel()) is True
@@ -2205,6 +2211,184 @@ def _install_read_inbox_svc(monkeypatch, svc: _ReadInboxSvc) -> None:
     monkeypatch.setattr(
         "pollypm.work.factory.create_work_service", fake_factory,
     )
+
+
+def _blocked_cancelled_handoff_tasks(handoff_body: str):
+    from pollypm.work.models import Priority, Task, TaskType, WorkStatus
+
+    now = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
+    blocker = Task(
+        project="myproj",
+        task_number=26,
+        title="Samblog Phase 0 needs your inputs",
+        type=TaskType.TASK,
+        work_status=WorkStatus.CANCELLED,
+        priority=Priority.HIGH,
+        flow_template_id="chat",
+        current_node_id=None,
+        roles={"requester": "user", "operator": "user"},
+        description=handoff_body,
+        created_at=now,
+        updated_at=now,
+        created_by="pm",
+    )
+    target = Task(
+        project="myproj",
+        task_number=30,
+        title="Execute SamBlog Phase 0 live MCP smoke test",
+        type=TaskType.TASK,
+        work_status=WorkStatus.BLOCKED,
+        priority=Priority.HIGH,
+        flow_template_id="chat",
+        current_node_id=None,
+        roles={},
+        description=(
+            "Run the smoke test once the operator provides the inputs."
+        ),
+        blocked_by=[("myproj", 26)],
+        created_at=now,
+        updated_at=now,
+        created_by="pm",
+    )
+    return blocker, target
+
+
+def test_list_inbox_reframes_blocked_cancelled_handoff(
+    client, auth_headers, monkeypatch,
+) -> None:
+    handoff_body = (
+        "1. WP core + PHP version on sam.blog\n"
+        "2. Greenlight cloning sam.blog to staging\n"
+        "3. Greenlight installing mcp-adapter on staging "
+        "(+ abilities-api if WP < 6.9)\n"
+        "4. Create a polly-mcp editor user + Application Password named "
+        "`mcp-adapter-phase-0`, delivered via 1Password\n"
+        "5. Confirm whether to repeat the smoke test on prod"
+    )
+    blocker, target = _blocked_cancelled_handoff_tasks(handoff_body)
+    svc = _ReadInboxSvc([blocker, target])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get("/api/v1/inbox?project=myproj", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["myproj/30"]
+    item = body["items"][0]
+    assert item["subject"] == "Provide inputs to unblock Samblog Phase 0"
+    assert item["preview"] == handoff_body
+    assert "`mcp-adapter-phase-0`" in item["preview"]
+    assert "abilities-api if WP < 6.9" in item["preview"]
+    assert item["metadata"]["blocked_cancelled_handoff"] is True
+    assert item["metadata"]["cancelled_handoff_task_id"] == "myproj/26"
+    assert item["metadata"]["blocked_task_subject"] == (
+        "Execute SamBlog Phase 0 live MCP smoke test"
+    )
+
+
+class _ResolveCancelledHandoffSvc:
+    def __init__(self, blocker, target) -> None:
+        self.tasks = {blocker.task_id: blocker, target.task_id: target}
+        self.reply_calls: list[tuple[str, str, str]] = []
+        self.context_calls: list[tuple[str, str, str, str]] = []
+        self.unlink_calls: list[tuple[str, str, str]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, task_id):
+        from pollypm.work.service_support import TaskNotFoundError
+
+        try:
+            return self.tasks[task_id]
+        except KeyError as exc:
+            raise TaskNotFoundError(task_id) from exc
+
+    def get_flow(self, name, project=None):
+        return None
+
+    def add_reply(self, task_id, body, actor="user"):
+        from pollypm.work.models import ContextEntry
+
+        entry = ContextEntry(
+            actor=actor,
+            timestamp=datetime(2026, 6, 2, 12, 5, tzinfo=timezone.utc),
+            text=body.strip(),
+            entry_type="reply",
+        )
+        self.tasks[task_id].context.append(entry)
+        self.reply_calls.append((task_id, actor, body.strip()))
+        return entry
+
+    def add_context(self, task_id, actor, text, *, entry_type="note"):
+        from pollypm.work.models import ContextEntry
+
+        entry = ContextEntry(
+            actor=actor,
+            timestamp=datetime(2026, 6, 2, 12, 6, tzinfo=timezone.utc),
+            text=text,
+            entry_type=entry_type,
+        )
+        self.tasks[task_id].context.append(entry)
+        self.context_calls.append((task_id, actor, text, entry_type))
+        return entry
+
+    def unlink(self, from_id, to_id, kind):
+        from pollypm.work.models import WorkStatus
+
+        self.unlink_calls.append((from_id, to_id, kind))
+        blocker = self.tasks[from_id]
+        target = self.tasks[to_id]
+        ref = (blocker.project, blocker.task_number)
+        target.blocked_by = [value for value in target.blocked_by if value != ref]
+        if kind == "blocks" and target.work_status is WorkStatus.BLOCKED:
+            if not target.blocked_by:
+                target.work_status = WorkStatus.QUEUED
+
+
+def test_reply_to_blocked_cancelled_handoff_records_answer_and_unblocks(
+    config, monkeypatch,
+) -> None:
+    from pollypm.web_api import service as web_service
+
+    blocker, target = _blocked_cancelled_handoff_tasks("1. Provide staging OK")
+    svc = _ResolveCancelledHandoffSvc(blocker, target)
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+
+    detail = web_service.reply_inbox_item(
+        config,
+        "myproj/30",
+        body="WP 6.8, staging OK, password in 1Password",
+        owner="operator",
+    )
+
+    assert svc.reply_calls == [
+        (
+            "myproj/26",
+            "operator",
+            "WP 6.8, staging OK, password in 1Password",
+        )
+    ]
+    assert svc.unlink_calls == [("myproj/26", "myproj/30", "blocks")]
+    assert svc.context_calls == [
+        (
+            "myproj/30",
+            "operator",
+            "operator answered cancelled handoff myproj/26; dependency cleared",
+            "note",
+        )
+    ]
+    assert detail.work_status == "queued"
+    assert detail.relationships.blocked_by == []
 
 
 def test_list_inbox_state_closed_returns_archived_task(

@@ -458,6 +458,13 @@ as `approval_request` / `manual_decision`), `state` (`open`, `threaded`,
 `updated_at`, `thread_id` (nullable), `metadata` (sidecar labels),
 `messages` (`InboxMessage[]`, only on detail).
 
+When a non-terminal task is blocked by a cancelled inbox handoff,
+the item may carry `metadata.blocked_cancelled_handoff=true` plus
+`cancelled_handoff_task_id`. In that case `subject` is reframed as the
+operator's unblock action and `preview` contains the cancelled handoff
+body so the original ask remains visible even though the blocker is
+terminal.
+
 ### Event
 
 A single audit-log line. Mirrors `pollypm.audit.log.AuditEvent`.
@@ -500,7 +507,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | PATCH  | `/api/v1/tasks/{project}/{n}` | Partial update of mutable fields. Body accepts ONLY `labels` / `metadata` / `status` (extras like `priority` or role assignments → `422` from request validation; use `/claim` and `/reassign` for ownership changes). `status` is routed to `svc.queue`/`svc.cancel` (other statuses → 422); `labels` / `metadata` flow through `svc.update`. Status MUST NOT be combined with other fields in one body (`400 invalid_request` if both present — use separate requests). An all-`null` / empty body is rejected with `400 invalid_request` |
 | GET    | `/api/v1/inbox` | List inbox items (`?project=&type=&state=&limit=&cursor=`) |
 | GET    | `/api/v1/inbox/{id}` | Inbox item detail (with full thread messages) |
-| POST   | `/api/v1/inbox/{id}/reply` | Reply to a thread |
+| POST   | `/api/v1/inbox/{id}/reply` | Reply to a thread. For `metadata.blocked_cancelled_handoff=true` items, records the reply on the cancelled handoff and clears that blocker edge through the work-service dependency facade |
 | POST   | `/api/v1/inbox/{id}/archive` | Archive (close) the item |
 | GET    | `/api/v1/events` | SSE stream of audit-log events (`?since=&project=&event=`) |
 | GET    | `/api/v1/chat/sessions` | Discover every chat surface (operator/architect/advisor/worker) |

@@ -406,6 +406,156 @@ def test_activity_endpoint_keeps_cross_project_signal_when_one_project_is_noisy(
     assert "otherproj/1" in subjects
 
 
+def test_activity_endpoint_hides_low_signal_plumbing_by_default(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Default activity hides plumbing while keeping recovery/watchdog signal."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(
+                event="work_db.opened",
+                actor="postgres",
+                ts=(now - timedelta(seconds=1)).isoformat(),
+            ),
+            _make_event(
+                event="session.pause.skip",
+                actor="heartbeat",
+                ts=(now - timedelta(seconds=2)).isoformat(),
+            ),
+            _make_event(
+                event="task.created",
+                subject="myproj/1",
+                ts=(now - timedelta(seconds=3)).isoformat(),
+            ),
+            _make_event(
+                event="audit.finding",
+                status="warn",
+                ts=(now - timedelta(seconds=4)).isoformat(),
+            ),
+            _make_event(
+                event="watchdog.operator_dispatched",
+                actor="audit_watchdog",
+                ts=(now - timedelta(seconds=5)).isoformat(),
+            ),
+            _make_event(
+                event="recovery.spawn",
+                actor="supervisor",
+                ts=(now - timedelta(seconds=6)).isoformat(),
+            ),
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={"project": "myproj", "since": "24h", "limit": 10},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    event_names = [e["event"] for e in response.json()["events"]]
+    assert "work_db.opened" not in event_names
+    assert "session.pause.skip" not in event_names
+    assert event_names == [
+        "task.created",
+        "audit.finding",
+        "watchdog.operator_dispatched",
+        "recovery.spawn",
+    ]
+
+
+def test_activity_endpoint_can_include_low_signal_plumbing(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Explicit raw-feed requests can still inspect low-signal rows."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(
+                event="work_db.opened",
+                actor="postgres",
+                ts=(now - timedelta(seconds=1)).isoformat(),
+            ),
+            _make_event(
+                event="task.created",
+                subject="myproj/1",
+                ts=(now - timedelta(seconds=2)).isoformat(),
+            ),
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={
+            "project": "myproj",
+            "since": "24h",
+            "limit": 10,
+            "include_low_signal": "1",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert [e["event"] for e in response.json()["events"]] == [
+        "work_db.opened",
+        "task.created",
+    ]
+
+
+def test_activity_endpoint_pattern_search_includes_low_signal_rows(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Searching for a plumbing event is an explicit request to see it."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(
+                event="work_db.opened",
+                actor="postgres",
+                ts=now.isoformat(),
+            )
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={
+            "project": "myproj",
+            "since": "24h",
+            "limit": 10,
+            "pattern": "work_db.opened",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert [e["event"] for e in response.json()["events"]] == ["work_db.opened"]
+
+
+def test_activity_low_signal_definition_is_shared_by_web_and_tui() -> None:
+    """The web route and cockpit feed import the same low-signal kind set."""
+    from pollypm import cockpit_activity
+    from pollypm.activity_low_signal import LOW_SIGNAL_ACTIVITY_KINDS
+    from pollypm.web_api.routes import activity
+
+    assert cockpit_activity._LOW_SIGNAL_ACTIVITY_KINDS is LOW_SIGNAL_ACTIVITY_KINDS
+    assert activity._LOW_SIGNAL_ACTIVITY_KINDS is LOW_SIGNAL_ACTIVITY_KINDS
+    assert "work_db.opened" in LOW_SIGNAL_ACTIVITY_KINDS
+    assert "session.pause.skip" in LOW_SIGNAL_ACTIVITY_KINDS
+
+
 def test_grep_regex_pattern_filters_lines(
     client: TestClient,
     auth_headers: dict[str, str],

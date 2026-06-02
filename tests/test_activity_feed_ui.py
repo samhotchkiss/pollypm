@@ -207,6 +207,41 @@ def test_default_activity_hides_low_signal_heartbeat_noise(
     _run(body())
 
 
+def test_default_activity_hides_work_db_and_pause_skip_plumbing(
+    activity_env, activity_app,
+) -> None:
+    """DB-open and pause-skip breadcrumbs are loaded but hidden by default."""
+    async def body() -> None:
+        entries = [
+            _make_entry(entry_id="evt:real", kind="task.done", verb="done"),
+            _make_entry(
+                entry_id="evt:db",
+                kind="work_db.opened",
+                actor="postgres",
+                verb="work_db.opened",
+                summary="work_db.opened",
+            ),
+            _make_entry(
+                entry_id="evt:pause",
+                kind="session.pause.skip",
+                actor="heartbeat",
+                verb="session.pause.skip",
+                summary="session.pause.skip",
+            ),
+        ]
+        activity_app._gather = lambda: entries  # type: ignore[method-assign]
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            assert activity_app.table.row_count == 1
+            assert "2 system noise hidden" in str(activity_app.counters.render())
+
+            await pilot.press("N")
+            await pilot.pause()
+            assert activity_app.table.row_count == 3
+
+    _run(body())
+
+
 def test_default_activity_hides_internal_scheduler_churn(
     activity_env, activity_app,
 ) -> None:

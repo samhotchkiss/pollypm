@@ -11,8 +11,12 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
+from pollypm.activity_low_signal import (
+    LOW_SIGNAL_ACTIVITY_KINDS as _LOW_SIGNAL_ACTIVITY_KINDS,
+    is_low_signal_activity,
+)
 from pollypm.audit.query import iter_recent_matching_events, resolve_target_files
-from pollypm.recovery.narration import summarize_audit_event
+from pollypm.recovery.narration import is_recovery_event, summarize_audit_event
 from pollypm.web_api.models import Event
 from pollypm.web_api.routes._deps import ConfigDep
 from pollypm.web_api.routes.audit import (
@@ -91,6 +95,15 @@ def activity_endpoint(
     safe_regex: Annotated[bool, Query()] = False,
     limit: Annotated[int, Query(ge=1, le=_GREP_LIMIT_MAX)] = _GREP_LIMIT_DEFAULT,
     deadline_seconds: Annotated[float, Query(ge=0.5, le=60.0)] = 5.0,
+    include_low_signal: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include low-signal plumbing rows such as work_db.opened. "
+                "Explicit event_type or pattern searches include them too."
+            )
+        ),
+    ] = False,
 ) -> ActivityResponse:
     """Return audit events shaped for the dashboard activity rail."""
 
@@ -129,6 +142,9 @@ def activity_endpoint(
             candidates,
             limit=limit,
             project_filter=project,
+            include_low_signal=(
+                include_low_signal or bool(event_type) or bool(pattern)
+            ),
         ),
         next_cursor=None,
         _malformed_rows_skipped=(
@@ -165,10 +181,16 @@ def _compose_activity_feed(
     *,
     limit: int,
     project_filter: str | None,
+    include_low_signal: bool = False,
 ) -> list[ActivityEvent]:
     deduped: list[Event] = []
     seen: set[tuple[str, str, str, str, str, str, str]] = set()
     for event in events:
+        if not _should_include_activity_event(
+            event,
+            include_low_signal=include_low_signal,
+        ):
+            continue
         identity = _activity_event_identity(event)
         if identity in seen:
             continue
@@ -205,6 +227,26 @@ def _compose_activity_feed(
         project_filter=project_filter,
     )
     return entries[:limit]
+
+
+def _should_include_activity_event(
+    event: Event,
+    *,
+    include_low_signal: bool,
+) -> bool:
+    if include_low_signal:
+        return True
+    if is_recovery_event(event.event):
+        return True
+    if event.event == "audit.finding" or event.event.startswith("watchdog."):
+        return True
+    if event.event.strip().lower() in _LOW_SIGNAL_ACTIVITY_KINDS:
+        return False
+    return not is_low_signal_activity(
+        kind=event.event,
+        actor=event.actor,
+        summary=event.subject,
+    )
 
 
 def _activity_event_identity(
@@ -266,8 +308,6 @@ def _activity_event_from_group(group: _ActivityGroup) -> ActivityEvent:
             project=event.project,
             metadata=event.metadata or {},
         )
-    from pollypm.recovery.narration import is_recovery_event
-
     data["recovery"] = is_recovery_event(event.event)
     return ActivityEvent.model_validate(data)
 
@@ -343,8 +383,6 @@ def _apply_project_share_cap(
 
 
 def _activity_event_from_audit_event(event: Event) -> ActivityEvent:
-    from pollypm.recovery.narration import is_recovery_event
-
     data: dict[str, Any] = event.model_dump(by_alias=True)
     data["summary"] = summarize_audit_event(
         event_name=event.event,

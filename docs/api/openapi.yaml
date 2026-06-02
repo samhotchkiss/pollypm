@@ -2926,7 +2926,10 @@ paths:
         but each row includes a `summary` sentence; recovery/self-heal
         events such as `recovery.spawn` and
         `watchdog.escalation_dispatched` are rendered from structured
-        metadata into calm operator-facing prose.
+        metadata into calm operator-facing prose. Low-signal plumbing
+        events are hidden by default, but remain available through
+        `include_low_signal=true` or explicit `event_type`/`pattern`
+        searches.
       parameters:
         - in: query
           name: project
@@ -2951,6 +2954,12 @@ paths:
           schema:
             type: boolean
             default: false
+        - in: query
+          name: include_low_signal
+          schema:
+            type: boolean
+            default: false
+          description: Include low-signal plumbing rows such as `work_db.opened`.
         - in: query
           name: limit
           schema:

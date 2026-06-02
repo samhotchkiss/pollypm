@@ -24,6 +24,11 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import DataTable, Input, Static
 
+from pollypm.activity_low_signal import (
+    LOW_SIGNAL_ACTIVITY_KINDS as _LOW_SIGNAL_ACTIVITY_KINDS,
+    LOW_SIGNAL_EMPTY_ACTIVITY_KINDS as _LOW_SIGNAL_EMPTY_ACTIVITY_KINDS,
+    is_low_signal_activity as _shared_is_low_signal_activity,
+)
 from pollypm.cockpit_alerts import _action_view_alerts
 from pollypm.cockpit_palette import _open_keyboard_help
 from pollypm.cockpit_theme import State
@@ -146,46 +151,17 @@ def _entry_search_haystack(entry) -> str:
     return " ".join(bit for bit in bits if bit).lower()
 
 
-_LOW_SIGNAL_ACTIVITY_KINDS = frozenset({
-    "heartbeat",
-    "lease",
-    "lease_override",
-    "scheduled",
-    "token_ledger",
-})
-_LOW_SIGNAL_EMPTY_ACTIVITY_KINDS = frozenset({"launch"})
-
-
-def _summary_has_content(entry) -> bool:
-    summary = (getattr(entry, "summary", "") or "").strip().lower()
-    if not summary:
-        return False
-    kind = (getattr(entry, "kind", "") or "").strip().lower()
-    verb = (getattr(entry, "verb", "") or "").strip().lower()
-    actor = (getattr(entry, "actor", "") or "").strip().lower()
-    return summary not in {kind, verb, actor, f"{kind} on {actor}"}
-
-
 def _is_low_signal_activity(entry) -> bool:
-    kind = (getattr(entry, "kind", "") or "").lower()
-    verb = (getattr(entry, "verb", "") or "").lower()
-    if kind in _LOW_SIGNAL_ACTIVITY_KINDS or verb in _LOW_SIGNAL_ACTIVITY_KINDS:
-        return True
-    actor = (getattr(entry, "actor", "") or "").lower()
-    if (
-        actor in {"operator", "scheduler"}
-        and (
-            kind in _LOW_SIGNAL_EMPTY_ACTIVITY_KINDS
-            or verb in _LOW_SIGNAL_EMPTY_ACTIVITY_KINDS
-        )
-        and not _summary_has_content(entry)
-    ):
-        return True
-    return False
+    return _shared_is_low_signal_activity(
+        kind=getattr(entry, "kind", ""),
+        verb=getattr(entry, "verb", ""),
+        actor=getattr(entry, "actor", ""),
+        summary=getattr(entry, "summary", ""),
+    )
 
 
 def _is_noise_type_filter(kind: str | None) -> bool:
-    lowered = (kind or "").lower()
+    lowered = (kind or "").strip().lower()
     return (
         lowered in _LOW_SIGNAL_ACTIVITY_KINDS
         or lowered in _LOW_SIGNAL_EMPTY_ACTIVITY_KINDS

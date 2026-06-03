@@ -774,6 +774,20 @@
     return blocked + review + inbox + plan;
   }
 
+  function projectTriageText(attentionTotal, attentionProjects) {
+    if (attentionTotal <= 0) return "All projects clear";
+    const projectCount = attentionProjects.length;
+    const scope = projectCount === 1
+      ? " in 1 project"
+      : " across " + projectCount + " projects";
+    const names = attentionProjects.slice(0, 3).map((project) => (
+      project.name || project.key
+    )).join(", ");
+    return attentionTotal + " " + plural(attentionTotal, "project status flag")
+      + scope
+      + (names ? " - " + names : "");
+  }
+
   function formatShortTime(value) {
     const parsed = Date.parse(value);
     if (!Number.isFinite(parsed)) return String(value || "");
@@ -867,13 +881,7 @@
       (sum, project) => sum + projectAttentionCount(project),
       0,
     );
-    const triageText = attentionTotal > 0
-      ? attentionTotal + " " + plural(attentionTotal, "item")
-        + (attentionTotal === 1 ? " needs you - " : " need you - ")
-        + attentionProjects.slice(0, 3).map((project) => (
-          project.name || project.key
-        )).join(", ")
-      : "All handled - nothing needs you";
+    const triageText = projectTriageText(attentionTotal, attentionProjects);
     const triage = el("li", {
       class: "project-triage " + (attentionTotal > 0 ? "attention" : "clear"),
     }, [

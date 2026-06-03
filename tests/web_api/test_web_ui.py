@@ -1572,6 +1572,7 @@ function makeNode(tag) {
 const elements = {
   "dashboard-rollups": makeNode("div"),
   "surface-list": makeNode("ul"),
+  "project-list": makeNode("ul"),
   "message-list": makeNode("div"),
   "send-input": makeNode("input"),
   "send-button": makeNode("button"),
@@ -1606,12 +1607,15 @@ eval(source);
 
 global.window.PollyPM.state.surfaces = payload.surfaces || [];
 global.window.PollyPM.state.taskSurfaces = payload.tasks || [];
+global.window.PollyPM.state.projects = payload.projects || [];
 global.window.PollyPM.renderSurfaces();
+global.window.PollyPM.renderProjects();
 if (payload.selectTask) {
   global.window.PollyPM.selectTask(payload.selectTask);
 }
 process.stdout.write(JSON.stringify({
   rail: elements["surface-list"].innerHTML,
+  projectRail: elements["project-list"].innerHTML,
   title: elements["pane-title"].textContent,
   meta: elements["pane-meta"].textContent,
   messages: elements["message-list"].innerHTML,
@@ -1632,6 +1636,33 @@ process.stdout.write(JSON.stringify({
             f"STDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
         )
     return json.loads(proc.stdout)
+
+
+def test_project_rail_triage_is_status_not_needs_you_alarm() -> None:
+    rendered = _node_render_surface_rail({
+        "projects": [
+            {
+                "key": "polly-remote",
+                "name": "polly-remote",
+                "tracked": True,
+                "task_counts": {"blocked": 9},
+            },
+            {
+                "key": "SamBlog",
+                "name": "SamBlog",
+                "tracked": True,
+                "open_inbox_count": 1,
+                "pending_plan_review": True,
+                "task_counts": {"blocked": 6},
+            },
+        ],
+    })
+    rail = rendered["projectRail"]
+    assert "17 project status flags across 2 projects" in rail
+    assert "polly-remote" in rail
+    assert "SamBlog" in rail
+    assert "needs you" not in rail
+    assert "need you" not in rail
 
 
 def test_render_surface_rail_groups_chat_and_task_surfaces() -> None:

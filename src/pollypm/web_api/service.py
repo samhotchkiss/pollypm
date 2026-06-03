@@ -35,6 +35,8 @@ from pollypm.models import KnownProject
 from pollypm.notify_task import is_notify_only_inbox_entry
 from pollypm.work import inbox_snooze as _inbox_snooze
 from pollypm.work.inbox_view import (
+    cancelled_handoff_blocker_for_task,
+    cancelled_handoff_unblock_subject,
     inbox_item_type_for_task,
     inbox_state_for_task,
     inbox_task_matches_type,
@@ -3288,7 +3290,7 @@ def reply_inbox_item(
             if not is_inbox_task(src_task, svc):
                 raise not_found(f"Inbox item not found: {item_id}")
             try:
-                cancelled_handoff = _cancelled_handoff_blocker_for_task(
+                cancelled_handoff = cancelled_handoff_blocker_for_task(
                     src_task, svc, flow_cache={},
                 )
                 if cancelled_handoff is None:
@@ -4616,12 +4618,12 @@ def _task_to_inbox_item(
         )
         if value:
             metadata[key] = value
-    cancelled_handoff = _cancelled_handoff_blocker_for_task(
+    cancelled_handoff = cancelled_handoff_blocker_for_task(
         task, svc, flow_cache=flow_cache or {},
     )
     if cancelled_handoff is not None:
         blocker_id = str(getattr(cancelled_handoff, "task_id"))
-        subject = _cancelled_handoff_unblock_subject(task, cancelled_handoff)
+        subject = cancelled_handoff_unblock_subject(task, cancelled_handoff)
         handoff_body = str(
             getattr(cancelled_handoff, "description", "") or ""
         ).strip()
@@ -4649,65 +4651,6 @@ def _task_to_inbox_item(
         updated_at=task.updated_at or task.created_at or datetime.utcnow(),
         metadata=metadata,
     )
-
-
-def _cancelled_handoff_unblock_subject(task, blocker) -> str:
-    blocker_title = str(getattr(blocker, "title", "") or "").strip()
-    match = re.match(
-        r"^(?P<target>.+?)\s+needs\s+your\s+inputs?\.?$",
-        blocker_title,
-        flags=re.IGNORECASE,
-    )
-    if match is not None:
-        target = match.group("target").strip()
-    else:
-        target = str(getattr(task, "title", "") or "").strip()
-    if target:
-        return f"Provide inputs to unblock {target}"
-    return "Provide inputs to unblock this task"
-
-
-def _cancelled_handoff_blocker_for_task(
-    task,
-    svc=None,
-    *,
-    flow_cache: dict[tuple[str, int], Any],
-):
-    status = getattr(getattr(task, "work_status", None), "value", None)
-    status = status or str(getattr(task, "work_status", "") or "")
-    if status != WorkStatus.BLOCKED.value:
-        return None
-    if svc is None:
-        return None
-    get_task = getattr(svc, "get", None)
-    if not callable(get_task):
-        return None
-    for ref in getattr(task, "blocked_by", None) or []:
-        try:
-            project, number = ref
-            blocker_id = f"{project}/{int(number)}"
-        except (TypeError, ValueError):
-            continue
-        try:
-            blocker = get_task(blocker_id)
-        except Exception:  # noqa: BLE001 - readonly surfacing degrades open
-            logger.debug(
-                "inbox: cancelled handoff lookup failed for %s",
-                blocker_id,
-                exc_info=True,
-            )
-            continue
-        blocker_status = getattr(
-            getattr(blocker, "work_status", None), "value", None,
-        )
-        blocker_status = blocker_status or str(
-            getattr(blocker, "work_status", "") or ""
-        )
-        if blocker_status != WorkStatus.CANCELLED.value:
-            continue
-        if is_inbox_task_identity(blocker, svc, flow_cache=flow_cache):
-            return blocker
-    return None
 
 
 def _inbox_state_from_task(task) -> str:

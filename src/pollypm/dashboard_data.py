@@ -175,6 +175,7 @@ class InboxPreview:
     task_id: str
     age_seconds: float
     project_key: str | None = None
+    allow_dormant_briefing: bool = False
 
 
 @dataclass(slots=True)
@@ -1007,7 +1008,7 @@ def _first_briefing_message(
         if _project_is_live_for_briefing(
             _briefing_message_project_key(message),
             recent_real_work_projects,
-        ):
+        ) or bool(getattr(message, "allow_dormant_briefing", False)):
             return message
     return None
 
@@ -1131,6 +1132,18 @@ def _strain_note(
     return "Health note: " + "; ".join(notes) + "."
 
 
+def _briefing_greeting(generated_at: datetime | None = None) -> str:
+    clock = generated_at or datetime.now(UTC)
+    hour = int(getattr(clock, "hour", 0) or 0)
+    if 5 <= hour < 12:
+        return "Morning. Here's the overnight read."
+    if 12 <= hour < 17:
+        return "Afternoon. Here's where things stand."
+    if 17 <= hour < 24:
+        return "Evening. Here's where things stand."
+    return "Morning. Here's where things stand."
+
+
 def _build_dashboard_briefing(
     *,
     commits: list[CommitInfo],
@@ -1141,10 +1154,11 @@ def _build_dashboard_briefing(
     recovery_summaries: list[str] | None = None,
     recent_real_work_projects: frozenset[str] | None = None,
     account_usages: list[AccountQuotaUsage] | None = None,
+    generated_at: datetime | None = None,
 ) -> str:
     """Build the concise Home briefing from already-gathered dashboard facts."""
 
-    lines: list[str] = ["Morning. Here's the overnight read."]
+    lines: list[str] = [_briefing_greeting(generated_at)]
     if completed:
         lines.append(
             "Shipped: "
@@ -1390,6 +1404,10 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         inbox_tasks_grouped,
     )
     from pollypm.notify_task import is_notify_only_inbox_entry
+    from pollypm.work.inbox_view import (
+        cancelled_handoff_blocker_for_task,
+        cancelled_handoff_unblock_subject,
+    )
 
     now = datetime.now(UTC)
     seen_task_ids: set[str] = set()
@@ -1412,6 +1430,34 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
     pg_grouped = inbox_tasks_grouped(config)
     if pg_grouped is None:
         return []
+    handoff_svc: object | None = None
+    handoff_flow_cache: dict[tuple[str, int], object] = {}
+
+    def _handoff_subject(task: object) -> str | None:
+        nonlocal handoff_svc
+        status = getattr(getattr(task, "work_status", None), "value", None)
+        status = status or str(getattr(task, "work_status", "") or "")
+        if status != "blocked" or not getattr(task, "blocked_by", None):
+            return None
+        if handoff_svc is None:
+            try:
+                from pollypm.work.pg_service import PgWorkService
+
+                handoff_svc = PgWorkService(config=config)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "dashboard_data: cancelled handoff preview lookup unavailable",
+                    exc_info=True,
+                )
+                return None
+        blocker = cancelled_handoff_blocker_for_task(
+            task,
+            handoff_svc,
+            flow_cache=handoff_flow_cache,  # type: ignore[arg-type]
+        )
+        if blocker is None:
+            return None
+        return cancelled_handoff_unblock_subject(task, blocker)
 
     def _emit_preview(
         task: object,
@@ -1434,24 +1480,38 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
                 )
             except (ValueError, TypeError):
                 age_seconds = 0.0
+        handoff_subject = _handoff_subject(task)
         previews.append(
             InboxPreview(
                 sender=_inbox_sender(task),
-                title=(getattr(task, "title", "") or "(untitled)")[:80],
+                title=(
+                    handoff_subject
+                    or getattr(task, "title", "")
+                    or "(untitled)"
+                )[:80],
                 project=project_label,
                 task_id=task.task_id,
                 age_seconds=age_seconds,
                 project_key=project_key,
+                allow_dormant_briefing=handoff_subject is not None,
             )
         )
 
     # Single in-memory partition + emit; no per-source DB opens.
-    for project_key, project_label, _db_path, _project_path in sources:
-        if not project_key:
-            # workspace-root source has no task rows under pg.
-            continue
-        for task in inbox_tasks_for_project(pg_grouped, config, project_key):
-            _emit_preview(task, project_label, project_key)
+    try:
+        for project_key, project_label, _db_path, _project_path in sources:
+            if not project_key:
+                # workspace-root source has no task rows under pg.
+                continue
+            for task in inbox_tasks_for_project(pg_grouped, config, project_key):
+                _emit_preview(task, project_label, project_key)
+    finally:
+        close = getattr(handoff_svc, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                pass
     previews.sort(key=lambda item: item.age_seconds)
     return previews[:limit]
 
@@ -1801,6 +1861,17 @@ def gather(
         user_waiting_task_ids=user_waiting,
         project_task_facts=project_task_facts,
     )
+    briefing_generated_at = now
+    try:
+        from pollypm.tz import get_timezone
+
+        config_tz = getattr(getattr(config, "pollypm", None), "timezone", "") or ""
+        briefing_generated_at = now.astimezone(get_timezone(config_tz))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "dashboard_data.gather: local briefing clock resolution failed",
+            exc_info=True,
+        )
     briefing = _build_dashboard_briefing(
         commits=commits,
         completed=completed,
@@ -1810,6 +1881,7 @@ def gather(
         recovery_summaries=recovery_summaries,
         recent_real_work_projects=recent_real_work_projects,
         account_usages=account_usages,
+        generated_at=briefing_generated_at,
     )
 
     return DashboardData(

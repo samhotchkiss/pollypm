@@ -1200,6 +1200,36 @@
     return count === 1 ? singular : (pluralText || singular + "s");
   }
 
+  function dashboardProjectLabel(data) {
+    const projects = data && Array.isArray(data.projects) ? data.projects : [];
+    const project = projects.length === 1 ? projects[0] : null;
+    if (!project) return state.selectedProject || "Project";
+    return project.name || project.key || state.selectedProject || "Project";
+  }
+
+  function firstProjectAlert(data) {
+    const alerts = data && Array.isArray(data.project_alerts)
+      ? data.project_alerts : [];
+    return alerts.length > 0 ? alerts[0] : null;
+  }
+
+  function projectAlertHeadline(data, alerts) {
+    const project = dashboardProjectLabel(data);
+    const firstAlert = firstProjectAlert(data);
+    const title = firstAlert && firstAlert.alert_type === "plan_missing"
+      ? project + " is waiting on a plan"
+      : project + " needs attention";
+    const detail = firstAlert && firstAlert.message
+      ? firstAlert.message
+      : alerts + " project " + plural(alerts, "alert") + " waiting.";
+    return {
+      title: title,
+      detail: detail,
+      actionLabel: "Open alerts",
+      target: "alerts",
+    };
+  }
+
   function dashboardStatus(data) {
     if (!data || typeof data !== "object") {
       return {
@@ -1215,11 +1245,16 @@
     const inbox = numeric(rollups.open_inbox_count);
     const alerts = numeric(rollups.alert_count);
     const total = planReviews + inbox;
+    const scopedAlerts = isScoped(data.scoped_fields, "rollups.alert_count");
+    const alertKind = scopedAlerts ? "project alert" : "background alert";
     const alertNote = alerts > 0
-      ? " " + alerts + " " + plural(alerts, "background alert")
+      ? " " + alerts + " " + plural(alerts, alertKind)
         + " being watched."
       : "";
     if (total === 0) {
+      if (scopedAlerts && alerts > 0) {
+        return projectAlertHeadline(data, alerts);
+      }
       const sweeps = numeric(rollups.sweep_count_24h);
       const recoveries = numeric(rollups.recovery_count_24h);
       const proof = sweeps || recoveries
@@ -3312,20 +3347,21 @@
       ));
     }
     if (typeof rollups.alert_count === "number") {
+      const scoped = isScoped(scopedFields, "rollups.alert_count");
       cards.push(buildCard(
         "watching",
         rollups.alert_count,
         rollups.alert_count > 0 ? "rollup-working" : "",
-        // alert_count is intentionally global per DashboardRollups
-        // docstring — never appears in scoped_fields, so no tag.
-        false,
+        scoped,
         dashboardCardAction({
           label: "watching",
           value: rollups.alert_count,
           target: "alerts",
-          detail: "Opens background alerts and recovery notes.",
+          detail: scoped
+            ? "Opens alerts for the selected project."
+            : "Opens background alerts and recovery notes.",
         }, data),
-        "Open background alerts",
+        scoped ? "Open project alerts" : "Open background alerts",
       ));
     }
 

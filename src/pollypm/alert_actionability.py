@@ -21,6 +21,7 @@ _QUEUE_WITHOUT_MOTION_SESSION_PREFIX = "audit-queue_without_motion-"
 _WORKTREE_STATE_PREFIX = "worktree_state:"
 _WATCHDOG_ALERT_TYPE = "audit_watchdog"
 _QWM_PROJECT_RE = re.compile(r"\bProject\s+(?P<project>[A-Za-z0-9_.-]+)\s+has\b")
+_TASK_PAYLOAD_RE = re.compile(r"^(?P<project>[A-Za-z0-9_.-]+)/\d+(?:\b|:)")
 
 # #2475/#2480 — system-internal recovery watchdog warns. Each of these
 # alert types is a mechanical recovery signal raised by the
@@ -75,6 +76,130 @@ def _text_value(row: object, *names: str) -> str:
     return str(value or "")
 
 
+def _known_project_match(
+    value: str,
+    *,
+    known_projects: frozenset[str] | None,
+) -> str | None:
+    if not value:
+        return None
+    if not known_projects:
+        return None
+    for project in sorted(known_projects, key=len, reverse=True):
+        if (
+            value == project
+            or value.startswith(project + "/")
+            or value.startswith(project + ":")
+        ):
+            return project
+    return None
+
+
+def _task_payload_project(value: str) -> str | None:
+    match = _TASK_PAYLOAD_RE.match(value.strip())
+    if match is None:
+        return None
+    return match.group("project") or None
+
+
+def _alert_type_payload_project(
+    alert_type: str,
+    *,
+    known_projects: frozenset[str] | None,
+) -> str | None:
+    if ":" not in alert_type:
+        return None
+    _family, _sep, payload = alert_type.partition(":")
+    payload = payload.strip()
+    if not payload:
+        return None
+    project = _task_payload_project(payload)
+    if project is None:
+        project = _known_project_match(payload, known_projects=known_projects)
+    if project is None:
+        return None
+    if known_projects is not None and project not in known_projects:
+        return None
+    return project
+
+
+def _session_prefix_project(
+    session_name: str,
+    *,
+    prefixes: tuple[str, ...],
+    known_projects: frozenset[str] | None,
+    allow_numeric_tail: bool,
+) -> str | None:
+    for prefix in prefixes:
+        if not session_name.startswith(prefix):
+            continue
+        tail = session_name[len(prefix):].strip()
+        project = _known_project_match(tail, known_projects=known_projects)
+        if project is not None:
+            return project
+        if allow_numeric_tail and "-" in tail:
+            head, _sep, number = tail.rpartition("-")
+            if head and number.isdigit():
+                return head
+    return None
+
+
+def alert_project_key(
+    alert: object,
+    *,
+    known_projects: frozenset[str] | None = None,
+) -> str | None:
+    """Return the project key encoded by a project-scoped alert, if known."""
+
+    alert_type = _text_value(alert, "alert_type", "type")
+    session_name = _text_value(alert, "session_name", "scope")
+
+    project = _queue_without_motion_project(
+        alert,
+        known_projects=known_projects,
+    )
+    if project:
+        return project
+
+    project = _recovery_watchdog_project(
+        alert,
+        alert_type,
+        known_projects=known_projects,
+    )
+    if project:
+        return project
+
+    project = _worktree_state_project(
+        alert_type,
+        known_projects=known_projects,
+    )
+    if project:
+        return project
+
+    project = _alert_type_payload_project(
+        alert_type,
+        known_projects=known_projects,
+    )
+    if project:
+        return project
+
+    project = _session_prefix_project(
+        session_name,
+        prefixes=("review-", "blocked-", "task-"),
+        known_projects=known_projects,
+        allow_numeric_tail=True,
+    )
+    if project:
+        return project
+
+    return _session_prefix_project(
+        session_name,
+        prefixes=("worker-", "architect-", "reviewer-", "pm-"),
+        known_projects=known_projects,
+        allow_numeric_tail=False,
+    )
+
+
 def _stuck_alert_already_user_waiting(
     alert_type: str,
     user_waiting_task_ids: frozenset[str],
@@ -102,7 +227,7 @@ def _queue_without_motion_project(
     tail = session_name[len(_QUEUE_WITHOUT_MOTION_SESSION_PREFIX):]
     if known_projects:
         for project in sorted(known_projects, key=len, reverse=True):
-            if tail == project or tail.startswith(project + "-"):
+            if tail == project:
                 return project
     return None
 
@@ -198,9 +323,9 @@ def _recovery_watchdog_project(
     name. ``plan_missing`` / ``worker_session_gap`` carry the project key
     directly (``plan_gate-<project>`` / ``worker_session_gap-<project>``).
     ``missing_task_worker`` is keyed per task (``missing_task_worker-<project>/<N>``)
-    so we strip the ``/<task-number>`` tail. Project keys can themselves
-    contain hyphens, so when a ``known_projects`` set is supplied we
-    prefer the longest matching key to disambiguate.
+    so we strip the ``/<task-number>`` tail. When a ``known_projects``
+    set is supplied, require an exact match so a ghost project such as
+    ``media-old`` cannot be counted against ``media``.
     """
 
     prefix = _RECOVERY_WATCHDOG_SESSION_PREFIXES.get(alert_type)
@@ -219,7 +344,7 @@ def _recovery_watchdog_project(
         return None
     if known_projects:
         for project in sorted(known_projects, key=len, reverse=True):
-            if tail == project or tail.startswith(project + "-"):
+            if tail == project:
                 return project
     return tail
 
@@ -327,6 +452,7 @@ def count_user_actionable_alerts(
 
 __all__ = [
     "AlertActionabilityContext",
+    "alert_project_key",
     "count_user_actionable_alerts",
     "is_user_actionable_alert",
     "user_actionable_alerts",

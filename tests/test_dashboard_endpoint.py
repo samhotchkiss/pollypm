@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -192,6 +193,11 @@ def patch_fresh_alert_count(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         dashboard_routes, "_fresh_dashboard_alert_count", lambda _config: None,
     )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_fresh_dashboard_project_alerts",
+        lambda _config, _project: None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +219,7 @@ def _make_data(
     recovery_count_24h: int = 0,
     inbox_count: int = 0,
     alert_count: int = 0,
+    alert_counts_by_project: dict[str, int] | None = None,
     account_usages: list[AccountQuotaUsage] | None = None,
     briefing: str = "",
 ) -> DashboardData:
@@ -229,6 +236,7 @@ def _make_data(
         recovery_count_24h=recovery_count_24h,
         inbox_count=inbox_count,
         alert_count=alert_count,
+        alert_counts_by_project=alert_counts_by_project or {},
         account_usages=account_usages or [],
         briefing=briefing,
     )
@@ -875,18 +883,15 @@ def test_dashboard_503_when_list_projects_raises(
 # ---------------------------------------------------------------------------
 
 
-def test_dashboard_project_filter_keeps_global_activity_rollups(
+def test_dashboard_project_filter_scopes_alert_rollup_and_keeps_global_activity_rollups(
     client, auth_headers, patch_gather, patch_list_projects,
 ):
-    """Regression for Codex PR #2057 P0 #1.
+    """Project filters scope project-owned alerts but keep 24h activity global.
 
     Under ``?project=myproj`` the response must NOT silently inherit
-    cross-project alert / sweep / message / recovery counts as if they
-    were narrowed to ``myproj``. The gather pipeline aggregates these
-    four counters globally (sessions for other projects contribute),
-    so for the v1 RC minimal-diff window we surface them unchanged and
-    enumerate the actually-narrowed fields in ``scoped_fields`` so
-    clients can tell the difference.
+    cross-project alert counts as if they were narrowed to ``myproj``.
+    ``alert_count`` now follows the selected project while the 24h
+    sweep / message / recovery counters remain whole-system.
     """
     patch_list_projects([
         _api_project("myproj", open_inbox_count=3, pending_plan_review=True),
@@ -894,8 +899,8 @@ def test_dashboard_project_filter_keeps_global_activity_rollups(
     ])
     # The dashboard data here represents the WHOLE system; sessions /
     # commits / inbox previews for "otherproj" are part of the global
-    # picture, and the four rollups below were computed across both
-    # projects.
+    # picture, and the 24h activity rollups below were computed across
+    # both projects.
     patch_gather(_make_data(
         active_sessions=[
             SessionActivity(
@@ -909,6 +914,7 @@ def test_dashboard_project_filter_keeps_global_activity_rollups(
                        age_seconds=1, project="otherproj"),
         ],
         alert_count=6,
+        alert_counts_by_project={"myproj": 2, "otherproj": 4},
         sweep_count_24h=12,
         message_count_24h=4,
         recovery_count_24h=2,
@@ -923,24 +929,71 @@ def test_dashboard_project_filter_keeps_global_activity_rollups(
     assert rollups["tracked_count"] == 1
     assert rollups["open_inbox_count"] == 3
     assert rollups["pending_plan_reviews"] == 1
-    # Global activity rollups are surfaced unchanged (documented as
-    # not-narrowed via the ``scoped_fields`` contract below).
-    assert rollups["alert_count"] == 6
+    assert rollups["alert_count"] == 2
+    # Global 24h activity rollups are surfaced unchanged (documented
+    # as not-narrowed via the ``scoped_fields`` contract below).
     assert rollups["sweep_count_24h"] == 12
     assert rollups["message_count_24h"] == 4
     assert rollups["recovery_count_24h"] == 2
 
     # Contract — the response enumerates exactly which fields the
-    # filter narrowed. The four global activity counters MUST NOT
+    # filter narrowed. The 24h global activity counters MUST NOT
     # appear here; the project-derived rollups MUST.
     scoped = set(body["scoped_fields"])
     assert "rollups.tracked_count" in scoped
     assert "rollups.open_inbox_count" in scoped
     assert "rollups.pending_plan_reviews" in scoped
-    assert "rollups.alert_count" not in scoped
+    assert "rollups.alert_count" in scoped
     assert "rollups.sweep_count_24h" not in scoped
     assert "rollups.message_count_24h" not in scoped
     assert "rollups.recovery_count_24h" not in scoped
+
+
+def test_dashboard_project_filter_uses_fresh_project_alerts(
+    client, auth_headers, patch_gather, patch_list_projects, monkeypatch,
+):
+    """A selected project with only plan_missing alerts must not look clean."""
+    patch_list_projects([
+        _api_project("myproj"),
+        _api_project("otherproj"),
+    ])
+    patch_gather(_make_data(
+        alert_count=6,
+        alert_counts_by_project={"myproj": 0},
+    ))
+    alert = SimpleNamespace(
+        session_name="plan_gate-myproj",
+        alert_type="plan_missing",
+        severity="warn",
+        message=(
+            "Project 'myproj' has no approved plan yet - queued task "
+            "myproj/1 is waiting. Run `pm project plan myproj`."
+        ),
+        updated_at="2026-06-03T15:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_fresh_dashboard_project_alerts",
+        lambda _config, project: [alert] if project == "myproj" else [],
+    )
+
+    body = client.get(
+        "/api/v1/dashboard?project=myproj", headers=auth_headers,
+    ).json()
+
+    assert body["rollups"]["open_inbox_count"] == 0
+    assert body["rollups"]["pending_plan_reviews"] == 0
+    assert body["rollups"]["alert_count"] == 1
+    assert "rollups.alert_count" in body["scoped_fields"]
+    assert body["project_alerts"] == [
+        {
+            "session_name": "plan_gate-myproj",
+            "alert_type": "plan_missing",
+            "severity": "warn",
+            "message": alert.message,
+            "updated_at": "2026-06-03T15:00:00+00:00",
+        }
+    ]
 
 
 def test_dashboard_scoped_fields_empty_without_filter(

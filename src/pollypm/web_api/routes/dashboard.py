@@ -108,13 +108,13 @@ class DashboardRollups(BaseModel):
     """Aggregate counters mirrored from the cockpit rail.
 
     Under ``?project=<key>``, only the project-derived counters
-    (``tracked_count``, ``open_inbox_count``, ``pending_plan_reviews``)
-    are narrowed to that project. ``alert_count`` and the three
-    ``*_24h`` activity counters remain whole-system because the
-    underlying ``gather`` pipeline aggregates them globally before
-    returning (see :func:`pollypm.dashboard_data.gather`). The set of
-    fields actually narrowed for a given response is enumerated on the
-    envelope's ``scoped_fields`` list so clients don't have to guess.
+    (``tracked_count``, ``open_inbox_count``, ``pending_plan_reviews``,
+    ``alert_count``) are narrowed to that project. The three ``*_24h``
+    activity counters remain whole-system because the underlying
+    ``gather`` pipeline aggregates them globally before returning (see
+    :func:`pollypm.dashboard_data.gather`). The set of fields actually
+    narrowed for a given response is enumerated on the envelope's
+    ``scoped_fields`` list so clients don't have to guess.
     """
 
     tracked_count: int
@@ -131,6 +131,16 @@ class DashboardTokens(BaseModel):
 
     today: int
     total: int
+
+
+class DashboardAlertPreviewModel(BaseModel):
+    """Project-scoped actionable alert preview for selected-project views."""
+
+    session_name: str
+    alert_type: str
+    severity: str
+    message: str
+    updated_at: str
 
 
 class DashboardResponse(BaseModel):
@@ -166,6 +176,13 @@ class DashboardResponse(BaseModel):
     recent_messages: list[InboxPreviewModel]
     tokens: DashboardTokens
     account_usages: list[AccountQuotaUsageModel]
+    project_alerts: list[DashboardAlertPreviewModel] = Field(
+        default_factory=list,
+        description=(
+            "Actionable alerts owned by the requested ``?project=``. "
+            "Empty for unfiltered/all-project responses."
+        ),
+    )
     daily_tokens: list[list[Any]] | None = Field(
         default=None,
         description=(
@@ -243,6 +260,16 @@ def _account_usage_to_wire(row: Any) -> AccountQuotaUsageModel:
     )
 
 
+def _alert_preview_to_wire(row: Any) -> DashboardAlertPreviewModel:
+    return DashboardAlertPreviewModel(
+        session_name=str(getattr(row, "session_name", "") or ""),
+        alert_type=str(getattr(row, "alert_type", "") or ""),
+        severity=str(getattr(row, "severity", "") or ""),
+        message=str(getattr(row, "message", "") or ""),
+        updated_at=str(getattr(row, "updated_at", "") or ""),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gather wrapper (pg-only path; sqlite store-open lives in load_dashboard)
 # ---------------------------------------------------------------------------
@@ -317,10 +344,39 @@ def _call_dashboard_source_pair(
     return results["projects"], results["data"]
 
 
-def _fresh_dashboard_alert_count(config: Any) -> int | None:
+def _fresh_dashboard_project_alerts(
+    config: Any,
+    project: str,
+) -> list[object] | None:
+    """Return fresh project-scoped actionable alerts, or ``None`` on failure."""
+
+    try:
+        from pollypm.dashboard_data import dashboard_actionable_alerts_for_project
+        from pollypm.storage.pg_alerts import open_alerts
+
+        return dashboard_actionable_alerts_for_project(
+            config,
+            project,
+            list(open_alerts(config=config)),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "dashboard: fresh project alert refresh failed; using cached value",
+            exc_info=True,
+        )
+        return None
+
+
+def _fresh_dashboard_alert_count(
+    config: Any,
+    project: str | None = None,
+) -> int | None:
     """Return a fresh alert count so stale dashboard snapshots cannot alarm high."""
 
     try:
+        if project is not None:
+            alerts = _fresh_dashboard_project_alerts(config, project)
+            return None if alerts is None else len(alerts)
         from pollypm.dashboard_data import count_dashboard_alerts
 
         return count_dashboard_alerts(config)
@@ -404,10 +460,9 @@ async def get_dashboard_endpoint(
             description=(
                 "Narrow the per-project lists (projects, sessions, "
                 "commits, completed items, recent messages) and the "
-                "three project-derived rollup counters to one project "
-                "key. The response's ``scoped_fields`` enumerates the "
-                "exact fields narrowed; the four global activity "
-                "rollups (alert / sweep / message / recovery 24h) and "
+                "project-derived rollup counters to one project key. "
+                "The response's ``scoped_fields`` enumerates the exact "
+                "fields narrowed; the three 24h activity rollups and "
                 "``daemon_status`` remain whole-system."
             ),
         ),
@@ -501,12 +556,10 @@ async def get_dashboard_endpoint(
         recent_messages = [m for m in recent_messages if m.project == project]
         # Enumerate the fields that are actually project-scoped under
         # ``?project=`` so clients don't have to guess which rollups
-        # were narrowed. The four ``rollups.*`` activity counters
-        # (alert_count, sweep_count_24h, message_count_24h,
-        # recovery_count_24h) are intentionally NOT listed — they are
-        # aggregated globally inside ``gather`` and re-scoping them
-        # would require new pg queries we deferred for the v1 RC
-        # minimal-diff window.
+        # were narrowed. The three ``rollups.*`` 24h activity counters
+        # (sweep_count_24h, message_count_24h, recovery_count_24h)
+        # are intentionally NOT listed because they are aggregated
+        # globally inside ``gather``.
         scoped_fields = [
             "projects",
             "active_sessions",
@@ -516,10 +569,11 @@ async def get_dashboard_endpoint(
             "rollups.tracked_count",
             "rollups.open_inbox_count",
             "rollups.pending_plan_reviews",
+            "rollups.alert_count",
         ]
 
     # Rollups — project-derived counters narrow with ``?project=``;
-    # the four ``gather``-computed activity counters stay global and
+    # the three ``gather``-computed 24h activity counters stay global and
     # are documented as such on the response (see ``scoped_fields``
     # above and the ``DashboardRollups`` docstring).
     tracked_count = sum(1 for p in projects_view if p.tracked)
@@ -532,7 +586,19 @@ async def get_dashboard_endpoint(
     # older snapshots, refresh that one cheap counter and write it through so
     # the Home headline does not hold an old-high value (#2504).
     snapshot_age = time.monotonic() - snapshot.refreshed_at_monotonic
-    if snapshot_age > 2.0:
+    project_alerts: list[object] = []
+    if project is not None:
+        fresh_project_alerts = _fresh_dashboard_project_alerts(config, project)
+        if fresh_project_alerts is not None:
+            project_alerts = fresh_project_alerts
+            fresh_alert_count = len(project_alerts)
+        else:
+            raw_counts = getattr(data, "alert_counts_by_project", {}) or {}
+            try:
+                fresh_alert_count = int(raw_counts.get(project, 0) or 0)
+            except (AttributeError, TypeError, ValueError):
+                fresh_alert_count = 0
+    elif snapshot_age > 2.0:
         fresh_alert_count = _normalize_dashboard_alert_count(config, data)
     else:
         # Prefer the loader's explicit normalized value so the sync
@@ -588,6 +654,10 @@ async def get_dashboard_endpoint(
             _account_usage_to_wire(u)
             for u in (data.account_usages or [])
         ],
+        project_alerts=[
+            _alert_preview_to_wire(alert)
+            for alert in project_alerts[:5]
+        ],
         daily_tokens=daily_tokens,
         briefing=briefing,
     )
@@ -597,6 +667,7 @@ __all__ = [
     "AccountQuotaUsageModel",
     "CommitInfoModel",
     "CompletedItemModel",
+    "DashboardAlertPreviewModel",
     "DashboardResponse",
     "DashboardRollups",
     "DashboardSnapshotCache",

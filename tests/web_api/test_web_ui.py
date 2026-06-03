@@ -2023,3 +2023,48 @@ def test_render_dashboard_scoped_fields_tag_filtered_cards() -> None:
     assert "inbox (filtered)" in rendered, (
         f"scoped inbox card should carry the (filtered) tag; got:\n{rendered}"
     )
+
+
+def test_render_dashboard_project_alert_headline_replaces_all_handled() -> None:
+    """A selected project with only scoped alerts must not render clean copy."""
+    payload = {
+        "rollups": {
+            "open_inbox_count": 0,
+            "pending_plan_reviews": 0,
+            "alert_count": 1,
+            "sweep_count_24h": 0,
+            "message_count_24h": 0,
+            "tracked_count": 1,
+        },
+        "daemon_status": "up",
+        "active_sessions": [],
+        "scoped_fields": [
+            "projects",
+            "rollups.alert_count",
+        ],
+        "projects": [
+            {
+                "key": "media",
+                "name": "media",
+                "tracked": True,
+            }
+        ],
+        "recent_messages": [],
+        "project_alerts": [
+            {
+                "session_name": "plan_gate-media",
+                "alert_type": "plan_missing",
+                "severity": "warn",
+                "message": (
+                    "Project 'media' has no approved plan yet - queued "
+                    "task media/1 is waiting. Run `pm project plan media`."
+                ),
+                "updated_at": "2026-06-03T15:00:00+00:00",
+            }
+        ],
+    }
+    rendered = _node_render_dashboard(payload)
+    assert "All handled - Polly's got it" not in rendered
+    assert "media is waiting on a plan" in rendered
+    assert "Run `pm project plan media`" in rendered
+    assert "watching (filtered)" in rendered

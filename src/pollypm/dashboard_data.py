@@ -204,6 +204,7 @@ class DashboardData:
     recovery_count_24h: int
     inbox_count: int
     alert_count: int
+    alert_counts_by_project: dict[str, int] = field(default_factory=dict)
     account_usages: list[AccountQuotaUsage] = field(default_factory=list)
     briefing: str = ""  # morning briefing narrative (if user was away)
 
@@ -894,6 +895,49 @@ def dashboard_actionable_alerts(
     return user_actionable_alerts(open_alerts, context=context)
 
 
+def dashboard_actionable_alerts_for_project(
+    config: PollyPMConfig,
+    project: str,
+    open_alerts: list[object],
+    *,
+    user_waiting_task_ids: frozenset[str] | None = None,
+    project_task_facts: _AlertProjectTaskFacts | None = None,
+) -> list[object]:
+    """Return actionable alert rows owned by ``project``."""
+
+    from pollypm.alert_actionability import alert_project_key
+
+    known_projects = _known_project_keys(config)
+    return [
+        alert
+        for alert in dashboard_actionable_alerts(
+            config,
+            open_alerts,
+            user_waiting_task_ids=user_waiting_task_ids,
+            project_task_facts=project_task_facts,
+        )
+        if alert_project_key(alert, known_projects=known_projects) == project
+    ]
+
+
+def dashboard_alert_counts_by_project(
+    config: PollyPMConfig,
+    actionable_alerts: list[object],
+) -> dict[str, int]:
+    """Group an already-filtered actionable alert list by owning project."""
+
+    from pollypm.alert_actionability import alert_project_key
+
+    known_projects = _known_project_keys(config)
+    counts: dict[str, int] = {}
+    for alert in actionable_alerts:
+        project = alert_project_key(alert, known_projects=known_projects)
+        if not project:
+            continue
+        counts[project] = counts.get(project, 0) + 1
+    return counts
+
+
 def count_dashboard_alerts(
     config: PollyPMConfig,
     open_alerts: list[object] | None = None,
@@ -910,6 +954,31 @@ def count_dashboard_alerts(
     return len(
         dashboard_actionable_alerts(
             config,
+            open_alerts,
+            user_waiting_task_ids=user_waiting_task_ids,
+            project_task_facts=project_task_facts,
+        )
+    )
+
+
+def count_dashboard_alerts_for_project(
+    config: PollyPMConfig,
+    project: str,
+    open_alerts: list[object] | None = None,
+    *,
+    user_waiting_task_ids: frozenset[str] | None = None,
+    project_task_facts: _AlertProjectTaskFacts | None = None,
+) -> int:
+    """Count actionable alerts scoped to one project."""
+
+    if open_alerts is None:
+        from pollypm.storage.pg_alerts import open_alerts as pg_open_alerts
+
+        open_alerts = list(pg_open_alerts(config=config))
+    return len(
+        dashboard_actionable_alerts_for_project(
+            config,
+            project,
             open_alerts,
             user_waiting_task_ids=user_waiting_task_ids,
             project_task_facts=project_task_facts,
@@ -1855,11 +1924,16 @@ def gather(
         + len(recovery_events)
     )
     user_waiting = _user_waiting_task_ids_across_projects(config)
-    alert_count = count_dashboard_alerts(
+    actionable_alerts = dashboard_actionable_alerts(
         config,
         open_alerts,
         user_waiting_task_ids=user_waiting,
         project_task_facts=project_task_facts,
+    )
+    alert_count = len(actionable_alerts)
+    alert_counts_by_project = dashboard_alert_counts_by_project(
+        config,
+        actionable_alerts,
     )
     briefing_generated_at = now
     try:
@@ -1897,6 +1971,7 @@ def gather(
         recovery_count_24h=recoveries,
         inbox_count=inbox_count,
         alert_count=alert_count,
+        alert_counts_by_project=alert_counts_by_project,
         account_usages=account_usages,
         briefing=briefing,
     )

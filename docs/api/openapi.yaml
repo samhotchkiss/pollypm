@@ -741,10 +741,10 @@ paths:
         - `?project=<key>` narrows the response to one project. The
           project list and per-project rows (sessions, commits,
           completed items, recent messages) are scoped to that key,
-          along with the three project-derived rollup counters
-          (`tracked_count`, `open_inbox_count`, `pending_plan_reviews`).
-          The four global activity counters (`alert_count`,
-          `sweep_count_24h`, `message_count_24h`, `recovery_count_24h`)
+          along with the project-derived rollup counters
+          (`tracked_count`, `open_inbox_count`, `pending_plan_reviews`,
+          `alert_count`). The three 24h activity counters
+          (`sweep_count_24h`, `message_count_24h`, `recovery_count_24h`)
           and `daemon_status` remain workspace-wide. See the
           `scoped_fields` array in the response for the authoritative
           enumeration of which fields were narrowed.
@@ -3820,8 +3820,8 @@ components:
       description: |
         Aggregate counters mirrored from the cockpit rail. Under
         `?project=<key>` only the project-derived counters
-        (`tracked_count`, `open_inbox_count`, `pending_plan_reviews`)
-        are narrowed; `alert_count` and the three `*_24h` activity
+        (`tracked_count`, `open_inbox_count`, `pending_plan_reviews`,
+        `alert_count`) are narrowed; the three `*_24h` activity
         counters remain whole-system. The response envelope's
         `scoped_fields` list enumerates which fields the filter
         actually narrowed.
@@ -3848,6 +3848,16 @@ components:
       properties:
         today: { type: integer }
         total: { type: integer }
+
+    DashboardAlertPreview:
+      type: object
+      required: [session_name, alert_type, severity, message, updated_at]
+      properties:
+        session_name: { type: string }
+        alert_type: { type: string }
+        severity: { type: string }
+        message: { type: string }
+        updated_at: { type: string }
 
     DashboardResponse:
       type: object
@@ -3886,7 +3896,7 @@ components:
             Names of response fields actually narrowed by `?project=`.
             Empty when no filter is in effect. Lets clients tell which
             counters reflect the requested project vs which remain
-            whole-system (see `DashboardRollups` for why the four
+            whole-system (see `DashboardRollups` for why the 24h
             activity counters stay global).
           items:
             type: string
@@ -3912,6 +3922,13 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AccountQuotaUsage"
+        project_alerts:
+          type: array
+          description: |
+            Actionable alerts owned by the requested `?project=`.
+            Empty for unfiltered/all-project responses.
+          items:
+            $ref: "#/components/schemas/DashboardAlertPreview"
         daily_tokens:
           type: array
           description: |

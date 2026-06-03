@@ -297,6 +297,55 @@ def test_worktree_state_demotes_tracked_project_without_recent_real_work() -> No
     assert not is_user_actionable_alert(warn, context=context)
 
 
+def test_alert_project_key_resolves_project_scoped_alert_families() -> None:
+    from pollypm.alert_actionability import alert_project_key
+
+    known = frozenset({"media", "sam-blog"})
+    rows = [
+        SimpleNamespace(
+            session_name="plan_gate-media",
+            alert_type="plan_missing",
+        ),
+        SimpleNamespace(
+            session_name="task-sam-blog-7",
+            alert_type="tmux_window_probe_unavailable",
+        ),
+        SimpleNamespace(
+            session_name="blocked-media-12",
+            alert_type="blocked_dead_end",
+        ),
+        SimpleNamespace(
+            session_name="review-media-4",
+            alert_type="review_pending",
+        ),
+        SimpleNamespace(
+            session_name="task_assignment",
+            alert_type="no_session_for_assignment:sam-blog/9",
+        ),
+        SimpleNamespace(
+            session_name="worker-media",
+            alert_type="project_path_unspawnable",
+        ),
+        SimpleNamespace(
+            session_name="worker-media-11",
+            alert_type="worktree_state:media/11:dirty_stale",
+        ),
+    ]
+
+    assert [
+        alert_project_key(row, known_projects=known)
+        for row in rows
+    ] == [
+        "media",
+        "sam-blog",
+        "media",
+        "media",
+        "sam-blog",
+        "media",
+        "media",
+    ]
+
+
 def test_orphan_worktree_alert_is_not_user_actionable() -> None:
     from pollypm.alert_actionability import is_user_actionable_alert
 

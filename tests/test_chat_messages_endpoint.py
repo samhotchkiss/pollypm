@@ -1598,6 +1598,48 @@ def test_messages_endpoint_source_auto_falls_back_when_stale(
     assert body["messages"][0]["id"] == "cap_1"
 
 
+def test_messages_endpoint_operator_welcome_capture_returns_empty(
+    client, auth_headers, patch_registry, monkeypatch,
+):
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=None, present=True,
+    )])
+
+    class _WelcomeTmuxClient:
+        def capture_pane(self, target: str, lines: int = 3000) -> str:
+            assert target == "pollypm-test-storage-closet:operator"
+            assert lines == 3000
+            return """\
+? for shortcuts · ← for agents
+────────────────────────────────────────
+❯ Try "write a test for <filepath>"
+────────────────────────────────────────
+
+
+  ▘▘ ▝▝    ~/dev
+▝▜█████▛▘  Opus 4.7 · Claude Max
+ ▐▛███▜▌   Claude Code v2.1.158
+"""
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_tmux_client",
+        lambda: _WelcomeTmuxClient(),
+    )
+
+    response = client.get(
+        "/api/v1/chat/operator/messages",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["session_name"] == "operator"
+    assert body["transcript_source"] is None
+    assert body["messages"] == []
+
+
 def test_messages_endpoint_source_auto_keeps_stale_open_ask_user_jsonl(
     client,
     auth_headers,

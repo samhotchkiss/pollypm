@@ -5,8 +5,8 @@ capture when the normalized archive is missing or stale (>60s) AND the
 tmux pane is alive. The Codex CLI doesn't write the Claude JSONL shape
 either, so Codex surfaces always land here.
 
-Each captured line becomes one :class:`MessageEnvelope` with
-``type=text`` and ``metadata.from_capture=true``. Envelope ids are
+Each non-chrome captured line becomes one :class:`MessageEnvelope`
+with ``type=text`` and ``metadata.from_capture=true``. Envelope ids are
 synthesized as ``cap_<hex>`` from a blake2b digest of
 ``f"{session_name}:{line_index}:{content}"`` so the same line read
 twice yields the same id (stable, sortable within a capture).
@@ -48,6 +48,22 @@ DEFAULT_CAPTURE_LINES = 3000
 # as :mod:`pollypm.recovery.worker_turn_end`.
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _C0_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_CLAUDE_WELCOME_SHORTCUTS_RE = re.compile(
+    r"^\?\s+for\s+shortcuts(?:\s+·\s+←\s+for\s+agents)?$",
+    re.IGNORECASE,
+)
+_CLAUDE_WELCOME_TRY_RE = re.compile(r"^[❯›▶▷>]\s*Try\s+\".+\"$", re.IGNORECASE)
+_CLAUDE_WELCOME_VERSION_RE = re.compile(
+    r"^(?:[▘▝▜▛█▐▌\s]+)?Claude\s+Code\s+v?\d+(?:\.\d+)+\s*$",
+    re.IGNORECASE,
+)
+_CLAUDE_WELCOME_MAX_RE = re.compile(
+    r"^(?:[▘▝▜▛█▐▌\s]+)?(?:Opus|Sonnet|Haiku)\s+[\w.-]+\s+·\s+Claude\s+Max\s*$",
+    re.IGNORECASE,
+)
+_CLAUDE_WELCOME_LEGACY_RE = re.compile(r"^Welcome to Claude Code$", re.IGNORECASE)
+_CLAUDE_WELCOME_RULE_CHARS = set("─━╌╍┄┅╴╶╼╾╸╺ ")
+_CLAUDE_WELCOME_LOGO_CHARS = set("▘▝▜▛█▐▌▟▙▚▞▖▗")
 
 
 def synthesize_capture_id(session_name: str, line_index: int, content: str) -> str:
@@ -129,6 +145,8 @@ def capture_envelopes(
 
     envelopes: list[MessageEnvelope] = []
     for line_index, line in enumerate(all_lines[:text_line_count]):
+        if _is_claude_welcome_chrome(line):
+            continue
         # Skip leading/trailing pure-whitespace lines but preserve internal
         # blank lines so the structure of a Claude-Code box is recognisable.
         if not line.strip() and not envelopes:
@@ -166,6 +184,40 @@ def _strip_control_codes(text: str) -> str:
     text = _ANSI_CSI_RE.sub("", text)
     text = _C0_CTRL_RE.sub("", text)
     return text
+
+
+def _is_claude_welcome_chrome(line: str) -> bool:
+    """Return True for standalone Claude Code welcome-screen UI chrome."""
+    text = line.strip()
+    if not text:
+        return False
+    if (
+        _CLAUDE_WELCOME_SHORTCUTS_RE.match(text)
+        or _CLAUDE_WELCOME_TRY_RE.match(text)
+        or _CLAUDE_WELCOME_VERSION_RE.match(text)
+        or _CLAUDE_WELCOME_MAX_RE.match(text)
+        or _CLAUDE_WELCOME_LEGACY_RE.match(text)
+    ):
+        return True
+    if _is_claude_welcome_rule(text):
+        return True
+    return _is_claude_welcome_logo_line(text)
+
+
+def _is_claude_welcome_rule(text: str) -> bool:
+    return len(text) >= 8 and "─" in text and set(text) <= _CLAUDE_WELCOME_RULE_CHARS
+
+
+def _is_claude_welcome_logo_line(text: str) -> bool:
+    glyph_count = sum(1 for char in text if char in _CLAUDE_WELCOME_LOGO_CHARS)
+    if glyph_count < 2:
+        return False
+    nonspace_count = sum(1 for char in text if not char.isspace())
+    if nonspace_count and glyph_count / nonspace_count >= 0.30:
+        return True
+    if text[:1] in _CLAUDE_WELCOME_LOGO_CHARS and re.search(r"(?:^|\s)(?:~|/)", text):
+        return True
+    return False
 
 
 def _utc_now() -> str:

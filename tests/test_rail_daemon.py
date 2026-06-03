@@ -120,11 +120,15 @@ def test_runtime_code_changed_detects_comparable_value_change() -> None:
     )
 
 
-def test_runtime_code_changed_ignores_unknown_or_incomparable_values() -> None:
+def test_runtime_code_changed_handles_unknown_and_kind_migrations() -> None:
     assert not _runtime_code_changed(None, _Fingerprint("served_git_sha", "new"))
-    assert not _runtime_code_changed(
+    assert _runtime_code_changed(
         _Fingerprint("served_git_sha", "old"),
         _Fingerprint("package_mtime_ns", "new"),
+    )
+    assert _runtime_code_changed(
+        _Fingerprint("editable_source_package_git_sha", "same-sha"),
+        _Fingerprint("served_package_git_sha", "same-sha"),
     )
     assert not _runtime_code_changed(
         _Fingerprint("served_git_sha", "same"),

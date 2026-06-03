@@ -248,18 +248,17 @@ def _runtime_code_changed(
     boot_fingerprint: object | None,
     current_fingerprint: object | None,
 ) -> bool:
-    """True when comparable runtime-code fingerprints differ."""
+    """True when runtime-code fingerprints differ."""
     if boot_fingerprint is None or current_fingerprint is None:
         return False
     boot_kind = getattr(boot_fingerprint, "kind", None)
     current_kind = getattr(current_fingerprint, "kind", None)
     if boot_kind != current_kind:
-        logger.debug(
+        logger.info(
             "rail_daemon: code fingerprint kind changed (%s -> %s); "
-            "skipping re-exec until the signal is comparable",
+            "treating as stale so the daemon reloads the current code",
             boot_kind, current_kind,
         )
-        return False
     boot_token = getattr(boot_fingerprint, "token", None)
     current_token = getattr(current_fingerprint, "token", None)
     if boot_token is None:

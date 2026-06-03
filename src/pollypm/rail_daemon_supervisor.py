@@ -49,9 +49,10 @@ When dead, we:
 2. Unlink the stale ``rail_daemon.pid`` so ``_claim_pid_file`` won't
    bail when the new daemon boots.
 3. Spawn a fresh daemon via the same ``cli._spawn_rail_daemon`` path
-   ``pm up`` uses. Best-effort — failures are surfaced but don't raise
-   so the calling supervisor (cockpit periodic timer, ``pm heartbeat``
-   cron) can still complete its primary job.
+   ``pm up`` uses. Keep the supervisor lock until the child both writes
+   a matching PID file and logs its ``rail_daemon: started`` boot line;
+   a PID-only child that hangs during init is killed and treated as a
+   failed start.
 4. Emit ``daemon.revived`` audit event so operators can quantify
    how often the field machine accumulates revivals (chronic revivals
    indicate a real OOM / leak / loop, not just transient death).
@@ -105,6 +106,7 @@ __all__ = [
     "DEFAULT_STALE_TICK_SECONDS",
     "DEFAULT_REVIVAL_THROTTLE_SECONDS",
     "DEFAULT_SIGTERM_GRACE_SECONDS",
+    "DEFAULT_CHILD_START_WAIT_SECONDS",
     "DEFAULT_IMMEDIATE_EXIT_THRESHOLD",
     "CrashLoopState",
     "check_and_revive_rail_daemon",
@@ -143,6 +145,13 @@ DEFAULT_SIGTERM_GRACE_SECONDS = 3.0
 #: making cron callers block longer than their tick budget.
 DEFAULT_CHILD_PID_WAIT_SECONDS = 5.0
 
+#: How long to wait, after the child writes a matching PID file, for
+#: the boot-complete log line emitted immediately after ``rail.start()``.
+#: A daemon can hang during init after claiming the PID; PID-only
+#: supervision leaves the self-heal rail silently dead. This second
+#: confirmation catches that class without adding a new IPC surface.
+DEFAULT_CHILD_START_WAIT_SECONDS = 20.0
+
 #: Consecutive spawn attempts that return without a live matching PID
 #: before the supervisor suppresses further respawns and surfaces a
 #: durable operator alert. This is intentionally small: a daemon that
@@ -157,6 +166,7 @@ DEFAULT_CRASH_LOOP_WINDOW_SECONDS = 60 * 60
 _CRASH_LOOP_STATE_NAME = "rail_daemon.crash_loop.json"
 _RAIL_DAEMON_LOG_NAME = "rail_daemon.log"
 _CRASH_LOOP_ALERT_SENDER = "rail_daemon_crash_loop"
+_RAIL_DAEMON_STARTED_MARKER = "rail_daemon: started"
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +937,56 @@ def _read_log_tail(log_path: Path, *, max_bytes: int = 8192) -> str:
     return data.decode("utf-8", "replace").strip()
 
 
+def _log_size(log_path: Path) -> int:
+    try:
+        return max(0, log_path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _read_log_since(
+    log_path: Path,
+    offset: int,
+    *,
+    max_bytes: int = 256 * 1024,
+) -> str:
+    try:
+        with log_path.open("rb") as fh:
+            try:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                start = offset if 0 <= offset <= size else 0
+                if size - start > max_bytes:
+                    start = max(0, size - max_bytes)
+                fh.seek(start, os.SEEK_SET)
+            except OSError:
+                fh.seek(0)
+            data = fh.read(max_bytes)
+    except OSError:
+        return ""
+    return data.decode("utf-8", "replace")
+
+
+def _wait_for_started_log(
+    log_path: Path,
+    *,
+    start_offset: int,
+    timeout_seconds: float,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    poll_interval: float = 0.05,
+) -> bool:
+    """Return True once a fresh ``rail_daemon: started`` line appears."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        if _RAIL_DAEMON_STARTED_MARKER in _read_log_since(
+            log_path, start_offset,
+        ):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        sleep_fn(poll_interval)
+
+
 def _emit_crash_loop_alert(
     *,
     config_path: Path,
@@ -990,6 +1050,7 @@ def _record_crash_loop_failure(
     threshold: int,
     window_seconds: float,
     emit_operator_alert: bool,
+    reason: str | None = None,
 ) -> CrashLoopState:
     existing = read_crash_loop_state(pid_path)
     if _last_failure_recent(existing, now=now, window_seconds=window_seconds):
@@ -1006,7 +1067,7 @@ def _record_crash_loop_failure(
         threshold=max(1, threshold),
         first_failure_at=first,
         last_failure_at=now.isoformat(),
-        reason=decision.reason,
+        reason=reason or decision.reason,
         log_excerpt=_read_log_tail(_rail_daemon_log_path(pid_path)),
         alerted=alerted,
     )
@@ -1280,18 +1341,21 @@ def _spawn_and_wait_for_child(
     config_path: Path,
     pid_path: Path,
     child_wait_seconds: float,
+    child_start_wait_seconds: float,
     sleep_fn: Callable[[float], None],
 ) -> tuple[str | None, int | None]:
-    """Spawn the new daemon and wait for it to register a PID file.
+    """Spawn the new daemon and wait for it to finish booting.
 
     Returns ``(spawn_error, confirmed_pid)``. Spawn-success but
-    pid-file-timeout produces a warning and ``confirmed_pid=None``:
-    the caller records the failed confirmation separately so repeated
-    immediate exits can be suppressed.
+    pid-file-timeout or boot-log-timeout produces a warning; the caller
+    records the failed confirmation separately so repeated startup
+    failures can be suppressed.
     """
     spawner = spawn_fn or _default_spawn_fn()
     spawn_error: str | None = None
     confirmed_pid: int | None = None
+    log_path = _rail_daemon_log_path(pid_path)
+    log_start_offset = _log_size(log_path)
     try:
         spawner(config_path)
     except Exception as exc:  # noqa: BLE001
@@ -1329,6 +1393,21 @@ def _spawn_and_wait_for_child(
                 "but next cycle may re-spawn",
                 pid_path, child_wait_seconds,
             )
+        elif not _wait_for_started_log(
+            log_path,
+            start_offset=log_start_offset,
+            timeout_seconds=child_start_wait_seconds,
+            sleep_fn=sleep_fn,
+        ):
+            spawn_error = "child_start_timeout"
+            logger.warning(
+                "rail_daemon_supervisor: spawned daemon pid=%d did not "
+                "log %r to %s within %.1fs — treating boot as hung",
+                confirmed_pid,
+                _RAIL_DAEMON_STARTED_MARKER,
+                log_path,
+                child_start_wait_seconds,
+            )
     return spawn_error, confirmed_pid
 
 
@@ -1347,6 +1426,7 @@ def check_and_revive_rail_daemon(
     cron: bool = False,
     lock_timeout_seconds: float = 5.0,
     child_wait_seconds: float = DEFAULT_CHILD_PID_WAIT_SECONDS,
+    child_start_wait_seconds: float = DEFAULT_CHILD_START_WAIT_SECONDS,
     immediate_exit_threshold: int = DEFAULT_IMMEDIATE_EXIT_THRESHOLD,
     crash_loop_window_seconds: float = DEFAULT_CRASH_LOOP_WINDOW_SECONDS,
     emit_operator_alert: bool = True,
@@ -1402,6 +1482,11 @@ def check_and_revive_rail_daemon(
             :data:`DEFAULT_CHILD_PID_WAIT_SECONDS` (5s). On timeout
             we log + release anyway so a buggy spawner can never
             deadlock the supervisor.
+        child_start_wait_seconds: how long, after PID confirmation, to
+            keep holding the lock while we wait for the daemon's fresh
+            ``rail_daemon: started`` log line. A child that registers a
+            PID but never reaches ``rail.start()`` is killed and treated
+            as a failed start.
         immediate_exit_threshold: consecutive failed child PID
             confirmations before suppressing further respawns and
             surfacing a crash-loop alert.
@@ -1572,8 +1657,32 @@ def check_and_revive_rail_daemon(
             config_path=config_path,
             pid_path=pid_path,
             child_wait_seconds=child_wait_seconds,
+            child_start_wait_seconds=child_start_wait_seconds,
             sleep_fn=sleep_fn,
         )
+        failure_reason: str | None = None
+        if spawn_error == "child_start_timeout" and confirmed_pid is not None:
+            kill_signal = _terminate_with_grace(
+                confirmed_pid, sleep_fn=sleep_fn, config_path=config_path,
+            )
+            if kill_signal in ("SIGTERM", "SIGKILL", "already_gone"):
+                killed_pid = confirmed_pid
+                try:
+                    if _read_pid(pid_path) == confirmed_pid:
+                        pid_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "rail_daemon_supervisor: could not unlink hung "
+                        "child PID file %s after pid=%d timeout: %s",
+                        pid_path,
+                        confirmed_pid,
+                        exc,
+                    )
+            failure_reason = (
+                f"spawned daemon pid={confirmed_pid} registered its PID "
+                f"but did not log {_RAIL_DAEMON_STARTED_MARKER!r} within "
+                f"{child_start_wait_seconds:.1f}s"
+            )
         if spawn_error is None and confirmed_pid is not None:
             _clear_crash_loop_state(pid_path)
         else:
@@ -1587,6 +1696,7 @@ def check_and_revive_rail_daemon(
                 threshold=immediate_exit_threshold,
                 window_seconds=crash_loop_window_seconds,
                 emit_operator_alert=emit_operator_alert,
+                reason=failure_reason,
             )
             if crash_state.suppressed:
                 logger.error(

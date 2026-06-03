@@ -384,7 +384,8 @@ failed migrations still stop startup and leave the structured migration
 message in `~/.pollypm/rail_daemon.log`.
 
 If the supervisor repeatedly spawns the daemon and no child claims
-`~/.pollypm/rail_daemon.pid`, the supervisor writes
+`~/.pollypm/rail_daemon.pid`, or the child claims the PID but never logs
+`rail_daemon: started`, the supervisor writes
 `~/.pollypm/rail_daemon.crash_loop.json`, stops further respawns for
 that failure window, and upserts a user-facing inbox alert. `pm doctor`
 also reports this as an error. After fixing the startup cause, run

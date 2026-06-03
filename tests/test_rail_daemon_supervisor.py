@@ -280,11 +280,13 @@ class _SpawnRecorder:
         *,
         pid_path: Path | None = None,
         write_pid: bool = True,
+        write_started_log: bool = True,
     ) -> None:
         self.calls: list[Path] = []
         self.raise_on_call = raise_on_call
         self.pid_path = pid_path
         self.write_pid = write_pid
+        self.write_started_log = write_started_log
 
     def __call__(self, config_path: Path) -> None:
         self.calls.append(config_path)
@@ -292,6 +294,10 @@ class _SpawnRecorder:
             raise RuntimeError("simulated spawn failure")
         if self.write_pid and self.pid_path is not None:
             self.pid_path.write_text(str(os.getpid()))
+            if self.write_started_log:
+                log_path = self.pid_path.with_name("rail_daemon.log")
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write("2026-05-09 rail_daemon: started (pid=1)\n")
 
 
 def test_revive_calls_spawner_when_pid_missing(tmp_path: Path):
@@ -638,6 +644,8 @@ def test_concurrent_revival_spawns_exactly_once(
         with spawn_lock:
             spawn_calls.append(cfg)
             pid_path.write_text(str(os.getpid()))
+            with (tmp_path / "rail_daemon.log").open("a", encoding="utf-8") as fh:
+                fh.write("2026-05-09 rail_daemon: started (pid=1)\n")
 
     results: list = [None, None]
 
@@ -939,6 +947,57 @@ def test_concurrent_revive_when_spawner_returns_without_writing_pid(
     assert results[1].spawn_error == "lock_busy"
 
 
+def test_confirmed_child_without_started_log_is_killed_and_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A spawned child that claims the PID but hangs before start is dead.
+
+    This is the #2558 incident shape: the process was alive and owned
+    ``rail_daemon.pid``, but it never emitted the boot-complete line
+    and never advanced the heartbeat rail. PID-only supervision must
+    not treat that as a successful revival.
+    """
+    config_path = tmp_path / "pollypm.toml"
+    pid_path = tmp_path / "rail_daemon.pid"
+    spawner = _SpawnRecorder(
+        pid_path=pid_path,
+        write_pid=True,
+        write_started_log=False,
+    )
+    terminations: list[int] = []
+
+    def fake_terminate(pid: int, **_kw) -> str:
+        terminations.append(pid)
+        return "SIGTERM"
+
+    monkeypatch.setattr(
+        _supervisor_mod, "_terminate_with_grace", fake_terminate,
+    )
+
+    result = check_and_revive_rail_daemon(
+        config_path=config_path,
+        pid_path=pid_path,
+        last_tick_iso=None,
+        last_revival_at=None,
+        spawn_fn=spawner,
+        sleep_fn=lambda _s: None,
+        emit_audit=False,
+        emit_operator_alert=False,
+        child_start_wait_seconds=0.01,
+    )
+
+    assert result.revived is False
+    assert result.spawn_error == "child_start_timeout"
+    assert result.killed_pid == os.getpid()
+    assert result.kill_signal == "SIGTERM"
+    assert terminations == [os.getpid()]
+    assert not pid_path.exists()
+    state = read_crash_loop_state(pid_path)
+    assert state is not None
+    assert state.failure_count == 1
+    assert "did not log 'rail_daemon: started'" in state.reason
+
+
 def test_immediate_exit_crash_loop_suppresses_future_respawns(tmp_path: Path):
     """Repeated starts with no child PID eventually stop respawning.
 
@@ -1025,7 +1084,9 @@ def test_crash_loop_state_clears_after_confirmed_child_pid(tmp_path: Path):
     assert read_crash_loop_state(pid_path) is None
 
 
-def test_daemon_pid_claim_is_atomic(tmp_path: Path):
+def test_daemon_pid_claim_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     """Two daemons racing to claim the same PID file → exactly one wins.
 
     Belt-and-suspenders for the supervisor lock: even if two daemon
@@ -1034,16 +1095,29 @@ def test_daemon_pid_claim_is_atomic(tmp_path: Path):
     ``O_EXCL`` to ensure exactly one ends up named in the PID file.
     The loser sees ``False`` and exits cleanly.
     """
-    from pollypm.rail_daemon import _claim_pid_file
+    import pollypm.rail_daemon as daemon_mod
 
     pid_path = tmp_path / "rail_daemon.pid"
     barrier = threading.Barrier(8)
     outcomes: list[bool] = []
     outcomes_lock = threading.Lock()
+    fake_pids: dict[int, int] = {}
+    fake_pids_lock = threading.Lock()
+
+    def fake_getpid() -> int:
+        ident = threading.get_ident()
+        with fake_pids_lock:
+            if ident not in fake_pids:
+                fake_pids[ident] = 50000 + len(fake_pids)
+            return fake_pids[ident]
+
+    monkeypatch.setattr(daemon_mod.os, "getpid", fake_getpid)
+    monkeypatch.setattr(daemon_mod, "_pid_alive", lambda _pid: True)
 
     def claimer() -> None:
+        fake_getpid()
         barrier.wait()
-        ok = _claim_pid_file(pid_path)
+        ok = daemon_mod._claim_pid_file(pid_path)
         with outcomes_lock:
             outcomes.append(ok)
 
@@ -1061,7 +1135,7 @@ def test_daemon_pid_claim_is_atomic(tmp_path: Path):
     )
     # The PID file names exactly one PID — ours.
     assert pid_path.exists()
-    assert pid_path.read_text().strip() == str(os.getpid())
+    assert int(pid_path.read_text().strip()) in set(fake_pids.values())
 
 
 # ---------------------------------------------------------------------------

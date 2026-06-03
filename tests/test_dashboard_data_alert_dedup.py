@@ -300,7 +300,7 @@ def test_worktree_state_demotes_tracked_project_without_recent_real_work() -> No
 def test_alert_project_key_resolves_project_scoped_alert_families() -> None:
     from pollypm.alert_actionability import alert_project_key
 
-    known = frozenset({"media", "sam-blog"})
+    known = frozenset({"media", "sam-blog", "savethenovel"})
     rows = [
         SimpleNamespace(
             session_name="plan_gate-media",
@@ -330,6 +330,19 @@ def test_alert_project_key_resolves_project_scoped_alert_families() -> None:
             session_name="worker-media-11",
             alert_type="worktree_state:media/11:dirty_stale",
         ),
+        SimpleNamespace(
+            session_name="architect_savethenovel",
+            alert_type="architect_worktree_stale",
+        ),
+        SimpleNamespace(
+            session_name="reviewer_sam-blog",
+            alert_type="review_pending",
+        ),
+        SimpleNamespace(
+            session_name="audit-plan_missing_queue_stalled-media-media",
+            alert_type="audit_watchdog",
+            message="Project media has 1 queued task(s) waiting on a plan.",
+        ),
     ]
 
     assert [
@@ -342,6 +355,9 @@ def test_alert_project_key_resolves_project_scoped_alert_families() -> None:
         "media",
         "sam-blog",
         "media",
+        "media",
+        "savethenovel",
+        "sam-blog",
         "media",
     ]
 

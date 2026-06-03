@@ -16,6 +16,7 @@ from pollypm.activity_low_signal import (
     is_low_signal_activity,
 )
 from pollypm.audit.query import iter_recent_matching_events, resolve_target_files
+from pollypm.project_liveness import project_key_looks_synthetic
 from pollypm.recovery.narration import is_recovery_event, summarize_audit_event
 from pollypm.web_api.models import Event
 from pollypm.web_api.routes._deps import ConfigDep
@@ -104,6 +105,15 @@ def activity_endpoint(
             )
         ),
     ] = False,
+    include_fixtures: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include audit findings from synthetic seed/test projects. "
+                "Explicit event_type or pattern searches include them too."
+            )
+        ),
+    ] = False,
 ) -> ActivityResponse:
     """Return audit events shaped for the dashboard activity rail."""
 
@@ -145,6 +155,9 @@ def activity_endpoint(
             include_low_signal=(
                 include_low_signal or bool(event_type) or bool(pattern)
             ),
+            include_fixtures=(
+                include_fixtures or bool(event_type) or bool(pattern)
+            ),
         ),
         next_cursor=None,
         _malformed_rows_skipped=(
@@ -162,9 +175,12 @@ class _ActivityGroup:
     representative: Event
     count: int = 0
     subjects: list[str] = field(default_factory=list)
+    last_seen: datetime | None = None
 
     def add(self, event: Event) -> None:
         self.count += 1
+        if self.last_seen is None or event.ts > self.last_seen:
+            self.last_seen = event.ts
         if event.subject:
             self.subjects.append(event.subject)
 
@@ -182,6 +198,7 @@ def _compose_activity_feed(
     limit: int,
     project_filter: str | None,
     include_low_signal: bool = False,
+    include_fixtures: bool = False,
 ) -> list[ActivityEvent]:
     deduped: list[Event] = []
     seen: set[tuple[str, str, str, str, str, str, str]] = set()
@@ -189,6 +206,7 @@ def _compose_activity_feed(
         if not _should_include_activity_event(
             event,
             include_low_signal=include_low_signal,
+            include_fixtures=include_fixtures,
         ):
             continue
         identity = _activity_event_identity(event)
@@ -200,7 +218,7 @@ def _compose_activity_feed(
     deduped.sort(key=_event_sort_key, reverse=True)
 
     entries: list[ActivityEvent] = []
-    groups: dict[tuple[str, str, str, str], _ActivityGroup] = {}
+    groups: dict[tuple[str, ...], _ActivityGroup] = {}
     for event in deduped:
         group_key = _activity_group_key(event)
         if group_key is None:
@@ -233,12 +251,20 @@ def _should_include_activity_event(
     event: Event,
     *,
     include_low_signal: bool,
+    include_fixtures: bool,
 ) -> bool:
-    if include_low_signal:
-        return True
     if is_recovery_event(event.event):
         return True
-    if event.event == "audit.finding" or event.event.startswith("watchdog."):
+    if event.event == "audit.finding":
+        if (
+            not include_fixtures
+            and project_key_looks_synthetic(event.project)
+        ):
+            return False
+        return True
+    if include_low_signal:
+        return True
+    if event.event.startswith("watchdog."):
         return True
     if event.event.strip().lower() in _LOW_SIGNAL_ACTIVITY_KINDS:
         return False
@@ -274,17 +300,30 @@ def _event_sort_key(event: Event) -> datetime:
     return event.ts
 
 
-def _activity_group_key(event: Event) -> tuple[str, str, str, str] | None:
+def _activity_group_key(event: Event) -> tuple[str, ...] | None:
+    if event.event == "audit.finding":
+        problem = _activity_problem_key(event)
+        return (
+            event.project,
+            event.event,
+            event.status,
+            event.subject,
+            problem,
+        )
     if event.event not in _ACTIVITY_GROUPED_EVENTS:
         return None
+    problem = _activity_problem_key(event)
+    return (event.project, event.event, event.status, problem)
+
+
+def _activity_problem_key(event: Event) -> str:
     metadata = event.metadata or {}
-    problem = str(
+    return str(
         metadata.get("rule")
         or metadata.get("finding_type")
         or metadata.get("reason")
         or ""
     )
-    return (event.project, event.event, event.status, problem)
 
 
 def _activity_event_from_group(group: _ActivityGroup) -> ActivityEvent:
@@ -294,6 +333,7 @@ def _activity_event_from_group(group: _ActivityGroup) -> ActivityEvent:
     metadata["activity_group"] = {
         "count": group.count,
         "event": event.event,
+        "last_seen": (group.last_seen or event.ts).isoformat(),
         "subjects": group.subjects[:10],
     }
     data["metadata"] = metadata
@@ -319,6 +359,16 @@ def _activity_group_summary(group: _ActivityGroup) -> str:
         problem = _plural_activity_problem(event, count)
         project = _activity_project_label(event.project)
         return f"I sent unstick briefs for {count} {problem} in {project}."
+    if event.event == "audit.finding":
+        summary = summarize_audit_event(
+            event_name=event.event,
+            subject=event.subject,
+            actor=event.actor,
+            status=event.status,
+            project=event.project,
+            metadata=event.metadata or {},
+        )
+        return f"{summary} (seen {count} times)."
     return summarize_audit_event(
         event_name=event.event,
         subject=event.subject,

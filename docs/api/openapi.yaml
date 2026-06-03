@@ -2934,7 +2934,12 @@ paths:
         metadata into calm operator-facing prose. Low-signal plumbing
         events are hidden by default, but remain available through
         `include_low_signal=true` or explicit `event_type`/`pattern`
-        searches.
+        searches. Synthetic seed/test-project `audit.finding` rows are
+        also hidden by default, while repeated real-project findings
+        for the same project/subject/finding collapse into one row with
+        recurrence details in `metadata.activity_group`. Use
+        `include_fixtures=true` or an explicit `event_type`/`pattern`
+        search to inspect fixture findings.
       parameters:
         - in: query
           name: project
@@ -2965,6 +2970,12 @@ paths:
             type: boolean
             default: false
           description: Include low-signal plumbing rows such as `work_db.opened`.
+        - in: query
+          name: include_fixtures
+          schema:
+            type: boolean
+            default: false
+          description: Include audit findings from synthetic seed/test projects.
         - in: query
           name: limit
           schema:

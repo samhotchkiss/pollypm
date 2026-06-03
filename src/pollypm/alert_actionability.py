@@ -131,16 +131,23 @@ def _session_prefix_project(
     allow_numeric_tail: bool,
 ) -> str | None:
     for prefix in prefixes:
-        if not session_name.startswith(prefix):
-            continue
-        tail = session_name[len(prefix):].strip()
-        project = _known_project_match(tail, known_projects=known_projects)
-        if project is not None:
-            return project
-        if allow_numeric_tail and "-" in tail:
-            head, _sep, number = tail.rpartition("-")
-            if head and number.isdigit():
-                return head
+        candidate_prefixes = [prefix]
+        if prefix.endswith("-"):
+            candidate_prefixes.append(prefix[:-1] + "_")
+        for candidate_prefix in candidate_prefixes:
+            if not session_name.startswith(candidate_prefix):
+                continue
+            tail = session_name[len(candidate_prefix):].strip()
+            project = _known_project_match(tail, known_projects=known_projects)
+            if project is not None:
+                return project
+            if allow_numeric_tail:
+                for separator in ("-", "_"):
+                    if separator not in tail:
+                        continue
+                    head, _sep, number = tail.rpartition(separator)
+                    if head and number.isdigit():
+                        return head
     return None
 
 
@@ -216,10 +223,16 @@ def _queue_without_motion_project(
     known_projects: frozenset[str] | None,
 ) -> str | None:
     session_name = _text_value(alert, "session_name", "scope")
+    message = _text_value(alert, "message", "body")
+    alert_type = _text_value(alert, "alert_type", "type")
+    if alert_type == _WATCHDOG_ALERT_TYPE:
+        match = _QWM_PROJECT_RE.search(message)
+        if match is not None:
+            return match.group("project")
+
     if not session_name.startswith(_QUEUE_WITHOUT_MOTION_SESSION_PREFIX):
         return None
 
-    message = _text_value(alert, "message", "body")
     match = _QWM_PROJECT_RE.search(message)
     if match is not None:
         return match.group("project")

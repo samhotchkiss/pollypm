@@ -52,7 +52,12 @@ from pollypm.plan_presence import (
     has_acceptable_plan,
     task_bypasses_plan_gate,
 )
-from pollypm.project_liveness import recent_real_work_project_keys
+from pollypm.project_liveness import (
+    is_real_operator_project,
+    project_has_real_stalled_work,
+    recent_real_work_project_keys,
+    task_status_key,
+)
 from pollypm.plugins_builtin.task_assignment_notify.resolver import (
     SWEEPER_COOLDOWN_SECONDS,
     _known_project_keys,
@@ -162,12 +167,20 @@ def _recent_real_work_project_keys_for_sweep(
     completed work.
     """
 
+    return _project_task_facts_for_sweep(services)[0]
+
+
+def _project_task_facts_for_sweep(
+    services: Any,
+) -> tuple[frozenset[str] | None, dict[str, dict[str, int]]]:
+    """Return recent-real-work and status-count facts for sweep liveness."""
+
     config = getattr(services, "config", None)
     if config is None:
-        return None
+        return None, {}
     projects = getattr(config, "projects", {}) or {}
     if not projects:
-        return None
+        return None, {}
     try:
         from pollypm.cockpit_pg_aggregates import (
             all_tasks_for_project,
@@ -176,17 +189,27 @@ def _recent_real_work_project_keys_for_sweep(
 
         grouped = all_tasks_grouped(config)
         if grouped is None:
-            return None
-        return recent_real_work_project_keys(
+            return None, {}
+        counts_by_project: dict[str, dict[str, int]] = {}
+        for project_key in projects:
+            counts: dict[str, int] = {}
+            for task in all_tasks_for_project(grouped, config, project_key):
+                status_key = task_status_key(task)
+                if not status_key:
+                    continue
+                counts[status_key] = counts.get(status_key, 0) + 1
+            counts_by_project[str(project_key)] = counts
+        recent = recent_real_work_project_keys(
             projects,
             lambda project_key: all_tasks_for_project(grouped, config, project_key),
         )
+        return recent, counts_by_project
     except Exception:  # noqa: BLE001
         logger.debug(
             "task_assignment sweep: recent real-work liveness lookup failed",
             exc_info=True,
         )
-        return None
+        return None, {}
 
 
 def _project_is_live_for_sweep(
@@ -214,6 +237,45 @@ def _known_projects_for_sweep(
         if _project_is_live_for_sweep(
             getattr(project, "key", None),
             recent_real_work_projects,
+        )
+    )
+
+
+def _project_can_emit_plan_missing_without_recent_work(
+    project: Any,
+    *,
+    project_task_counts: dict[str, dict[str, int]],
+) -> bool:
+    project_key = getattr(project, "key", None)
+    if not project_key:
+        return False
+    if not is_real_operator_project(project_key, project):
+        return False
+    return project_has_real_stalled_work(
+        project_key,
+        project_task_counts.get(str(project_key)),
+    )
+
+
+def _known_projects_for_plan_missing_precompute(
+    services: Any,
+    *,
+    recent_real_work_projects: frozenset[str] | None,
+    project_task_counts: dict[str, dict[str, int]],
+) -> tuple[Any, ...]:
+    projects = tuple(getattr(services, "known_projects", ()) or ())
+    if recent_real_work_projects is None:
+        return projects
+    return tuple(
+        project
+        for project in projects
+        if _project_is_live_for_sweep(
+            getattr(project, "key", None),
+            recent_real_work_projects,
+        )
+        or _project_can_emit_plan_missing_without_recent_work(
+            project,
+            project_task_counts=project_task_counts,
         )
     )
 
@@ -1312,12 +1374,17 @@ def _sweep_work_service(
     # ``auto_claim_skipped_plan_missing`` outcome on the same task.
     known_by_key: dict[str, Any] = {}
     if project is None and project_path is None:
-        for known in _known_projects_for_sweep(
-            services,
-            recent_real_work_projects=recent_real_work_projects,
-        ):
+        for known in tuple(getattr(services, "known_projects", ()) or ()):
             known_key = getattr(known, "key", None)
-            if known_key:
+            if not known_key:
+                continue
+            if (
+                _project_is_live_for_sweep(
+                    known_key,
+                    recent_real_work_projects,
+                )
+                or str(known_key) in plan_missing_projects
+            ):
                 known_by_key[known_key] = known
     for status in _SWEEPABLE_STATUSES:
         try:
@@ -1341,10 +1408,15 @@ def _sweep_work_service(
                 task_project_key,
                 recent_real_work_projects,
             ):
-                by_outcome["skipped_dormant_project"] = (
-                    by_outcome.get("skipped_dormant_project", 0) + 1
+                can_check_plan_missing = (
+                    status == WorkStatus.QUEUED.value
+                    and task_project_key in plan_missing_projects
                 )
-                continue
+                if not can_check_plan_missing:
+                    by_outcome["skipped_dormant_project"] = (
+                        by_outcome.get("skipped_dormant_project", 0) + 1
+                    )
+                    continue
             if (
                 review_pending_tasks is not None
                 and status == WorkStatus.REVIEW.value
@@ -2650,6 +2722,7 @@ def _precompute_plan_missing_projects(
     services: Any,
     *,
     recent_real_work_projects: frozenset[str] | None = None,
+    project_task_counts: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, str | None]:
     """Return a mapping of plan-gated project keys → an example queued task_id.
 
@@ -2670,9 +2743,10 @@ def _precompute_plan_missing_projects(
         if not global_enforce:
             return {}
         known = list(
-            _known_projects_for_sweep(
+            _known_projects_for_plan_missing_precompute(
                 services,
                 recent_real_work_projects=recent_real_work_projects,
+                project_task_counts=project_task_counts or {},
             )
         )
         if not known:
@@ -3028,13 +3102,17 @@ def _task_assignment_sweep_body(
 
     totals: dict[str, Any] = {"considered": 0, "by_outcome": {}}
     alerted_pairs: set[tuple[str, str]] = set()
-    recent_real_work_projects = _recent_real_work_project_keys_for_sweep(services)
+    (
+        recent_real_work_projects,
+        project_task_counts,
+    ) = _project_task_facts_for_sweep(services)
     # #1524 — pre-compute the set of projects that are plan-gated this
     # tick so the emit/clear decision is deterministic across the
     # workspace pass + per-project pass.
     precomputed_missing = _precompute_plan_missing_projects(
         services,
         recent_real_work_projects=recent_real_work_projects,
+        project_task_counts=project_task_counts,
     )
     plan_missing_projects: set[str] = set(precomputed_missing.keys())
     plan_decisions: dict[str, bool] = {}

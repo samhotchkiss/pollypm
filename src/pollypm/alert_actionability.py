@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
 from pollypm.cockpit_alerts import is_operational_alert
+from pollypm.project_liveness import project_key_looks_synthetic
 
 
 _STUCK_ON_TASK_PREFIX = "stuck_on_task:"
@@ -31,9 +32,10 @@ _QWM_PROJECT_RE = re.compile(r"\bProject\s+(?P<project>[A-Za-z0-9_.-]+)\s+has\b"
 # ``ghost``, ``alpha``, ``queuestorm_*``, ...) — many of which were
 # still tracked, so trackedness alone was a false liveness signal. We
 # demote a recovery warn when it is scoped to a project that is not
-# tracked OR has no recent real completed work. The session-name →
-# project extraction mirrors the synthetic scope strings the sweep
-# writes (see ``plugins_builtin/task_assignment_notify/handlers/sweep.py``):
+# tracked, synthetic, or has neither recent real completed work nor real
+# stalled work. The session-name → project extraction mirrors the
+# synthetic scope strings the sweep writes (see
+# ``plugins_builtin/task_assignment_notify/handlers/sweep.py``):
 #   plan_missing        -> ``plan_gate-<project>``
 #   worker_session_gap  -> ``worker_session_gap-<project>``
 #   missing_task_worker -> ``missing_task_worker-<project>/<task-number>``
@@ -42,6 +44,13 @@ _RECOVERY_WATCHDOG_SESSION_PREFIXES: dict[str, str] = {
     "worker_session_gap": "worker_session_gap-",
     "missing_task_worker": "missing_task_worker-",
 }
+_REAL_WORK_STALL_STATUSES = frozenset({
+    "queued",
+    "blocked",
+    "in_progress",
+    "review",
+    "rework",
+})
 
 
 @dataclass(slots=True, frozen=True)
@@ -167,6 +176,22 @@ def _project_is_inactive_for_operator_count(
     return False
 
 
+def _project_has_real_stalled_work(
+    project: str,
+    *,
+    context: AlertActionabilityContext,
+) -> bool:
+    if project_key_looks_synthetic(project):
+        return False
+    counts = context.project_task_counts.get(project)
+    if not counts:
+        return False
+    for status in _REAL_WORK_STALL_STATUSES:
+        if int(counts.get(status, 0) or 0) > 0:
+            return True
+    return False
+
+
 def _worktree_state_is_stale(
     alert_type: str,
     *,
@@ -236,8 +261,10 @@ def _recovery_watchdog_warn_is_self_healing(
     Counting it in the operator's "N things need you" headline trains
     the operator to ignore the number (#2475/#2480). Trackedness is not
     enough: watchdog churn can keep a dead tracked project looking
-    freshly touched, so callers may also pass the set of projects with
-    recent real ``done`` work.
+    freshly touched, so callers may also pass recent real ``done`` work
+    and task-count facts. A real tracked project with queued / blocked /
+    in-progress work is still operator-relevant before its first done
+    task (#2545).
     """
 
     if alert_type not in _RECOVERY_WATCHDOG_SESSION_PREFIXES:
@@ -252,6 +279,8 @@ def _recovery_watchdog_warn_is_self_healing(
         known_projects=context.known_projects or context.tracked_projects,
     )
     if not project:
+        return False
+    if _project_has_real_stalled_work(project, context=context):
         return False
     return _project_is_inactive_for_operator_count(project, context=context)
 

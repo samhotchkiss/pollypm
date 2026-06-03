@@ -187,6 +187,40 @@ def test_capture_preserves_internal_blank_lines() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Claude Code welcome-screen chrome
+# ---------------------------------------------------------------------------
+
+
+def test_capture_drops_claude_welcome_screen_chrome() -> None:
+    output = """\
+? for shortcuts · ← for agents
+────────────────────────────────────────
+❯ Try "write a test for <filepath>"
+────────────────────────────────────────
+
+
+  ▘▘ ▝▝    ~/dev
+▝▜█████▛▘  Opus 4.7 · Claude Max
+ ▐▛███▜▌   Claude Code v2.1.158
+"""
+    tmux = _StubTmuxClient(output=output)
+
+    assert capture_envelopes(tmux, session_name="operator", target="t") == []
+
+
+def test_capture_keeps_conversation_that_mentions_claude_code_version() -> None:
+    output = "Claude Code v2.1.158 is installed here.\nActual answer.\n"
+    tmux = _StubTmuxClient(output=output)
+
+    envelopes = capture_envelopes(tmux, session_name="operator", target="t")
+
+    assert [env.text for env in envelopes] == [
+        "Claude Code v2.1.158 is installed here.",
+        "Actual answer.",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Empty / failure cases
 # ---------------------------------------------------------------------------
 

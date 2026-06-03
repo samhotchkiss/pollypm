@@ -364,6 +364,140 @@ def test_activity_endpoint_groups_repeated_watchdog_escalations(
     assert event["metadata"]["activity_group"]["count"] == 3
 
 
+def test_activity_endpoint_hides_synthetic_audit_findings_and_groups_real_subjects(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """Fixture-project findings stay out; recurring real findings collapse."""
+    now = datetime.now(timezone.utc)
+    latest_media_seen = now - timedelta(seconds=1)
+    _write_jsonl(
+        _central_log(audit_home, "media"),
+        [
+            _make_event(
+                project="media",
+                event="audit.finding",
+                subject="media",
+                status="warn",
+                actor="audit_watchdog",
+                ts=latest_media_seen.isoformat(),
+                metadata={"rule": "queue_without_motion"},
+            ),
+            _make_event(
+                project="media",
+                event="audit.finding",
+                subject="media",
+                status="warn",
+                actor="audit_watchdog",
+                ts=(now - timedelta(seconds=2)).isoformat(),
+                metadata={"rule": "queue_without_motion"},
+            ),
+            _make_event(
+                project="media",
+                event="audit.finding",
+                subject="media",
+                status="warn",
+                actor="audit_watchdog",
+                ts=(now - timedelta(seconds=3)).isoformat(),
+                metadata={"rule": "queue_without_motion"},
+            ),
+            _make_event(
+                project="booktalk",
+                event="audit.finding",
+                subject="booktalk/124",
+                status="warn",
+                actor="audit_watchdog",
+                ts=(now - timedelta(seconds=4)).isoformat(),
+                metadata={"rule": "stuck_draft"},
+            ),
+        ],
+    )
+    _write_jsonl(
+        _central_log(audit_home, "pm_test_01wave_1779715196"),
+        [
+            _make_event(
+                project="pm_test_01wave_1779715196",
+                event="audit.finding",
+                subject="pm_test_01wave_1779715196",
+                status="warn",
+                actor="audit_watchdog",
+                ts=(now - timedelta(seconds=5 + number)).isoformat(),
+                metadata={"rule": "queue_without_motion"},
+            )
+            for number in range(6)
+        ],
+    )
+    _write_jsonl(
+        _central_log(audit_home, "pr2316_drift_1779720195"),
+        [
+            _make_event(
+                project="pr2316_drift_1779720195",
+                event="audit.finding",
+                subject="pr2316_drift_1779720195",
+                status="warn",
+                actor="audit_watchdog",
+                ts=(now - timedelta(seconds=20 + number)).isoformat(),
+                metadata={"rule": "queue_without_motion"},
+            )
+            for number in range(7)
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={"since": "24h", "limit": 40},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    events = response.json()["events"]
+    subjects = [event["subject"] for event in events]
+    assert subjects.count("media") == 1
+    assert "booktalk/124" in subjects
+    assert not any(subject.startswith("pm_test_") for subject in subjects)
+    assert not any(subject.startswith("pr2316_drift_") for subject in subjects)
+    media = next(event for event in events if event["subject"] == "media")
+    assert media["metadata"]["activity_group"]["count"] == 3
+    assert media["metadata"]["activity_group"]["last_seen"] == (
+        latest_media_seen.isoformat()
+    )
+    assert "seen 3 times" in media["summary"]
+
+
+def test_activity_endpoint_include_fixtures_returns_synthetic_findings(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """The explicit fixture override keeps the forensic stream inspectable."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _central_log(audit_home, "pm_test_01wave_1779715196"),
+        [
+            _make_event(
+                project="pm_test_01wave_1779715196",
+                event="audit.finding",
+                subject="pm_test_01wave_1779715196",
+                status="warn",
+                actor="audit_watchdog",
+                ts=now.isoformat(),
+                metadata={"rule": "queue_without_motion"},
+            )
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/activity",
+        params={"since": "24h", "limit": 10, "include_fixtures": "1"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    subjects = [event["subject"] for event in response.json()["events"]]
+    assert "pm_test_01wave_1779715196" in subjects
+
+
 def test_activity_endpoint_keeps_cross_project_signal_when_one_project_is_noisy(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -434,6 +568,8 @@ def test_activity_endpoint_hides_low_signal_plumbing_by_default(
             ),
             _make_event(
                 event="audit.finding",
+                project="media",
+                subject="media",
                 status="warn",
                 ts=(now - timedelta(seconds=4)).isoformat(),
             ),
@@ -554,6 +690,24 @@ def test_activity_low_signal_definition_is_shared_by_web_and_tui() -> None:
     assert activity._LOW_SIGNAL_ACTIVITY_KINDS is LOW_SIGNAL_ACTIVITY_KINDS
     assert "work_db.opened" in LOW_SIGNAL_ACTIVITY_KINDS
     assert "session.pause.skip" in LOW_SIGNAL_ACTIVITY_KINDS
+
+
+def test_activity_synthetic_project_definition_is_shared_with_alert_liveness() -> None:
+    """The feed imports the same synthetic predicate used by alert liveness."""
+    from pollypm import dashboard_data, project_liveness
+    from pollypm.web_api.routes import activity
+
+    assert (
+        activity.project_key_looks_synthetic
+        is project_liveness.project_key_looks_synthetic
+    )
+    assert (
+        dashboard_data.is_real_operator_project
+        is project_liveness.is_real_operator_project
+    )
+    assert project_liveness.project_key_looks_synthetic(
+        "pm_test_01wave_1779715196"
+    )
 
 
 def test_grep_regex_pattern_filters_lines(

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
 from pollypm.cockpit_alerts import is_operational_alert
-from pollypm.project_liveness import project_key_looks_synthetic
+from pollypm.project_liveness import project_has_real_stalled_work
 
 
 _STUCK_ON_TASK_PREFIX = "stuck_on_task:"
@@ -44,14 +44,6 @@ _RECOVERY_WATCHDOG_SESSION_PREFIXES: dict[str, str] = {
     "worker_session_gap": "worker_session_gap-",
     "missing_task_worker": "missing_task_worker-",
 }
-_REAL_WORK_STALL_STATUSES = frozenset({
-    "queued",
-    "blocked",
-    "in_progress",
-    "review",
-    "rework",
-})
-
 
 @dataclass(slots=True, frozen=True)
 class AlertActionabilityContext:
@@ -176,22 +168,6 @@ def _project_is_inactive_for_operator_count(
     return False
 
 
-def _project_has_real_stalled_work(
-    project: str,
-    *,
-    context: AlertActionabilityContext,
-) -> bool:
-    if project_key_looks_synthetic(project):
-        return False
-    counts = context.project_task_counts.get(project)
-    if not counts:
-        return False
-    for status in _REAL_WORK_STALL_STATUSES:
-        if int(counts.get(status, 0) or 0) > 0:
-            return True
-    return False
-
-
 def _worktree_state_is_stale(
     alert_type: str,
     *,
@@ -280,7 +256,10 @@ def _recovery_watchdog_warn_is_self_healing(
     )
     if not project:
         return False
-    if _project_has_real_stalled_work(project, context=context):
+    if project_has_real_stalled_work(
+        project,
+        context.project_task_counts.get(project),
+    ):
         return False
     return _project_is_inactive_for_operator_count(project, context=context)
 

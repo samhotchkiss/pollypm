@@ -104,6 +104,31 @@ def task_status_key(task: object) -> str:
     return str(status_value or "")
 
 
+REAL_WORK_STALL_STATUSES = frozenset({
+    "queued",
+    "blocked",
+    "in_progress",
+    "review",
+    "rework",
+})
+
+
+def project_has_real_stalled_work(
+    project_key: object,
+    status_counts: Mapping[str, int] | None,
+) -> bool:
+    """Return True when a real project has unfinished operator-relevant work."""
+
+    if project_key_looks_synthetic(project_key):
+        return False
+    if not status_counts:
+        return False
+    for status in REAL_WORK_STALL_STATUSES:
+        if int(status_counts.get(status, 0) or 0) > 0:
+            return True
+    return False
+
+
 def coerce_utc_datetime(value: object) -> datetime | None:
     """Coerce an ISO/datetime value to UTC, returning ``None`` on parse failure."""
 
@@ -222,9 +247,11 @@ def real_operator_project_items(
 
 __all__ = [
     "RECENT_REAL_WORK_WINDOW",
+    "REAL_WORK_STALL_STATUSES",
     "coerce_utc_datetime",
     "is_real_operator_project",
     "project_key_looks_synthetic",
+    "project_has_real_stalled_work",
     "project_path_looks_synthetic",
     "real_operator_project_items",
     "real_operator_project_keys",

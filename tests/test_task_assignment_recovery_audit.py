@@ -7,9 +7,12 @@ from pollypm.audit.log import EVENT_TASK_RECLAIMED, read_events
 from pollypm.plugins_builtin.task_assignment_notify.handlers import sweep as sweep_mod
 from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
     _auto_claim_next,
+    _precompute_plan_missing_projects,
     _recover_dead_claims,
+    _sweep_work_service,
     _sweep_workspace_per_project,
 )
+from pollypm.project_liveness import project_has_real_stalled_work
 from pollypm.work.models import WorkStatus
 
 
@@ -86,6 +89,24 @@ class _FakeAutoClaimWork:
         if self.claim_error is not None:
             raise self.claim_error
         self.claimed.append((task_id, actor))
+
+
+class _FakePlanWork:
+    def __init__(self, queued: list[SimpleNamespace]) -> None:
+        self.queued = queued
+        self.closed = False
+
+    def list_tasks(
+        self, *, project: str | None = None, work_status: str,
+    ) -> list[SimpleNamespace]:
+        if work_status != WorkStatus.QUEUED.value:
+            return []
+        if project is None:
+            return list(self.queued)
+        return [task for task in self.queued if task.project == project]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeMsgStore:
@@ -178,6 +199,142 @@ def test_auto_claim_workspace_pass_skips_dormant_projects(monkeypatch) -> None:
     assert recovered == ["savethenovel"]
     assert claimed == ["savethenovel"]
     assert work_by_project["savethenovel"].closed
+
+
+def test_plan_missing_precompute_includes_real_dormant_stall_not_fixture(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """#2548: plan_missing emission gets the same stalled-work carve-out
+    that alert actionability uses, while synthetic fixtures stay quiet.
+    """
+    media_path = tmp_path / "media"
+    fixture_path = tmp_path / "pm_test_alpha"
+    media_path.mkdir()
+    fixture_path.mkdir()
+    media = SimpleNamespace(key="media", path=media_path, tracked=True)
+    fixture = SimpleNamespace(
+        key="pm_test_alpha",
+        path=fixture_path,
+        tracked=True,
+    )
+    media_task = SimpleNamespace(
+        project="media",
+        task_id="media/1",
+        labels=[],
+        flow_template_id="standard",
+    )
+    fixture_task = SimpleNamespace(
+        project="pm_test_alpha",
+        task_id="pm_test_alpha/1",
+        labels=[],
+        flow_template_id="standard",
+    )
+    works = {
+        "media": _FakePlanWork([media_task]),
+        "pm_test_alpha": _FakePlanWork([fixture_task]),
+    }
+    opened: list[str] = []
+
+    def _open(project, _services):
+        opened.append(project.key)
+        return works[project.key]
+
+    monkeypatch.setattr(
+        sweep_mod,
+        "_open_workspace_project_work_service",
+        _open,
+    )
+    monkeypatch.setattr(
+        "pollypm.plan_presence.has_acceptable_plan",
+        lambda *_args, **_kwargs: False,
+    )
+    services = SimpleNamespace(
+        enforce_plan=True,
+        known_projects=(media, fixture),
+        plan_dir="docs/plan",
+    )
+    project_task_counts = {
+        "media": {"queued": 1},
+        "pm_test_alpha": {"queued": 1},
+    }
+
+    assert project_has_real_stalled_work("media", project_task_counts["media"])
+    assert not project_has_real_stalled_work(
+        "pm_test_alpha",
+        project_task_counts["pm_test_alpha"],
+    )
+
+    missing = _precompute_plan_missing_projects(
+        services,
+        recent_real_work_projects=frozenset(),
+        project_task_counts=project_task_counts,
+    )
+
+    assert missing == {"media": "media/1"}
+    assert opened == ["media"]
+    assert works["media"].closed
+    assert not works["pm_test_alpha"].closed
+
+
+def test_sweep_checks_precomputed_plan_missing_before_dormant_skip(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A precomputed plan_missing project must not be lost at the
+    per-task dormant-project guard before the gate can record the skip.
+    """
+    project_path = tmp_path / "media"
+    project_path.mkdir()
+    task = SimpleNamespace(
+        project="media",
+        task_id="media/1",
+        labels=[],
+        flow_template_id="standard",
+    )
+    work = _FakePlanWork([task])
+    services = SimpleNamespace(
+        enforce_plan=True,
+        known_projects=(SimpleNamespace(key="media", path=project_path),),
+        plan_dir="docs/plan",
+        msg_store=_FakeMsgStore(),
+    )
+    totals = {"considered": 0, "by_outcome": {}}
+
+    monkeypatch.setattr(
+        sweep_mod,
+        "_build_event_for_task",
+        lambda _work, _task: SimpleNamespace(
+            project="media",
+            task_id="media/1",
+            actor_name="worker",
+            work_status=WorkStatus.QUEUED.value,
+        ),
+    )
+    monkeypatch.setattr(
+        sweep_mod,
+        "notify",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plan-gated dormant task should not notify")
+        ),
+    )
+
+    _sweep_work_service(
+        work,
+        services,
+        throttle_override=30,
+        totals=totals,
+        alerted_pairs=set(),
+        plan_missing_projects={"media"},
+        plan_decisions={"media": False},
+        project_path=None,
+        project=None,
+        recent_real_work_projects=frozenset(),
+    )
+
+    assert totals["considered"] == 0
+    assert totals["by_outcome"]["skipped_plan_missing"] == 1
+    assert "skipped_dormant_project" not in totals["by_outcome"]
 
 
 def test_recover_dead_claims_emits_task_reclaimed_audit(

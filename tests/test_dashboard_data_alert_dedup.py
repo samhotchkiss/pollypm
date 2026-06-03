@@ -12,6 +12,7 @@ for non-faults the user already sees as yellow.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 from pollypm.dashboard_data import _stuck_alert_already_user_waiting
@@ -731,6 +732,7 @@ def test_briefing_pluralizes_counts_correctly() -> None:
             )
         ],
         recovery_count_24h=1,
+        generated_at=datetime(2026, 6, 2, 8, 0, tzinfo=UTC),
     )
     assert "1 commit across 1 project" in out
     assert "1 item wrapped" in out
@@ -773,6 +775,37 @@ def test_briefing_pluralizes_counts_correctly() -> None:
     assert "other/99" not in out2
     assert "(s)" not in out2
     assert "(ies)" not in out2
+
+
+def test_briefing_greeting_tracks_generated_time() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing
+
+    base = {
+        "commits": [],
+        "completed": [],
+        "inbox_count": 0,
+        "recent_messages": [],
+        "recovery_count_24h": 0,
+    }
+
+    morning = _build_dashboard_briefing(
+        **base,
+        generated_at=datetime(2026, 6, 2, 8, 0, tzinfo=UTC),
+    )
+    afternoon = _build_dashboard_briefing(
+        **base,
+        generated_at=datetime(2026, 6, 2, 14, 0, tzinfo=UTC),
+    )
+    evening = _build_dashboard_briefing(
+        **base,
+        generated_at=datetime(2026, 6, 2, 17, 36, tzinfo=UTC),
+    )
+
+    assert morning.startswith("Morning. Here's the overnight read.")
+    assert afternoon.startswith("Afternoon. Here's where things stand.")
+    assert evening.startswith("Evening. Here's where things stand.")
+    assert "overnight read" not in afternoon
+    assert "overnight read" not in evening
 
 
 def test_briefing_splits_bookkeeping_commits_from_product_progress() -> None:
@@ -1063,6 +1096,37 @@ def test_briefing_first_up_skips_dormant_projects() -> None:
     assert "open Inbox and clear that first" in out
 
 
+def test_briefing_names_dormant_operator_blocked_handoff() -> None:
+    from pollypm.dashboard_data import _build_dashboard_briefing, InboxPreview
+
+    out = _build_dashboard_briefing(
+        commits=[],
+        completed=[],
+        inbox_count=1,
+        recent_messages=[
+            InboxPreview(
+                sender="polly",
+                title="Provide inputs to unblock Samblog Phase 0",
+                project="Samblog",
+                task_id="samblog/30",
+                age_seconds=3600.0,
+                project_key="samblog",
+                allow_dormant_briefing=True,
+            )
+        ],
+        recovery_count_24h=0,
+        recent_real_work_projects=frozenset({"savethenovel"}),
+        generated_at=datetime(2026, 6, 2, 17, 36, tzinfo=UTC),
+    )
+
+    assert out.startswith("Evening. Here's where things stand.")
+    assert (
+        "One thing needs you: Provide inputs to unblock Samblog Phase 0. "
+        "Open Inbox and clear that first."
+    ) in out
+    assert "1 inbox item waiting" not in out
+
+
 def test_briefing_first_up_skips_orphan_worktree_maintenance() -> None:
     from pollypm.dashboard_data import _build_dashboard_briefing, InboxPreview
 
@@ -1123,6 +1187,83 @@ def test_briefing_uses_generic_inbox_line_when_only_dormant_items_exist() -> Non
     assert "pm test" not in out
     assert "status=in_progress" not in out
     assert "One thing needs you: 1 inbox item waiting." in out
+
+
+def test_recent_inbox_messages_reframes_cancelled_handoff_preview(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from pollypm.dashboard_data import _recent_inbox_messages
+
+    now = datetime(2026, 6, 2, 12, 0, tzinfo=UTC)
+    target = SimpleNamespace(
+        project="samblog",
+        task_number=30,
+        task_id="samblog/30",
+        title="Execute SamBlog Phase 0 live MCP smoke test",
+        work_status=SimpleNamespace(value="blocked"),
+        blocked_by=[("samblog", 26)],
+        labels=[],
+        roles={},
+        priority=SimpleNamespace(value="high"),
+        flow_template_id="chat",
+        flow_template_version=1,
+        current_node_id=None,
+        updated_at=now,
+        created_at=now,
+        created_by="pm",
+    )
+    blocker = SimpleNamespace(
+        project="samblog",
+        task_number=26,
+        task_id="samblog/26",
+        title="Samblog Phase 0 needs your inputs",
+        work_status=SimpleNamespace(value="cancelled"),
+        labels=[],
+        roles={"requester": "user", "operator": "user"},
+        flow_template_id="chat",
+        flow_template_version=1,
+        current_node_id=None,
+    )
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.inbox_tasks_grouped",
+        lambda _config: {"samblog": [target]},
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.inbox_tasks_for_project",
+        lambda grouped, _config, project_key: grouped.get(project_key, []),
+    )
+
+    class _FakePgWorkService:
+        closed = False
+
+        def __init__(self, *, config) -> None:  # noqa: ARG002
+            pass
+
+        def get(self, task_id: str):
+            if task_id == "samblog/26":
+                return blocker
+            raise KeyError(task_id)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "pollypm.work.pg_service.PgWorkService",
+        _FakePgWorkService,
+    )
+    project = SimpleNamespace(
+        tracked=True,
+        path=tmp_path / "samblog",
+        display_label=lambda: "Samblog",
+    )
+    config = SimpleNamespace(projects={"samblog": project})
+
+    previews = _recent_inbox_messages(config)
+
+    assert len(previews) == 1
+    assert previews[0].title == "Provide inputs to unblock Samblog Phase 0"
+    assert previews[0].allow_dormant_briefing is True
 
 
 def test_recovery_narration_filters_dormant_projects(monkeypatch) -> None:

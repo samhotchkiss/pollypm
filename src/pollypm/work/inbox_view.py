@@ -23,6 +23,8 @@ autoreview), then by priority descending, then by ``updated_at`` descending.
 
 from __future__ import annotations
 
+import logging
+import re
 from datetime import datetime, timezone
 from typing import Iterable, Protocol
 
@@ -36,6 +38,8 @@ from pollypm.work.models import (
     TERMINAL_STATUSES,
     WorkStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -289,28 +293,64 @@ def _blocked_on_cancelled_inbox_dependency(
     visible in the user's inbox so the operator-input request is not erased by
     the cancellation.
     """
+    return cancelled_handoff_blocker_for_task(
+        task, service, flow_cache=flow_cache,
+    ) is not None
+
+
+def cancelled_handoff_unblock_subject(task: object, blocker: object) -> str:
+    blocker_title = str(getattr(blocker, "title", "") or "").strip()
+    match = re.match(
+        r"^(?P<target>.+?)\s+needs\s+your\s+inputs?\.?$",
+        blocker_title,
+        flags=re.IGNORECASE,
+    )
+    if match is not None:
+        target = match.group("target").strip()
+    else:
+        target = str(getattr(task, "title", "") or "").strip()
+    if target:
+        return f"Provide inputs to unblock {target}"
+    return "Provide inputs to unblock this task"
+
+
+def cancelled_handoff_blocker_for_task(
+    task: object,
+    service: _FlowLookup | None,
+    *,
+    flow_cache: dict[tuple[str, int], FlowTemplate] | None = None,
+) -> object | None:
     if _status_value(task) != WorkStatus.BLOCKED.value:
-        return False
+        return None
+    if service is None:
+        return None
     refs = getattr(task, "blocked_by", None) or []
     if not refs:
-        return False
+        return None
     get_task = getattr(service, "get", None)
     if not callable(get_task):
-        return False
+        return None
+    cache = flow_cache if flow_cache is not None else {}
     for ref in refs:
         try:
             project, task_number = ref
+            blocker_id = f"{project}/{int(task_number)}"
         except (TypeError, ValueError):
             continue
         try:
-            blocker = get_task(f"{project}/{int(task_number)}")
+            blocker = get_task(blocker_id)
         except Exception:  # noqa: BLE001 - readonly predicate degrades hidden
+            logger.debug(
+                "inbox_view: cancelled handoff lookup failed for %s",
+                blocker_id,
+                exc_info=True,
+            )
             continue
         if _status_value(blocker) != WorkStatus.CANCELLED.value:
             continue
-        if is_inbox_task_identity(blocker, service, flow_cache=flow_cache):
-            return True
-    return False
+        if is_inbox_task_identity(blocker, service, flow_cache=cache):
+            return blocker
+    return None
 
 
 def is_inbox_task(

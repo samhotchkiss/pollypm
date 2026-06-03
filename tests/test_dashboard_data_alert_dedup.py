@@ -192,7 +192,7 @@ def test_recovery_warn_demotes_tracked_but_dormant_project() -> None:
     A dead project can remain ``tracked=True`` while watchdog churn keeps
     touching its tasks. Recovery/hygiene warns on such projects should
     not inflate the operator "needs you" headline unless the project has
-    recent real completed work.
+    recent real completed work or real stalled work.
     """
     from pollypm.alert_actionability import (
         AlertActionabilityContext,
@@ -224,6 +224,36 @@ def test_recovery_warn_demotes_tracked_but_dormant_project() -> None:
     assert not is_user_actionable_alert(dormant_recovery_warn, context=context)
     assert is_user_actionable_alert(active_recovery_warn, context=context)
     assert is_user_actionable_alert(operator_decision, context=context)
+
+
+def test_recovery_warn_surfaces_tracked_project_with_stalled_work() -> None:
+    from pollypm.alert_actionability import (
+        AlertActionabilityContext,
+        is_user_actionable_alert,
+    )
+
+    context = AlertActionabilityContext(
+        known_projects=frozenset({"media", "pm_test_alpha"}),
+        tracked_projects=frozenset({"media", "pm_test_alpha"}),
+        recent_real_work_projects=frozenset(),
+        project_task_counts={
+            "media": {"queued": 2},
+            "pm_test_alpha": {"queued": 4},
+        },
+    )
+    media_plan_missing = SimpleNamespace(
+        session_name="plan_gate-media",
+        alert_type="plan_missing",
+        message="Project media has queued tasks but no plan.",
+    )
+    fixture_plan_missing = SimpleNamespace(
+        session_name="plan_gate-pm_test_alpha",
+        alert_type="plan_missing",
+        message="Project pm_test_alpha has queued tasks but no plan.",
+    )
+
+    assert is_user_actionable_alert(media_plan_missing, context=context)
+    assert not is_user_actionable_alert(fixture_plan_missing, context=context)
 
 
 def test_queue_without_motion_demotes_tracked_project_without_recent_real_work() -> None:
@@ -417,6 +447,81 @@ def test_alert_filter_task_facts_excludes_synthetic_done_projects(monkeypatch) -
     assert "pm_test" not in out
     assert "pm test" not in out
     assert "First up: Save the Novel has queued work without an active claim." in out
+
+
+def test_dashboard_alert_count_surfaces_real_plan_stall_not_fixture(
+    monkeypatch,
+) -> None:
+    from pollypm import dashboard_data
+
+    grouped = {
+        "media": [
+            SimpleNamespace(
+                work_status="queued",
+                updated_at=datetime.now(UTC),
+            ),
+            SimpleNamespace(
+                work_status="queued",
+                updated_at=datetime.now(UTC),
+            ),
+        ],
+        "pm_test_01wave_1779715196": [
+            SimpleNamespace(
+                work_status="queued",
+                updated_at=datetime.now(UTC),
+            )
+        ],
+    }
+    config = SimpleNamespace(
+        projects={
+            "media": SimpleNamespace(
+                tracked=True,
+                path="/Users/sam/dev/media",
+            ),
+            "pm_test_01wave_1779715196": SimpleNamespace(
+                tracked=True,
+                path="/private/tmp/pm_test_01wave_1779715196",
+            ),
+        }
+    )
+    alerts = [
+        SimpleNamespace(
+            session_name="plan_gate-media",
+            alert_type="plan_missing",
+            message="Project media has 2 queued tasks but no plan.",
+        ),
+        SimpleNamespace(
+            session_name="plan_gate-pm_test_01wave_1779715196",
+            alert_type="plan_missing",
+            message="Project pm_test_01wave_1779715196 has queued tasks but no plan.",
+        ),
+    ]
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_grouped",
+        lambda _config: grouped,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_for_project",
+        lambda data, _config, key: data[key],
+    )
+
+    facts = dashboard_data._project_task_facts_for_alert_filter(config, alerts)
+    actionable = dashboard_data.dashboard_actionable_alerts(
+        config,
+        alerts,
+        user_waiting_task_ids=frozenset(),
+        project_task_facts=facts,
+    )
+
+    assert facts.recent_real_work_projects == frozenset()
+    assert dashboard_data.count_dashboard_alerts(
+        config,
+        alerts,
+        user_waiting_task_ids=frozenset(),
+        project_task_facts=facts,
+    ) == 1
+    assert actionable == [alerts[0]]
 
 
 def test_session_description_skips_claude_tui_bottom_bar(tmp_path) -> None:
